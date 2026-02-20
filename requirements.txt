@@ -1,0 +1,26 @@
+# JointQuant Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Hugging Face Ecosystem
+transformers>=4.37.0
+datasets>=2.16.0
+accelerate>=0.26.0
+tokenizers>=0.15.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Progress & Utilities
+tqdm>=4.65.0
+
+# Optional: ModelScope (for Chinese mirror access)
+# modelscope>=1.9.0

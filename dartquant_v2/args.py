@@ -25,8 +25,15 @@ def create_parser() -> argparse.ArgumentParser:
         help='HuggingFace model name (e.g., meta-llama/Llama-3.2-1B)')
     model_group.add_argument('--hf_token', type=str, default=None,
                              help='HuggingFace access token')
-    model_group.add_argument('--cache_dir', type=str, default=None,
-                             help='Cache directory for models and datasets')
+    model_group.add_argument(
+        '--cache_dir', type=str, default='/root/autodl-tmp/huggingface',
+        help='Cache directory for HuggingFace model weights. '
+             'Default matches scripts/stat_and_download.py so models already '
+             'downloaded by that script are reused without re-downloading.')
+    model_group.add_argument(
+        '--datasets_cache_dir', type=str, default='/root/autodl-tmp/datasets',
+        help='Cache directory for HuggingFace datasets. '
+             'Default matches scripts/stat_and_download.py.')
     model_group.add_argument('--seed', type=int, default=0,
                              help='Random seed')
 

@@ -30,6 +30,18 @@ import sys
 import os
 import logging
 
+# ── AutoDL / HuggingFace cache alignment ─────────────────────────────────────
+# Mirrors scripts/stat_and_download.py so models and datasets already
+# downloaded by that script are reused automatically (no re-download needed).
+# Uses setdefault() so user-set env vars are never overwritten.
+_CACHE_DIR = "/root/autodl-tmp"
+_HF_HOME   = os.path.join(_CACHE_DIR, "huggingface")
+os.environ.setdefault("HF_ENDPOINT",        "https://hf-mirror.com")
+os.environ.setdefault("HF_HOME",            _HF_HOME)
+os.environ.setdefault("TRANSFORMERS_CACHE",  _HF_HOME)
+os.environ.setdefault("HF_DATASETS_CACHE",   os.path.join(_CACHE_DIR, "datasets"))
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Ensure project root and DartQuant paths are importable
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_script_dir)

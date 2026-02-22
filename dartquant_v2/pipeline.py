@@ -271,13 +271,24 @@ def collect_r3_activations(model, calibration_data, umodel, device):
     return None
 
 
+def _r4_hook_path(umodel: UnifiedQuantModel, layer_idx: int) -> str:
+    """Return the module path to hook for R4 activation collection.
+
+    Dense: layer.mlp.down_proj
+    MoE:   layer.block_sparse_moe.experts.0.w2  (representative expert 0)
+    A single hook on experts[0] suffices because all experts share the same R4.
+    """
+    base = f"{umodel.arch.layers_path}.{layer_idx}"
+    if umodel.arch.is_moe:
+        return f"{base}.{umodel.arch.experts_attr}.0.{umodel.arch.expert_down_proj_attr}"
+    return f"{base}.{umodel.arch.mlp_down_proj_attr}"
+
+
 def collect_r4_activations(model, calibration_data, umodel, device):
     """Collect down_proj input activations for butterfly R4 training."""
     target_names = []
     for i in range(umodel.num_layers):
-        target_names.append(
-            f"{umodel.arch.layers_path}.{i}.{umodel.arch.mlp_down_proj_attr}"
-        )
+        target_names.append(_r4_hook_path(umodel, i))
 
     acts = collect_activations(model, calibration_data, target_names, device)
     if acts:
@@ -339,13 +350,14 @@ def apply_r1_rotation(model, R1, umodel: UnifiedQuantModel, smooth_scale=None):
             W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
         # Rotate MLP output: W_down = R1^T @ W_down
-        W = umodel.get_mlp_output_proj(layer)
-        dtype = W.weight.data.dtype
-        W_ = W.weight.data.to(device=DEV, dtype=torch.float64)
-        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
-        if W.bias is not None:
-            b = W.bias.data.to(device=DEV, dtype=torch.float64)
-            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+        # For MoE, the same R1^T is applied to every expert's down_proj.
+        for W in umodel.get_all_mlp_output_projs(layer):
+            dtype = W.weight.data.dtype
+            W_ = W.weight.data.to(device=DEV, dtype=torch.float64)
+            W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+            if W.bias is not None:
+                b = W.bias.data.to(device=DEV, dtype=torch.float64)
+                W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
     cleanup_memory()
     logging.info("R1 rotation applied to model.")
@@ -429,8 +441,9 @@ def apply_r4_hadamard(model, umodel: UnifiedQuantModel):
 
     layers = umodel.get_layers()
     for layer in tqdm(layers, desc="Applying R4 Hadamard"):
-        W = umodel.get_mlp_output_proj(layer)
-        apply_exact_had_to_linear(W, had_dim=-1, output=False)
+        # For MoE: all experts share the same R4; bake into every expert's down_proj.
+        for W in umodel.get_all_mlp_output_projs(layer):
+            apply_exact_had_to_linear(W, had_dim=-1, output=False)
 
     logging.info("R4 Hadamard applied to down_proj weights.")
 
@@ -441,11 +454,12 @@ def apply_r4_butterfly(model, butterfly_r4, umodel: UnifiedQuantModel):
 
     layers = umodel.get_layers()
     for layer in tqdm(layers, desc="Applying R4 Butterfly"):
-        W = umodel.get_mlp_output_proj(layer)
-        dtype = W.weight.data.dtype
-        W_ = W.weight.data.to(device=DEV, dtype=torch.float64)
-        # W_down_new = W_down @ R4^T (absorb R4 into down_proj input)
-        W.weight.data = torch.matmul(W_, R4_matrix.T).to(device="cpu", dtype=dtype)
+        # For MoE: all experts share the same R4; bake into every expert's down_proj.
+        for W in umodel.get_all_mlp_output_projs(layer):
+            dtype = W.weight.data.dtype
+            W_ = W.weight.data.to(device=DEV, dtype=torch.float64)
+            # W_down_new = W_down @ R4^T (absorb R4 into down_proj input)
+            W.weight.data = torch.matmul(W_, R4_matrix.T).to(device="cpu", dtype=dtype)
 
     logging.info("R4 Butterfly applied to down_proj weights.")
 

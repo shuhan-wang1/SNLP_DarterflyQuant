@@ -66,6 +66,37 @@ class ModelArchConfig:
     # No-split module class name (for multi-GPU distribution)
     no_split_module_class: str = "LlamaDecoderLayer"
 
+    # -----------------------------------------------------------------------
+    # MoE-specific fields (leave all None for dense models)
+    # -----------------------------------------------------------------------
+
+    # Set to True to activate MoE code paths in all accessor methods
+    is_moe: bool = False
+
+    # Path to the experts ModuleList within a single layer (relative to layer)
+    # e.g. "block_sparse_moe.experts" for Mixtral
+    #      "mlp.experts"              for Qwen2-MoE
+    experts_attr: Optional[str] = None
+
+    # Attribute names *within* each individual expert module
+    # Mixtral uses w1/w2/w3; Qwen2-MoE / DeepSeek use up_proj/gate_proj/down_proj
+    expert_up_proj_attr: Optional[str] = None
+    expert_gate_proj_attr: Optional[str] = None
+    expert_down_proj_attr: Optional[str] = None
+
+    # Optional always-active "shared" expert (Qwen2-MoE has one, Mixtral does not)
+    # Path relative to layer, e.g. "mlp.shared_expert"
+    shared_expert_attr: Optional[str] = None
+    # Attrs within the shared expert; if None, reuses expert_*_proj_attr above
+    shared_expert_up_attr: Optional[str] = None
+    shared_expert_gate_attr: Optional[str] = None
+    shared_expert_down_attr: Optional[str] = None
+
+    # Name of the config attribute that stores the per-expert intermediate size
+    # e.g. "moe_intermediate_size" for Qwen2-MoE, "ffn_dim" for Mixtral
+    # If None, falls back to the standard intermediate_size / ffn_dim logic
+    moe_intermediate_size_attr: Optional[str] = None
+
 
 # ============================================================================
 # Architecture Registry
@@ -96,57 +127,9 @@ def get_arch_config(config_class_name: str) -> ModelArchConfig:
     return _ARCH_REGISTRY[config_class_name]
 
 
-# ============================================================================
-# Pre-registered architectures
-# ============================================================================
-
-# Llama family (Llama-2, Llama-3, Llama-3.1, Llama-3.2 all share LlamaConfig)
-register_arch("LlamaConfig", ModelArchConfig(
-    embed_tokens_path="model.embed_tokens",
-    embed_positions_path=None,
-    layers_path="model.layers",
-    pre_head_norm_path="model.norm",
-    lm_head_path="lm_head",
-    q_proj_attr="self_attn.q_proj",
-    k_proj_attr="self_attn.k_proj",
-    v_proj_attr="self_attn.v_proj",
-    o_proj_attr="self_attn.o_proj",
-    mlp_up_proj_attr="mlp.up_proj",
-    mlp_gate_proj_attr="mlp.gate_proj",
-    mlp_down_proj_attr="mlp.down_proj",
-    input_ln_attr="input_layernorm",
-    post_attn_ln_attr="post_attention_layernorm",
-    norm_class_name="LlamaRMSNorm",
-    has_rope=True,
-    rope_function_name="apply_rotary_pos_emb",
-    needs_mean_baking=False,
-    self_attn_attr="self_attn",
-    no_split_module_class="LlamaDecoderLayer",
-))
-
-# OPT family
-register_arch("OPTConfig", ModelArchConfig(
-    embed_tokens_path="model.decoder.embed_tokens",
-    embed_positions_path="model.decoder.embed_positions",
-    layers_path="model.decoder.layers",
-    pre_head_norm_path="model.decoder.final_layer_norm",
-    lm_head_path="lm_head",
-    q_proj_attr="self_attn.q_proj",
-    k_proj_attr="self_attn.k_proj",
-    v_proj_attr="self_attn.v_proj",
-    o_proj_attr="self_attn.out_proj",
-    mlp_up_proj_attr=None,  # OPT uses fc1
-    mlp_gate_proj_attr=None,  # OPT has no gate
-    mlp_down_proj_attr="fc2",
-    input_ln_attr="self_attn_layer_norm",
-    post_attn_ln_attr="final_layer_norm",
-    norm_class_name="LayerNorm",
-    has_rope=False,
-    rope_function_name="",
-    needs_mean_baking=True,
-    self_attn_attr="self_attn",
-    no_split_module_class="OPTDecoderLayer",
-))
+# NOTE: Architecture registrations have moved to dartquant_v2/arch/
+# (dense/llama.py, dense/opt.py, moe/mixtral.py, moe/qwen_moe.py, etc.)
+# They are loaded automatically when dartquant_v2 is imported.
 
 
 def _deep_getattr(obj, attr_path: str):
@@ -312,8 +295,30 @@ class UnifiedQuantModel:
     def get_mlp_input_projs(self, layer) -> list[nn.Linear]:
         """Get MLP input projection layers.
 
-        Returns [up_proj, gate_proj] for Llama or [fc1] for OPT.
+        Dense: returns [up_proj, gate_proj] for Llama, or [fc1] for OPT.
+        MoE:   returns [expert_0.up, expert_0.gate, expert_1.up, ..., shared.up, ...].
+               All experts' input projections, so R1 can be applied uniformly.
         """
+        if self.arch.is_moe:
+            projs = []
+            experts = _deep_getattr(layer, self.arch.experts_attr)
+            for expert in experts:
+                if self.arch.expert_up_proj_attr:
+                    projs.append(_deep_getattr(expert, self.arch.expert_up_proj_attr))
+                if self.arch.expert_gate_proj_attr:
+                    projs.append(_deep_getattr(expert, self.arch.expert_gate_proj_attr))
+            # Shared / always-active expert (e.g. Qwen2-MoE)
+            if self.arch.shared_expert_attr:
+                se = _deep_getattr(layer, self.arch.shared_expert_attr)
+                up_attr = self.arch.shared_expert_up_attr or self.arch.expert_up_proj_attr
+                gate_attr = self.arch.shared_expert_gate_attr or self.arch.expert_gate_proj_attr
+                if up_attr:
+                    projs.append(_deep_getattr(se, up_attr))
+                if gate_attr:
+                    projs.append(_deep_getattr(se, gate_attr))
+            return projs
+
+        # Dense path (original logic)
         projs = []
         if self.arch.mlp_up_proj_attr:
             projs.append(_deep_getattr(layer, self.arch.mlp_up_proj_attr))
@@ -325,8 +330,41 @@ class UnifiedQuantModel:
         return projs
 
     def get_mlp_output_proj(self, layer) -> nn.Linear:
-        """Get the MLP output projection (down_proj or fc2)."""
+        """Get a single representative down_proj.
+
+        Dense: returns the single down_proj / fc2.
+        MoE:   returns experts[0].down_proj as a representative.
+               Use this ONLY for R4 training hook registration (single hook
+               on one expert suffices because all experts share R4).
+               For R1/R4 weight baking use get_all_mlp_output_projs() instead.
+        """
+        if self.arch.is_moe:
+            experts = _deep_getattr(layer, self.arch.experts_attr)
+            return _deep_getattr(experts[0], self.arch.expert_down_proj_attr)
         return _deep_getattr(layer, self.arch.mlp_down_proj_attr)
+
+    def get_all_mlp_output_projs(self, layer) -> list[nn.Linear]:
+        """Get ALL down_proj layers from a layer.
+
+        Dense: returns [down_proj]  (list with 1 element for uniform iteration).
+        MoE:   returns [expert_0.down, expert_1.down, ..., shared.down].
+               Use this for R1 rotation baking and R4 Hadamard/Butterfly baking
+               because the same rotation must be applied to every expert's down_proj.
+        """
+        if self.arch.is_moe:
+            projs = []
+            experts = _deep_getattr(layer, self.arch.experts_attr)
+            for expert in experts:
+                projs.append(_deep_getattr(expert, self.arch.expert_down_proj_attr))
+            # Shared expert
+            if self.arch.shared_expert_attr:
+                se = _deep_getattr(layer, self.arch.shared_expert_attr)
+                down_attr = (self.arch.shared_expert_down_attr
+                             or self.arch.expert_down_proj_attr)
+                projs.append(_deep_getattr(se, down_attr))
+            return projs
+        # Dense: wrap in list so callers can always iterate
+        return [_deep_getattr(layer, self.arch.mlp_down_proj_attr)]
 
     def get_input_ln(self, layer) -> nn.Module:
         """Get input layer norm (before attention)."""
@@ -364,10 +402,17 @@ class UnifiedQuantModel:
 
     @property
     def intermediate_size(self) -> int:
-        if hasattr(self.model.config, 'intermediate_size'):
-            return self.model.config.intermediate_size
-        if hasattr(self.model.config, 'ffn_dim'):
-            return self.model.config.ffn_dim
+        """Return the per-expert intermediate size for MoE, or the standard FFN size for dense."""
+        cfg = self.model.config
+        # MoE: try the dedicated per-expert size attribute first
+        if self.arch.is_moe and self.arch.moe_intermediate_size_attr:
+            if hasattr(cfg, self.arch.moe_intermediate_size_attr):
+                return getattr(cfg, self.arch.moe_intermediate_size_attr)
+        # Dense / fallback
+        if hasattr(cfg, 'intermediate_size'):
+            return cfg.intermediate_size
+        if hasattr(cfg, 'ffn_dim'):
+            return cfg.ffn_dim
         raise AttributeError("Cannot determine intermediate_size from model config")
 
     @property

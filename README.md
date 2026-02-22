@@ -13,7 +13,8 @@ DartQuant v2 是一个**一键执行**的统一量化管道，基于 DartQuant �
 | 一键执行 | 否 | 是 | 完整管道编排 |
 | 损失函数 | Whip 损失 | Whip / SWD_Unif / SWD_Gauss | 3 种可选 |
 | 量化器 | INT4 仅 | INT4 / NF4 | 支持 NF4 |
-| 模型支持 | Llama/OPT 硬编码 | 自动检测，可扩展 | 通用架构 |
+| Dense 模型 | Llama/OPT 硬编码 | 自动检测，可扩展 | 注册新架构只需新建文件 |
+| MoE 模型 | 不支持 | 原生支持（Mixtral、Qwen2-MoE） | 专家共享 R4，无需子类化 |
 | R3/R4 旋转 | 固定 Hadamard | 可学习 Butterfly | 性能更优 |
 | 使用门槛 | 高（需修改代码） | 低（命令行参数） | 易用性提升 |
 
@@ -230,40 +231,50 @@ python dartquant_v2/run_quantize.py \
 ```
 int4_quantization_darkquant/
 |
-|-- dartquant_v2/                   # [新增] 统一量化管道
-|   |-- __init__.py
-|   |-- run_quantize.py             # 一键执行脚本（入口）
-|   |-- pipeline.py                 # 12 步完整流程
-|   |-- args.py                     # 参数解析
-|   |-- loss_functions.py           # whip / swd_unif / swd_gauss
-|   |-- unified_model.py            # UnifiedQuantModel（架构通用化）
-|   |-- nf4_quantizer.py            # NF4 量化（bitsandbytes）
-|   |-- butterfly.py                # Butterfly Givens 旋转
-|   `-- trainers.py                 # R1/R2/Butterfly 训练器
+|-- dartquant_v2/                         # [核心] 统一量化管道
+|   |-- __init__.py                       # 导入时自动注册所有架构
+|   |-- run_quantize.py                   # 一键执行脚本（入口）
+|   |-- pipeline.py                       # 12 步完整流程
+|   |-- args.py                           # 参数解析
+|   |-- loss_functions.py                 # whip / swd_unif / swd_gauss
+|   |-- unified_model.py                  # UnifiedQuantModel（架构通用化）
+|   |-- nf4_quantizer.py                  # NF4 量化（bitsandbytes）
+|   |-- butterfly.py                      # Butterfly Givens 旋转
+|   |-- trainers.py                       # R1/R2/Butterfly 训练器
+|   `-- arch/                             # [架构注册中心] 按公司/类型分组
+|       |-- __init__.py                   # 统一入口，触发所有注册
+|       |-- dense/                        # Dense（非 MoE）模型
+|       |   |-- __init__.py
+|       |   |-- llama.py                  # Meta Llama 全家族（1/2/3/3.1/3.2）
+|       |   `-- opt.py                    # Meta OPT 全家族
+|       `-- moe/                          # MoE 模型
+|           |-- __init__.py
+|           |-- mixtral.py                # Mistral AI Mixtral 8x7B / 8x22B
+|           `-- qwen_moe.py               # Alibaba Qwen2-MoE
 |
-|-- DartQuant/                      # [参考] DartQuant 原始实现
-|   |-- fake_quant/                 # 假量化模块（R1-R4 应用、INT4 量化）
-|   |   |-- rotation_utils.py       # R1-R4 应用方法
-|   |   |-- quant_utils.py          # 激活量化
-|   |   |-- model_utils.py          # 模型访问器
-|   |   |-- gptq_utils.py           # GPTQ/RTN 权重量化
-|   |   |-- hadamard_utils.py       # Hadamard 矩阵
-|   |   |-- data_utils.py           # 数据加载
-|   |   `-- eval_utils.py           # 困惑度评估
-|   `-- calibrater/                 # 校准器
-|       |-- r1_base_qr.py           # R1 QR 分解训练
-|       `-- r2_base_qr.py           # R2 QR 分解训练
+|-- DartQuant/                            # [参考] DartQuant 原始实现
+|   |-- fake_quant/                       # 假量化模块（R1-R4 应用、INT4 量化）
+|   |   |-- rotation_utils.py             # R1-R4 应用方法
+|   |   |-- quant_utils.py                # 激活量化
+|   |   |-- model_utils.py                # 模型访问器
+|   |   |-- gptq_utils.py                 # GPTQ/RTN 权重量化
+|   |   |-- hadamard_utils.py             # Hadamard 矩阵
+|   |   |-- data_utils.py                 # 数据加载
+|   |   `-- eval_utils.py                 # 困惑度评估
+|   `-- calibrater/                       # 校准器
+|       |-- r1_base_qr.py                 # R1 QR 分解训练
+|       `-- r2_base_qr.py                 # R2 QR 分解训练
 |
-|-- docs/                           # [文档] 研究报告
-|   |-- SNLP_report_1_v1_en.md      # 第一阶段：SWD_Unif 和 QR-Orth
-|   |-- report_2_en.md              # 第二阶段：Butterfly 和 Gaussian SWD
-|   `-- *.md                        # 其他研究笔记
+|-- docs/                                 # [文档] 研究报告
+|   |-- SNLP_report_1_v1_en.md            # 第一阶段：SWD_Unif 和 QR-Orth
+|   |-- report_2_en.md                    # 第二阶段：Butterfly 和 Gaussian SWD
+|   `-- *.md                              # 其他研究笔记
 |
-|-- scripts/                        # [工具脚本]
-|   |-- validation.py               # 损失函数对比验证
-|   `-- *.py                        # 其他辅助脚本
+|-- scripts/                              # [工具脚本]
+|   |-- validation.py                     # 损失函数对比验证
+|   `-- *.py                              # 其他辅助脚本
 |
-`-- requirements.txt                # Python 依赖列表
+`-- requirements.txt                      # Python 依赖列表
 ```
 
 ---
@@ -507,51 +518,134 @@ d=8 的例子（K=3）：
 
 ## 模型支持与扩展
 
-### 默认支持模型
+### 内置支持模型
 
-| 系列 | 具体模型示例 | 备注 |
-|------|------------|------|
-| Llama | Llama-2-7B、Llama-3-8B、Llama-3.2-1B 等 | 所有版本自动支持 |
-| OPT | OPT-125M、OPT-1.3B、OPT-30B 等 | 所有版本自动支持 |
+所有内置注册在 `dartquant_v2/arch/` 下，导入 `dartquant_v2` 时自动生效。
 
-### 如何添加新架构
+| 系列 | 配置类名 | 架构 | 注册文件 | 典型模型 |
+|------|---------|------|---------|---------|
+| Meta Llama | LlamaConfig | Dense | arch/dense/llama.py | Llama-2-7B、Llama-3-8B、Llama-3.2-1B |
+| Meta OPT | OPTConfig | Dense | arch/dense/opt.py | OPT-125M、OPT-1.3B、OPT-30B |
+| Mistral AI Mixtral | MixtralConfig | MoE | arch/moe/mixtral.py | Mixtral-8x7B、Mixtral-8x22B |
+| Alibaba Qwen2-MoE | Qwen2MoeConfig | MoE | arch/moe/qwen_moe.py | Qwen1.5-MoE-A2.7B、Qwen2-57B-A14B |
 
-**步骤 1**：查看新模型的 config 类名
+MoE 模型的旋转矩阵应用规则（依据 docs/SNLP_report_1_v1_en.md 第 2.4.4 节）：
+- R1 应用于每个专家的输入投影（up/gate）和输出投影（down，右乘 R1^T）
+- R4 所有专家共享同一矩阵，烘焙到每个专家的 down_proj 权重中
+
+### 如何添加新的 Dense 架构
+
+**步骤 1**：查看 config 类名
 ```python
 from transformers import AutoConfig
-config = AutoConfig.from_pretrained("new-model-name")
-print(config.__class__.__name__)  # 如：MistralConfig
+cfg = AutoConfig.from_pretrained("new-model-name")
+print(cfg.__class__.__name__)   # 例如：Qwen2Config
 ```
 
-**步骤 2**：在代码中注册
+**步骤 2**：在 `arch/dense/` 下创建新文件
 ```python
-from dartquant_v2.unified_model import register_arch, ModelArchConfig
+# dartquant_v2/arch/dense/qwen2.py
+from dartquant_v2.unified_model import ModelArchConfig, register_arch
 
-config = ModelArchConfig(
-    embeddings_path="model.embed_tokens",
+register_arch("Qwen2Config", ModelArchConfig(
+    embed_tokens_path="model.embed_tokens",
     layers_path="model.layers",
+    pre_head_norm_path="model.norm",
     lm_head_path="lm_head",
-    q_proj_path="self_attn.q_proj",
-    k_proj_path="self_attn.k_proj",
-    v_proj_path="self_attn.v_proj",
-    o_proj_path="self_attn.o_proj",
-    up_proj_path="mlp.up_proj",
-    down_proj_path="mlp.down_proj",
-    gate_proj_path="mlp.gate_proj",
-    input_ln_path="input_layernorm",
-    post_attn_ln_path="post_attention_layernorm",
-)
-register_arch("MistralConfig", config)
+    q_proj_attr="self_attn.q_proj",
+    k_proj_attr="self_attn.k_proj",
+    v_proj_attr="self_attn.v_proj",
+    o_proj_attr="self_attn.o_proj",
+    self_attn_attr="self_attn",
+    mlp_up_proj_attr="mlp.up_proj",
+    mlp_gate_proj_attr="mlp.gate_proj",
+    mlp_down_proj_attr="mlp.down_proj",
+    input_ln_attr="input_layernorm",
+    post_attn_ln_attr="post_attention_layernorm",
+    norm_class_name="Qwen2RMSNorm",
+    has_rope=True,
+    rope_function_name="apply_rotary_pos_emb",
+    no_split_module_class="Qwen2DecoderLayer",
+    is_moe=False,
+))
 ```
 
-**步骤 3**：验证
+**步骤 3**：在 `arch/dense/__init__.py` 中导入
+```python
+from dartquant_v2.arch.dense import qwen2 as _qwen2   # noqa: F401
+```
+
+**步骤 4**：验证
 ```bash
 python -c "
+import dartquant_v2   # 触发注册
 from dartquant_v2.unified_model import UnifiedQuantModel
-m = UnifiedQuantModel('your-model-name')
-print(f'Loaded: {m.num_layers} layers, hidden_size={m.hidden_size}')
+m = UnifiedQuantModel('Qwen/Qwen2-7B')
+print(f'Layers: {m.num_layers}, hidden: {m.hidden_size}')
 "
 ```
+
+### 如何添加新的 MoE 架构
+
+在 `arch/moe/` 下创建文件，额外填写 MoE 专用字段：
+
+```python
+# dartquant_v2/arch/moe/your_moe.py
+from dartquant_v2.unified_model import ModelArchConfig, register_arch
+
+register_arch("YourMoeConfig", ModelArchConfig(
+    # --- 与 Dense 相同的公共字段 ---
+    embed_tokens_path="model.embed_tokens",
+    layers_path="model.layers",
+    pre_head_norm_path="model.norm",
+    lm_head_path="lm_head",
+    q_proj_attr="self_attn.q_proj",
+    k_proj_attr="self_attn.k_proj",
+    v_proj_attr="self_attn.v_proj",
+    o_proj_attr="self_attn.o_proj",
+    self_attn_attr="self_attn",
+    # Dense MLP 路径设为 None（MoE 层没有独立的 dense MLP）
+    mlp_up_proj_attr=None,
+    mlp_gate_proj_attr=None,
+    mlp_down_proj_attr=None,
+    input_ln_attr="input_layernorm",
+    post_attn_ln_attr="post_attention_layernorm",
+    norm_class_name="YourRMSNorm",
+    has_rope=True,
+    rope_function_name="apply_rotary_pos_emb",
+    no_split_module_class="YourDecoderLayer",
+
+    # --- MoE 专用字段 ---
+    is_moe=True,
+    # 专家列表的路径（相对于 layer）
+    experts_attr="mlp.experts",
+    # 每个专家内部的投影属性名
+    expert_up_proj_attr="up_proj",
+    expert_gate_proj_attr="gate_proj",
+    expert_down_proj_attr="down_proj",
+    # 共享专家（若无，设为 None）
+    shared_expert_attr="mlp.shared_expert",
+    # 若属性名与上面相同，设为 None 即可复用
+    shared_expert_up_attr=None,
+    shared_expert_gate_attr=None,
+    shared_expert_down_attr=None,
+    # 专家中间层维度的 config 属性名
+    moe_intermediate_size_attr="moe_intermediate_size",
+))
+```
+
+然后在 `arch/moe/__init__.py` 中添加导入即可，无需修改任何核心代码。
+
+**MoE 关键字段说明**：
+
+| 字段 | 说明 | Mixtral 示例 | Qwen2-MoE 示例 |
+|------|------|------------|--------------|
+| `experts_attr` | 专家列表路径（相对于 layer） | `block_sparse_moe.experts` | `mlp.experts` |
+| `expert_up_proj_attr` | 专家内 up/gate 输入投影 | `w1` | `up_proj` |
+| `expert_gate_proj_attr` | 专家内 gate 投影 | `w3` | `gate_proj` |
+| `expert_down_proj_attr` | 专家内 down 投影 | `w2` | `down_proj` |
+| `shared_expert_attr` | 常驻专家路径（无则 None） | None | `mlp.shared_expert` |
+| `moe_intermediate_size_attr` | config 中专家中间层维度 | `ffn_dim` | `moe_intermediate_size` |
 
 ---
 

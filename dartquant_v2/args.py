@@ -124,6 +124,16 @@ def create_parser() -> argparse.ArgumentParser:
                              help='Gradient accumulation steps')
     train_group.add_argument('--train_subset_size', type=float, default=1.0,
                              help='Fraction of calibration data per epoch')
+    train_group.add_argument(
+        '--lambda_recon', type=float, default=0.1,
+        help='Weight for the quantization reconstruction loss L_recon in '
+             'Butterfly training (doc Section 2.1.7). Only active when '
+             '--butterfly is set and quantizer_type is not "none". '
+             'Total loss = L_dist + lambda_recon * L_recon.')
+    train_group.add_argument(
+        '--quant_block_size', type=int, default=64,
+        help='Per-block size used by the fake quantizer inside Butterfly '
+             'training for the L_recon term.')
 
     # ==== Weight Quantization (for INT4) ====
     wq_group = parser.add_argument_group('Weight Quantization (INT4)')

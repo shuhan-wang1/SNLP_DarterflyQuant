@@ -187,7 +187,7 @@ class UnifiedQuantModel:
                 self.model.seqlen = 2048
 
     def _load_model(self, model_name, hf_token, cache_dir, dtype):
-        """Load model, trying transformers first then falling back to modelscope."""
+        """Load model from local cache only. Raises RuntimeError if not found."""
         # Skip init for faster loading
         orig_kaiming = torch.nn.init.kaiming_uniform_
         orig_uniform = torch.nn.init.uniform_
@@ -201,6 +201,7 @@ class UnifiedQuantModel:
                 'torch_dtype': dtype,
                 'trust_remote_code': True,
                 'low_cpu_mem_usage': True,
+                'local_files_only': True,
             }
             if hf_token:
                 kwargs['token'] = hf_token
@@ -210,25 +211,13 @@ class UnifiedQuantModel:
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 model_name, **kwargs
             )
-            logging.info(f"Loaded model via transformers: {model_name}")
+            logging.info(f"Loaded model from local cache: {model_name}")
         except Exception as e:
-            logging.warning(f"transformers load failed ({e}), trying modelscope...")
-            try:
-                from modelscope import AutoModelForCausalLM as MSAutoModel
-                ms_kwargs = {
-                    'torch_dtype': dtype,
-                    'trust_remote_code': True,
-                    'low_cpu_mem_usage': True,
-                }
-                if cache_dir:
-                    ms_kwargs['cache_dir'] = cache_dir
-                model = MSAutoModel.from_pretrained(model_name, **ms_kwargs)
-                logging.info(f"Loaded model via modelscope: {model_name}")
-            except Exception as e2:
-                raise RuntimeError(
-                    f"Failed to load model '{model_name}' via both "
-                    f"transformers ({e}) and modelscope ({e2})"
-                )
+            cache_hint = cache_dir or "the default HuggingFace cache directory"
+            raise RuntimeError(
+                f"Model '{model_name}' not found in local cache ({cache_hint}). "
+                f"Please run the download script first. Original error: {e}"
+            ) from e
         finally:
             torch.nn.init.kaiming_uniform_ = orig_kaiming
             torch.nn.init.uniform_ = orig_uniform
@@ -261,21 +250,20 @@ class UnifiedQuantModel:
         return _deep_getattr(self.model, self.arch.pre_head_norm_path)
 
     def get_tokenizer(self) -> transformers.PreTrainedTokenizer:
-        """Load the tokenizer for this model."""
+        """Load tokenizer from local cache only. Raises RuntimeError if not found."""
         try:
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 self.model_name,
                 token=self.hf_token,
                 use_fast=False,
                 trust_remote_code=True,
+                local_files_only=True,
             )
-        except Exception:
-            from modelscope import AutoTokenizer as MSAutoTokenizer
-            tokenizer = MSAutoTokenizer.from_pretrained(
-                self.model_name,
-                use_fast=False,
-                trust_remote_code=True,
-            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Tokenizer for '{self.model_name}' not found in local cache. "
+                f"Please run the download script first. Original error: {e}"
+            ) from e
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
         return tokenizer

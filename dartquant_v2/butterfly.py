@@ -112,6 +112,52 @@ class ButterflyRotation(nn.Module):
 
         return result
 
+    def inverse_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply R^T (inverse rotation) to input tensor.
+
+        Since all Givens rotations are orthogonal, R^T = R^{-1}.
+        The inverse is computed by applying layers in reverse order
+        and transposing each Givens rotation (negate sin, keep cos).
+
+        Args:
+            x: Tensor of shape (..., dim)
+
+        Returns:
+            Inversely rotated tensor of same shape, complexity O(d log d)
+        """
+        orig_shape = x.shape
+        x = x.reshape(-1, self.dim)
+
+        for l in reversed(range(self.num_layers)):
+            x = self._apply_layer_inverse(x, l)
+
+        return x.reshape(orig_shape)
+
+    def _apply_layer_inverse(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """Apply the transpose of one butterfly layer.
+
+        G(theta)^T = [[cos, -sin], [sin, cos]] (negate the off-diagonal sin terms).
+        """
+        thetas = self.angles[layer_idx]  # (dim//2,)
+        cos_t = torch.cos(thetas)
+        sin_t = torch.sin(thetas)
+
+        i_idx = getattr(self, f'_i_idx_{layer_idx}')
+        j_idx = getattr(self, f'_j_idx_{layer_idx}')
+
+        xi = x[:, i_idx]
+        xj = x[:, j_idx]
+
+        # Transposed Givens: [cos, -sin; sin, cos] @ [xi; xj]
+        new_xi = cos_t * xi - sin_t * xj
+        new_xj = sin_t * xi + cos_t * xj
+
+        result = x.clone()
+        result[:, i_idx] = new_xi
+        result[:, j_idx] = new_xj
+
+        return result
+
     def get_matrix(self) -> torch.Tensor:
         """Compute the full d x d rotation matrix.
 
@@ -213,6 +259,35 @@ class ButterflyFactored(nn.Module):
 
         # Normalize
         x = x / math.sqrt(self.total_dim)
+
+        return x.reshape(orig_shape)
+
+    def inverse_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply R^T (inverse rotation) to input tensor.
+
+        Reverses the three steps of forward():
+          1. Undo normalization (multiply by sqrt(total_dim))
+          2. Apply hadK^T to the K dimension
+          3. Apply butterfly.inverse_forward to the m dimension
+        """
+        if self.K == 1:
+            return self.butterfly.inverse_forward(x)
+
+        orig_shape = x.shape
+        x = x.reshape(-1, self.K, self.m)
+
+        # Step 1: undo normalization
+        x = x * math.sqrt(self.total_dim)
+
+        # Step 2: apply hadK^T over the K dimension
+        hadK = self.hadK.to(x.device).to(x.dtype)
+        x = torch.einsum('ji,bjk->bik', hadK, x)  # hadK.T
+
+        # Step 3: apply inverse butterfly to each m-dim sub-block
+        batch = x.shape[0]
+        x = x.reshape(-1, self.m)
+        x = self.butterfly.inverse_forward(x)
+        x = x.reshape(batch, self.K, self.m)
 
         return x.reshape(orig_shape)
 

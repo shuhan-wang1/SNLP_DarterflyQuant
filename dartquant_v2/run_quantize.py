@@ -30,16 +30,28 @@ import sys
 import os
 import logging
 
-# ── AutoDL / HuggingFace cache alignment ─────────────────────────────────────
-# Mirrors scripts/stat_and_download.py so models and datasets already
-# downloaded by that script are reused automatically (no re-download needed).
-# Uses setdefault() so user-set env vars are never overwritten.
+# ── Local-only cache configuration ───────────────────────────────────────────
+# All models and datasets must be downloaded in advance (e.g. via
+# scripts/stat_and_download.py).  Network access is completely disabled so
+# that the pipeline fails fast with a clear error if a required file is
+# missing, rather than silently hanging on a download.
+#
+# Cache directories: honour existing env vars so users can override paths,
+#   but default to the standard AutoDL layout.
+# Offline flags: set to "1" unconditionally; set to "0" in your shell env
+#   only if you explicitly need to allow downloads for a specific run.
 _CACHE_DIR = "/root/autodl-tmp"
 _HF_HOME   = os.path.join(_CACHE_DIR, "huggingface")
-os.environ.setdefault("HF_ENDPOINT",        "https://hf-mirror.com")
-os.environ.setdefault("HF_HOME",            _HF_HOME)
-os.environ.setdefault("TRANSFORMERS_CACHE",  _HF_HOME)
-os.environ.setdefault("HF_DATASETS_CACHE",   os.path.join(_CACHE_DIR, "datasets"))
+os.environ.setdefault("HF_HOME",           _HF_HOME)
+os.environ.setdefault("TRANSFORMERS_CACHE", _HF_HOME)
+os.environ.setdefault("HF_DATASETS_CACHE",  os.path.join(_CACHE_DIR, "datasets"))
+
+# Block all HuggingFace network calls (transformers + datasets).
+# These env vars are checked by the HF libraries before any network request.
+if os.environ.get("TRANSFORMERS_OFFLINE") != "0":
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+if os.environ.get("HF_DATASETS_OFFLINE") != "0":
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Ensure project root and DartQuant paths are importable

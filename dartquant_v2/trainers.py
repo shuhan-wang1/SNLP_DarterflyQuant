@@ -16,11 +16,14 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 
 from .loss_functions import get_loss_fn
 from .butterfly import ButterflyRotation, ButterflyFactored
+from .nf4_quantizer import NF4FakeQuantizer
+from .int4_quantizer import INT4FakeQuantizer
 
 
 # ============================================================================
@@ -356,24 +359,63 @@ def train_butterfly(
     cos_lr: bool = True,
     optim: str = 'sgd',
     device: str = 'cuda',
+    quantizer_type: str = 'none',
+    lambda_recon: float = 0.1,
+    quant_block_size: int = 64,
 ) -> nn.Module:
     """Train a Butterfly Givens rotation.
 
     Used for R3 (head_dim, typically power of 2) and R4 (intermediate_size,
     may not be power of 2).
 
+    The total loss combines the distribution-shaping loss with an optional
+    quantization reconstruction loss (doc Section 2.1.7 Phase 3):
+
+        L_total = L_dist(R3 @ X_in)
+                  + lambda_recon * ||X_in - R3^T @ FakeQuant(R3 @ X_in)||^2
+
+    The reconstruction term uses a straight-through estimator (STE) so that
+    gradients flow back through the rotation parameters even though the
+    fake-quantizer's argmin/round operations have zero gradients.
+
     Args:
         activations: Tensor of shape (N, dim)
         dim: Rotation dimension
-        loss_fn_name: Loss function name
+        loss_fn_name: Loss function name ('whip', 'swd_unif', 'swd_gauss')
         label: Label for logging (e.g., "R3" or "R4")
-        ... (same training hyperparams)
+        lr: Learning rate
+        momentum: SGD momentum
+        epochs: Training epochs
+        batch_size: Mini-batch size
+        cos_lr: Use cosine annealing LR scheduler
+        optim: Optimizer ('sgd' or 'adam')
+        device: Device string
+        quantizer_type: Fake quantizer for L_recon. One of:
+            'nf4'  - NF4 non-uniform quantizer (pairs with swd_gauss)
+            'int4' - INT4 symmetric uniform quantizer (pairs with swd_unif)
+            'none' - Disable L_recon (original behaviour, default)
+        lambda_recon: Weight for L_recon relative to L_dist (default 0.1)
+        quant_block_size: Per-block size used by the fake quantizer (default 64)
 
     Returns:
         Trained ButterflyRotation or ButterflyFactored module
     """
     loss_fn = get_loss_fn(loss_fn_name)
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    # Build optional fake quantizer for reconstruction loss
+    fake_quant: nn.Module | None = None
+    if quantizer_type == 'nf4':
+        fake_quant = NF4FakeQuantizer(block_size=quant_block_size).to(device)
+    elif quantizer_type == 'int4':
+        fake_quant = INT4FakeQuantizer(block_size=quant_block_size).to(device)
+    elif quantizer_type != 'none':
+        raise ValueError(
+            f"Unknown quantizer_type '{quantizer_type}'. "
+            "Choose from 'nf4', 'int4', or 'none'."
+        )
+
+    use_recon = fake_quant is not None and lambda_recon > 0.0
 
     # Choose butterfly type based on dimension
     if dim > 0 and (dim & (dim - 1)) == 0:
@@ -393,14 +435,39 @@ def train_butterfly(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     butterfly.train()
-    logging.info(f"Training Butterfly {label} (dim={dim}), {epochs} epochs")
+    recon_tag = f" + {lambda_recon}*L_recon[{quantizer_type}]" if use_recon else ""
+    logging.info(
+        f"Training Butterfly {label} (dim={dim}), {epochs} epochs, "
+        f"loss={loss_fn_name}{recon_tag}"
+    )
 
     for epoch in range(epochs):
         loss_log = []
         for (batch,) in dataloader:
             batch = batch.to(device)
+
+            # Forward: X_out = R3 @ X_in  (butterfly acts on row vectors)
             outputs = butterfly(batch)
-            loss = loss_fn(outputs)
+
+            # Distribution loss: L_dist(X_out)
+            dist_loss = loss_fn(outputs)
+
+            if use_recon:
+                # Fake-quantize with STE so gradients flow through R3 parameters.
+                # Forward : x_hat  = FakeQuant(outputs)   (true quantized values)
+                # Backward: d/d_outputs treated as identity (straight-through)
+                with torch.no_grad():
+                    x_hat_q = fake_quant(outputs)
+                x_hat = outputs + (x_hat_q - outputs).detach()  # STE
+
+                # Reconstruction loss: L_recon = ||X_in - R3^T @ x_hat||^2
+                x_recon = butterfly.inverse_forward(x_hat)
+                recon_loss = F.mse_loss(batch, x_recon)
+
+                loss = dist_loss + lambda_recon * recon_loss
+            else:
+                loss = dist_loss
+
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -413,7 +480,7 @@ def train_butterfly(
             mean_loss = torch.stack(loss_log).mean()
             logging.info(
                 f"  {label} Epoch [{epoch+1}/{epochs}], "
-                f"{loss_fn_name} Loss: {mean_loss.item():.6f}"
+                f"total Loss: {mean_loss.item():.6f}"
             )
 
     logging.info(f"Butterfly {label} training complete.")

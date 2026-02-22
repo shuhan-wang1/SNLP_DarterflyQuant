@@ -5,7 +5,9 @@
       "Bash(ls:*)",
       "Bash(cmp:*)",
       "Bash(dir:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git -C /c/Users/shuhan/Desktop/UCL/snlp/int4_quantization_darkquant log --oneline -20)",
+      "Bash(wc:*)"
     ]
   }
 }

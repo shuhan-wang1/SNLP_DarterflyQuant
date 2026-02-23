@@ -916,6 +916,13 @@ def run_full_pipeline(args):
         logging.info("\n[8/12] Training Butterfly R3/R4...")
         model.to(DEV)
 
+        # Auto-select KL divergence loss for R3/R4 based on quantizer type.
+        # INT4 → kl_unif (maximise entropy → uniform coverage of quantiser bins)
+        # NF4  → kl_gauss (minimise skewness² + kurtosis² → Gaussian shape)
+        _bf_loss = 'kl_unif' if args.quantizer_type == 'int4' else 'kl_gauss'
+        logging.info(f"  Butterfly R3/R4 distribution loss: {_bf_loss} "
+                     f"(auto-selected for {args.quantizer_type})")
+
         # Train Butterfly R3 (for Q/K after RoPE)
         # R3 is applied online (not baked into weights), so we use
         # activation-only reconstruction loss (weight_matrices=None).
@@ -926,7 +933,7 @@ def run_full_pipeline(args):
                 butterfly_r3 = train_butterfly(
                     activations=r3_acts,
                     dim=umodel.head_dim,
-                    loss_fn_name=args.loss,
+                    loss_fn_name=_bf_loss,
                     label="R3",
                     lr=args.lr,
                     momentum=args.momentum,
@@ -954,7 +961,7 @@ def run_full_pipeline(args):
                 butterfly_r4 = train_butterfly(
                     activations=r4_acts,
                     dim=umodel.intermediate_size,
-                    loss_fn_name=args.loss,
+                    loss_fn_name=_bf_loss,
                     label="R4",
                     lr=args.lr,
                     momentum=args.momentum,

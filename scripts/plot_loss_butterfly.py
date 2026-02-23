@@ -94,7 +94,7 @@ LR_LOSS     = 1e-3    # learning rate for R1 / R2
 LR_BF       = 1e-3    # learning rate for Butterfly R3/R4
 MOMENTUM    = 0.9
 EPOCHS_LOSS = 10      # R1/R2 epochs (matches pipeline --r1_epochs 10)
-EPOCHS_BF   = 20      # Butterfly epochs (matches pipeline --butterfly_epochs)
+EPOCHS_BF   = 250      # Butterfly epochs (matches pipeline --butterfly_epochs)
 BATCH_SIZE  = 64
 
 # ============================================================================
@@ -156,6 +156,46 @@ except ImportError as e:
             p = p.clamp(1e-6, 1 - 1e-6)
             t = math.sqrt(2) * torch.erfinv(2 * p - 1) * sigma
         return F.mse_loss(xs, t)
+
+    # ── Inline fallback KL divergence losses (mirrors dartquant_v2) ────────
+
+    def calc_kl_unif_loss(x):
+        """KL divergence to Uniform via differential-entropy maximisation.
+
+        KL(P || Unif[-b,b]) = log(2b) - H(P).  Since b = sqrt(3)*RMS is
+        rotation-invariant, minimising KL reduces to maximising H(P),
+        estimated by the Vasicek (1976) spacing estimator:
+            H(P) ≈ (1/n) Σ_i log(n · Δx_i)
+        The gradient equalises neighbouring spacings → uniform coverage.
+        Pairs with INT4 uniform quantiser.
+        """
+        x_flat = x.reshape(-1).float()
+        n = x_flat.numel()
+        x_sorted, _ = torch.sort(x_flat)
+        spacings = torch.empty(n, device=x_flat.device, dtype=x_flat.dtype)
+        spacings[1:-1] = (x_sorted[2:] - x_sorted[:-2]) / 2.0
+        spacings[0]    = x_sorted[1] - x_sorted[0]
+        spacings[-1]   = x_sorted[-1] - x_sorted[-2]
+        spacings = spacings.clamp(min=1e-8)
+        neg_entropy = -(torch.log(n * spacings)).mean()
+        return neg_entropy
+
+    def calc_kl_gauss_loss(x):
+        """KL divergence to Gaussian via Gram-Charlier moment matching.
+
+        KL(P || N(0,σ²)) ≈ γ₁²/12 + γ₂²/96.  Minimising the surrogate
+        L = γ₁² + γ₂² (skewness² + excess_kurtosis²) drives the
+        distribution toward Gaussian shape (γ₁=0, γ₂=0).
+        Pairs with NF4 (Normal Float 4-bit) quantiser.
+        """
+        x_flat = x.reshape(-1).float()
+        mu = x_flat.mean()
+        centered = x_flat - mu
+        sigma2 = (centered ** 2).mean()
+        sigma  = torch.sqrt(sigma2 + 1e-8)
+        skewness        = (centered ** 3).mean() / (sigma ** 3)
+        excess_kurtosis = (centered ** 4).mean() / (sigma ** 4) - 3.0
+        return skewness ** 2 + excess_kurtosis ** 2
 
     def get_loss_fn(name):
         return _LOSS_FNS_FALLBACK[name]
@@ -380,6 +420,8 @@ _LOSS_FNS_FALLBACK = {
     'whip':      calc_whip_loss,
     'swd_unif':  calc_swd_unif_loss,
     'swd_gauss': calc_swd_gauss_loss,
+    'kl_unif':   calc_kl_unif_loss,
+    'kl_gauss':  calc_kl_gauss_loss,
 }
 
 try:
@@ -1276,6 +1318,8 @@ _COLORS = {
     'whip':      'darkorange',
     'swd_unif':  'steelblue',
     'swd_gauss': 'mediumorchid',
+    'kl_unif':   'steelblue',
+    'kl_gauss':  'mediumorchid',
     'hadamard':  'tomato',
     'butterfly': 'steelblue',
 }
@@ -1567,10 +1611,15 @@ def plot_butterfly_training_curves(bf_histories: dict,   # {loss_name: {layer_id
     axes = axes[0]
 
     bf_styles = {
+        'kl_unif':  ('steelblue',    '-',  'Butterfly KL-Unif'),
+        'kl_gauss': ('mediumorchid', '--', 'Butterfly KL-Gauss'),
+        # Legacy SWD keys (kept for backward compatibility if called with old dicts)
         'swd_unif':  ('steelblue',    '-',  'Butterfly SWD-Unif'),
         'swd_gauss': ('mediumorchid', '--', 'Butterfly SWD-Gauss'),
     }
     had_colors = {
+        'kl_unif':   'deepskyblue',
+        'kl_gauss':  'violet',
         'swd_unif':  'deepskyblue',
         'swd_gauss': 'violet',
     }
@@ -1586,7 +1635,7 @@ def plot_butterfly_training_curves(bf_histories: dict,   # {loss_name: {layer_id
                 ax.axhline(hv, color=had_colors[loss_name], ls=':', lw=2,
                            label=f'Hadamard {suffix} ({hv:.4f})')
 
-        ax.set_title(f'{rotation_label} (all-layer collection)', fontsize=12, fontweight='bold')
+        ax.set_title(f'{rotation_label} Layer {layer_idx} (KL divergence)', fontsize=12, fontweight='bold')
         ax.set_xlabel('Epoch', fontsize=10)
         ax.set_ylabel('Loss', fontsize=10)
         ax.legend(fontsize=8)
@@ -1755,15 +1804,19 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
     Fix: One forward pass collects all layers simultaneously; then each layer in
     layer_indices gets its own independent butterfly optimized on that layer only.
 
+    Distribution loss uses KL divergence (not SWD):
+      kl_unif  — Vasicek entropy maximisation → Uniform target (INT4)
+      kl_gauss — Gram-Charlier moment matching → Gaussian target (NF4)
+
     R4 (down_proj inputs, dim=intermediate_size):
       Joint weight+activation reconstruction loss (paper Eq 17, Flaw 1 fix):
-        L_total = L_dist(B·x) + λ · ||W·x − Q(W·B^T) · Q(B·x)||²_F
+        L_total = L_KL(B·x) + λ · ||W·x − Q(W·B^T) · Q(B·x)||²_F
       Prevents optimizer from reducing distribution loss at the expense of
       catastrophic condition-number blow-up in the rotated weight matrix W·B^T.
 
     R3 (Q+K proj outputs, dim=head_dim):
       Activation-only reconstruction loss (Flaw 1 fix), joint Q+K (Flaw 3 fix):
-        L_total = L_dist(B·x) + λ · ||x − B^T · Q(B·x)||²
+        L_total = L_KL(B·x) + λ · ||x − B^T · Q(B·x)||²
 
     Plots per selected layer:
       {model_clean}_butterfly_R4_layer{l}.png
@@ -1792,8 +1845,8 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
         if int_size is None:
             int_size = list(r4_raw.values())[0].shape[-1]
 
-        bf_hist_r4  = {'swd_unif': {}, 'swd_gauss': {}}
-        had_loss_r4 = {'swd_unif': {}, 'swd_gauss': {}}
+        bf_hist_r4  = {'kl_unif': {}, 'kl_gauss': {}}
+        had_loss_r4 = {'kl_unif': {}, 'kl_gauss': {}}
         is_pow2_r4  = int_size > 0 and (int_size & (int_size - 1)) == 0
 
         for layer_idx in layer_indices:
@@ -1812,52 +1865,52 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
                 print(f"  Layer {layer_idx}: int_size={int_size} not pow-2, skip Hadamard")
             else:
                 had_acts_l = apply_hadamard_fwht(acts_l)
-                hv_u       = compute_hadamard_loss(acts_l, 'swd_unif')
-                hv_g       = compute_hadamard_loss(acts_l, 'swd_gauss')
-                print(f"  Layer {layer_idx}: Hadamard R4 swd_unif={hv_u:.4f},"
-                      f" swd_gauss={hv_g:.4f}")
-            had_loss_r4['swd_unif'][layer_idx]  = hv_u
-            had_loss_r4['swd_gauss'][layer_idx] = hv_g
+                hv_u       = compute_hadamard_loss(acts_l, 'kl_unif')
+                hv_g       = compute_hadamard_loss(acts_l, 'kl_gauss')
+                print(f"  Layer {layer_idx}: Hadamard R4 kl_unif={hv_u:.4f},"
+                      f" kl_gauss={hv_g:.4f}")
+            had_loss_r4['kl_unif'][layer_idx]  = hv_u
+            had_loss_r4['kl_gauss'][layer_idx] = hv_g
 
             # ── Weight bank for Eq 17 (this layer's down_proj only) ─────────
             # Shape: (1, hidden_size, int_size) = (1, out_dim, dim)
             W_bank = arch_wrapper._down_proj_weight_for_layer(layer_idx).unsqueeze(0)
 
-            # ── Per-layer butterfly [swd_unif] + Eq17 INT4 weight+act quant ─
-            print(f"  Layer {layer_idx}: Training R4 butterfly [swd_unif + Eq17 INT4] ...")
+            # ── Per-layer butterfly [kl_unif] + Eq17 INT4 weight+act quant ──
+            print(f"  Layer {layer_idx}: Training R4 butterfly [kl_unif + Eq17 INT4] ...")
             bf_u, hist_u = train_butterfly_with_history(
-                acts_l, int_size, 'swd_unif',
+                acts_l, int_size, 'kl_unif',
                 quantizer_type='int4', weight_quantizer_type='int4',
                 weight_matrices=W_bank, lambda_recon=0.1,
             )
             bf_acts_u = apply_butterfly_to_acts(bf_u, acts_l)
             with torch.no_grad():
-                bf_loss_u = _get_loss_fn('swd_unif')(
+                bf_loss_u = _get_loss_fn('kl_unif')(
                     torch.tensor(bf_acts_u, device=DEVICE)).item()
-            bf_hist_r4['swd_unif'][layer_idx] = hist_u
+            bf_hist_r4['kl_unif'][layer_idx] = hist_u
 
-            # ── Per-layer butterfly [swd_gauss] + Eq17 NF4 act / INT4 weight ─
-            print(f"  Layer {layer_idx}: Training R4 butterfly [swd_gauss + Eq17 NF4/INT4] ...")
+            # ── Per-layer butterfly [kl_gauss] + Eq17 NF4 act / INT4 weight ─
+            print(f"  Layer {layer_idx}: Training R4 butterfly [kl_gauss + Eq17 NF4/INT4] ...")
             bf_g, hist_g = train_butterfly_with_history(
-                acts_l, int_size, 'swd_gauss',
+                acts_l, int_size, 'kl_gauss',
                 quantizer_type='nf4', weight_quantizer_type='int4',
                 weight_matrices=W_bank, lambda_recon=0.1,
             )
             bf_acts_g = apply_butterfly_to_acts(bf_g, acts_l)
             with torch.no_grad():
-                bf_loss_g = _get_loss_fn('swd_gauss')(
+                bf_loss_g = _get_loss_fn('kl_gauss')(
                     torch.tensor(bf_acts_g, device=DEVICE)).item()
-            bf_hist_r4['swd_gauss'][layer_idx] = hist_g
+            bf_hist_r4['kl_gauss'][layer_idx] = hist_g
 
-            print(f"  Layer {layer_idx}: R4 bf_unif={bf_loss_u:.4f} (had={hv_u:.4f}), "
-                  f"bf_gauss={bf_loss_g:.4f} (had={hv_g:.4f})")
+            print(f"  Layer {layer_idx}: R4 bf_kl_unif={bf_loss_u:.4f} (had={hv_u:.4f}), "
+                  f"bf_kl_gauss={bf_loss_g:.4f} (had={hv_g:.4f})")
 
-            # ── Per-layer distribution plot (swd_unif butterfly shown) ──────
+            # ── Per-layer distribution plot (kl_unif butterfly shown) ────────
             save_path = os.path.join(PLOT_DIR,
                                      f"{model_clean}_butterfly_R4_layer{layer_idx}.png")
             plot_butterfly_distribution(
                 acts_l.flatten(), had_acts_l.flatten(), bf_acts_u.flatten(),
-                hv_u, bf_loss_u, 'R4', layer_idx, 'swd_unif', model_name, save_path
+                hv_u, bf_loss_u, 'R4', layer_idx, 'kl_unif', model_name, save_path
             )
 
         # ── Summary: per-layer training curves ─────────────────────────────
@@ -1883,8 +1936,8 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
         print("  Skipping R3: no activations collected")
         return
 
-    bf_hist_r3  = {'swd_unif': {}, 'swd_gauss': {}}
-    had_loss_r3 = {'swd_unif': {}, 'swd_gauss': {}}
+    bf_hist_r3  = {'kl_unif': {}, 'kl_gauss': {}}
+    had_loss_r3 = {'kl_unif': {}, 'kl_gauss': {}}
     is_pow2_r3  = head_dim > 0 and (head_dim & (head_dim - 1)) == 0
 
     for layer_idx in layer_indices:
@@ -1902,46 +1955,46 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
             print(f"  Layer {layer_idx}: head_dim={head_dim} not pow-2, skip Hadamard")
         else:
             had_acts_l = apply_hadamard_fwht(acts_l)
-            hv_u3      = compute_hadamard_loss(acts_l, 'swd_unif')
-            hv_g3      = compute_hadamard_loss(acts_l, 'swd_gauss')
-            print(f"  Layer {layer_idx}: Hadamard R3 swd_unif={hv_u3:.4f},"
-                  f" swd_gauss={hv_g3:.4f}")
-        had_loss_r3['swd_unif'][layer_idx]  = hv_u3
-        had_loss_r3['swd_gauss'][layer_idx] = hv_g3
+            hv_u3      = compute_hadamard_loss(acts_l, 'kl_unif')
+            hv_g3      = compute_hadamard_loss(acts_l, 'kl_gauss')
+            print(f"  Layer {layer_idx}: Hadamard R3 kl_unif={hv_u3:.4f},"
+                  f" kl_gauss={hv_g3:.4f}")
+        had_loss_r3['kl_unif'][layer_idx]  = hv_u3
+        had_loss_r3['kl_gauss'][layer_idx] = hv_g3
 
-        # ── Per-layer butterfly [swd_unif] + activation-only recon (INT4) ──
-        print(f"  Layer {layer_idx}: Training R3 butterfly [swd_unif + act recon INT4] ...")
+        # ── Per-layer butterfly [kl_unif] + activation-only recon (INT4) ───
+        print(f"  Layer {layer_idx}: Training R3 butterfly [kl_unif + act recon INT4] ...")
         bf_u3, hist_u3 = train_butterfly_with_history(
-            acts_l, head_dim, 'swd_unif',
+            acts_l, head_dim, 'kl_unif',
             quantizer_type='int4', lambda_recon=0.1,
         )
         bf_acts_u3 = apply_butterfly_to_acts(bf_u3, acts_l)
         with torch.no_grad():
-            bf_loss_u3 = _get_loss_fn('swd_unif')(
+            bf_loss_u3 = _get_loss_fn('kl_unif')(
                 torch.tensor(bf_acts_u3, device=DEVICE)).item()
-        bf_hist_r3['swd_unif'][layer_idx] = hist_u3
+        bf_hist_r3['kl_unif'][layer_idx] = hist_u3
 
-        # ── Per-layer butterfly [swd_gauss] + activation-only recon (NF4) ──
-        print(f"  Layer {layer_idx}: Training R3 butterfly [swd_gauss + act recon NF4] ...")
+        # ── Per-layer butterfly [kl_gauss] + activation-only recon (NF4) ───
+        print(f"  Layer {layer_idx}: Training R3 butterfly [kl_gauss + act recon NF4] ...")
         bf_g3, hist_g3 = train_butterfly_with_history(
-            acts_l, head_dim, 'swd_gauss',
+            acts_l, head_dim, 'kl_gauss',
             quantizer_type='nf4', lambda_recon=0.1,
         )
         bf_acts_g3 = apply_butterfly_to_acts(bf_g3, acts_l)
         with torch.no_grad():
-            bf_loss_g3 = _get_loss_fn('swd_gauss')(
+            bf_loss_g3 = _get_loss_fn('kl_gauss')(
                 torch.tensor(bf_acts_g3, device=DEVICE)).item()
-        bf_hist_r3['swd_gauss'][layer_idx] = hist_g3
+        bf_hist_r3['kl_gauss'][layer_idx] = hist_g3
 
-        print(f"  Layer {layer_idx}: R3 bf_unif={bf_loss_u3:.4f} (had={hv_u3:.4f}), "
-              f"bf_gauss={bf_loss_g3:.4f} (had={hv_g3:.4f})")
+        print(f"  Layer {layer_idx}: R3 bf_kl_unif={bf_loss_u3:.4f} (had={hv_u3:.4f}), "
+              f"bf_kl_gauss={bf_loss_g3:.4f} (had={hv_g3:.4f})")
 
         # ── Per-layer distribution plot ─────────────────────────────────────
         save_path = os.path.join(PLOT_DIR,
                                  f"{model_clean}_butterfly_R3_layer{layer_idx}.png")
         plot_butterfly_distribution(
             acts_l.flatten(), had_acts_l.flatten(), bf_acts_u3.flatten(),
-            hv_u3, bf_loss_u3, 'R3', layer_idx, 'swd_unif', model_name, save_path
+            hv_u3, bf_loss_u3, 'R3', layer_idx, 'kl_unif', model_name, save_path
         )
 
         # ── Per-layer variance uniformity plot ─────────────────────────────

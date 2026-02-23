@@ -178,7 +178,9 @@ except ImportError as e:
                 return self.forward(I.unsqueeze(0)).squeeze(0).T.float()
 
     class ButterflyFactored(ButterflyRotation):
-        pass  # simplified fallback
+        """Simplified fallback – ignores k_factor_mode (no non-power-of-2 support)."""
+        def __init__(self, dim, k_factor_mode: str = 'latent'):
+            super().__init__(dim)
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -395,9 +397,22 @@ def train_butterfly_with_history(acts_np: np.ndarray, dim: int,
                                   loss_fn_name: str,
                                   lr: float = LR_BF, momentum: float = MOMENTUM,
                                   epochs: int = EPOCHS_BF,
-                                  batch_size: int = BATCH_SIZE):
+                                  batch_size: int = BATCH_SIZE,
+                                  k_factor_mode: str = 'latent'):
     """
     Train Butterfly rotation for the given dimension and loss function.
+
+    Args:
+        acts_np       : Activations array, shape (N, dim)
+        dim           : Rotation dimension
+        loss_fn_name  : One of the keys in _LOSS_FNS
+        lr, momentum  : SGD hyperparameters
+        epochs        : Training epochs
+        batch_size    : Mini-batch size
+        k_factor_mode : K-factor parameterization for non-power-of-2 dims.
+                        'latent' (default) — OR-Orth unconstrained matrix + QR,
+                        same approach as R1/R2.
+                        'cayley' — Cayley transform Q=(I-A)(I+A)^{-1}.
 
     Returns:
         butterfly : trained ButterflyRotation or ButterflyFactored module
@@ -412,7 +427,7 @@ def train_butterfly_with_history(acts_np: np.ndarray, dim: int,
 
     is_pow2  = dim > 0 and (dim & (dim - 1)) == 0
     butterfly = (ButterflyRotation(dim) if is_pow2
-                 else ButterflyFactored(dim)).to(DEVICE)
+                 else ButterflyFactored(dim, k_factor_mode=k_factor_mode)).to(DEVICE)
 
     opt = torch.optim.SGD(butterfly.parameters(), lr=lr, momentum=momentum)
     sch = CosineAnnealingLR(opt, T_max=epochs, eta_min=0)

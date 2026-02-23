@@ -297,6 +297,50 @@ def collect_r4_activations(model, calibration_data, umodel, device):
     return None
 
 
+def collect_r4_weight_bank(umodel: 'UnifiedQuantModel',
+                           max_layers: int = 8) -> torch.Tensor:
+    """Collect a bank of down_proj weight matrices for R4 weight-aware recon.
+
+    Samples up to ``max_layers`` down_proj weight matrices (evenly spaced
+    across layers) and returns them as a tensor.  Used for the paper's Eq 17
+    joint weight+activation reconstruction loss.
+
+    For MoE models, expert 0 is used as the representative since all experts
+    share the same R4 rotation.
+
+    Args:
+        umodel: UnifiedQuantModel with accessible layers
+        max_layers: Maximum number of layers to sample
+
+    Returns:
+        Tensor of shape (num_samples, hidden_size, intermediate_size),
+        float32, on CPU.
+    """
+    layers = umodel.get_layers()
+    num_layers = len(layers)
+
+    # Sample evenly spaced layer indices
+    if num_layers <= max_layers:
+        layer_indices = list(range(num_layers))
+    else:
+        step = num_layers / max_layers
+        layer_indices = [int(i * step) for i in range(max_layers)]
+
+    weights = []
+    for idx in layer_indices:
+        layer = layers[idx]
+        down_proj = umodel.get_mlp_output_proj(layer)
+        W = down_proj.weight.data.float().cpu()  # (hidden_size, intermediate_size)
+        weights.append(W)
+
+    weight_bank = torch.stack(weights, dim=0)
+    logging.info(
+        f"  R4 weight bank: {weight_bank.shape[0]} layers sampled, "
+        f"shape per weight = {tuple(weight_bank.shape[1:])}"
+    )
+    return weight_bank
+
+
 # ============================================================================
 # Rotation Application
 # ============================================================================
@@ -873,6 +917,8 @@ def run_full_pipeline(args):
         model.to(DEV)
 
         # Train Butterfly R3 (for Q/K after RoPE)
+        # R3 is applied online (not baked into weights), so we use
+        # activation-only reconstruction loss (weight_matrices=None).
         if args.use_r3:
             logging.info("  Training Butterfly R3...")
             r3_acts = collect_r3_activations(model, calib_data, umodel, DEV)
@@ -888,14 +934,23 @@ def run_full_pipeline(args):
                     batch_size=args.batch_size,
                     cos_lr=True,
                     optim=args.optim,
+                    quantizer_type=args.quantizer_type,
+                    lambda_recon=args.lambda_recon,
+                    quant_block_size=args.quant_block_size,
+                    k_factor_mode=args.k_factor_mode,
                 )
                 del r3_acts
 
         # Train Butterfly R4 (for down_proj input)
+        # R4 is baked into down_proj weights offline, so we use the
+        # paper's Eq 17 weight-aware reconstruction loss.
         if args.use_r4:
             logging.info("  Training Butterfly R4...")
             r4_acts = collect_r4_activations(model, calib_data, umodel, DEV)
             if r4_acts is not None:
+                # Collect weight bank for joint weight+activation recon loss
+                r4_weight_bank = collect_r4_weight_bank(umodel, max_layers=8)
+
                 butterfly_r4 = train_butterfly(
                     activations=r4_acts,
                     dim=umodel.intermediate_size,
@@ -907,8 +962,14 @@ def run_full_pipeline(args):
                     batch_size=args.batch_size,
                     cos_lr=True,
                     optim=args.optim,
+                    quantizer_type=args.quantizer_type,
+                    lambda_recon=args.lambda_recon,
+                    quant_block_size=args.quant_block_size,
+                    weight_matrices=r4_weight_bank,
+                    weight_quantizer_type=args.quantizer_type,
+                    k_factor_mode=args.k_factor_mode,
                 )
-                del r4_acts
+                del r4_acts, r4_weight_bank
 
         model.cpu()
         cleanup_memory()

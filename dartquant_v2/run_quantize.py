@@ -67,8 +67,8 @@ from dartquant_v2.pipeline import run_full_pipeline
 
 # Recommended loss/quantizer pairings
 _RECOMMENDED_PAIRINGS = {
-    'int4': ['whip', 'swd_unif', 'kl_unif'],
-    'nf4':  ['swd_gauss', 'kl_gauss'],
+    'int4': ['whip', 'swd_unif', 'kl_unif', 'bin_kl_unif'],
+    'nf4':  ['swd_gauss', 'kl_gauss', 'bin_kl_nf4'],
 }
 
 
@@ -85,9 +85,17 @@ def _validate_and_warn(args):
 
     # Butterfly only affects R3/R4
     if args.butterfly:
+        k_mode_desc = {
+            'latent': 'latent QR-Orth (unconstrained matrix + QR decomposition)',
+            'cayley': 'Cayley transform (skew-symmetric + matrix solve)',
+        }
         logging.info(
             "Butterfly mode enabled: R3 and R4 will use learnable Butterfly "
             "Givens rotations instead of fixed Hadamard. R1/R2 are unaffected."
+        )
+        logging.info(
+            f"K-factor mode: {k_mode_desc.get(args.k_factor_mode, args.k_factor_mode)} "
+            f"(for non-power-of-2 dimensions)"
         )
 
     # NF4 is weight-only
@@ -118,6 +126,7 @@ def main():
     logging.info(f"Loss:           {args.loss}")
     logging.info(f"Quantizer:      {args.quantizer_type}")
     logging.info(f"Butterfly R3/4: {args.butterfly}")
+    logging.info(f"K-factor mode:  {args.k_factor_mode}")
     logging.info(f"W bits:         {args.w_bits}")
     logging.info(f"A bits:         {args.a_bits}")
     logging.info(f"K bits:         {args.k_bits}")

@@ -2,11 +2,13 @@
 Unified argument parser for DartQuant v2.
 
 Key required arguments (no defaults):
-  --loss {whip, swd_unif, swd_gauss}
+  --loss {whip, swd_unif, swd_gauss, kl_unif, kl_gauss, bin_kl_unif, bin_kl_nf4}
   --quantizer_type {int4, nf4}
 
-Optional new argument:
-  --butterfly (applies learnable Butterfly Givens to R3/R4 only)
+Optional arguments:
+  --butterfly       Apply learnable Butterfly Givens to R3/R4 only
+  --latent          (Default) Use latent QR-Orth for the non-power-of-2 K-factor
+  --cayley          Use Cayley parameterization for the non-power-of-2 K-factor
 """
 
 import argparse
@@ -41,13 +43,16 @@ def create_parser() -> argparse.ArgumentParser:
     loss_group = parser.add_argument_group('Loss Function')
     loss_group.add_argument(
         '--loss', type=str, required=True,
-        choices=['whip', 'swd_unif', 'swd_gauss', 'kl_unif', 'kl_gauss'],
+        choices=['whip', 'swd_unif', 'swd_gauss', 'kl_unif', 'kl_gauss',
+                 'bin_kl_unif', 'bin_kl_nf4'],
         help='Loss function for rotation training. '
              'whip: original DartQuant exponential repulsion (int4). '
              'swd_unif: Sliced Wasserstein Distance to Uniform (int4). '
              'swd_gauss: Gaussian SWD (nf4). '
              'kl_unif: KL divergence to Uniform via entropy maximisation (int4). '
              'kl_gauss: KL divergence to Gaussian via moment matching (nf4). '
+             'bin_kl_unif: Discrete-bin KL to Uniform over INT4 levels (paper Eq 19). '
+             'bin_kl_nf4: Discrete-bin KL to Uniform over NF4 levels (paper Eq 19). '
              'REQUIRED - no default.')
 
     # ==== Quantizer Type (REQUIRED) ====
@@ -67,6 +72,23 @@ def create_parser() -> argparse.ArgumentParser:
         help='Use learnable Butterfly Givens rotations for R3 and R4 '
              'instead of fixed random Hadamard. Only affects R3/R4, '
              'never R1/R2.')
+    k_factor_mode = rot_group.add_mutually_exclusive_group()
+    k_factor_mode.add_argument(
+        '--latent', action='store_const', const='latent',
+        dest='k_factor_mode',
+        help='(Default) Use latent QR decomposition (OR-Orth) for the '
+             'non-power-of-2 K-factor in ButterflyFactored (R3/R4). '
+             'An unconstrained K×K matrix is optimized; the orthogonal '
+             'factor is extracted via QR at each forward pass. '
+             'Same approach as R1/R2 (Algorithm 1, Section 2.3).')
+    k_factor_mode.add_argument(
+        '--cayley', action='store_const', const='cayley',
+        dest='k_factor_mode',
+        help='Use Cayley parameterization Q=(I-A)(I+A)^{-1} for the '
+             'non-power-of-2 K-factor in ButterflyFactored (R3/R4). '
+             'Guarantees strict orthogonality but requires O(K^3) '
+             'matrix solve per forward pass.')
+    parser.set_defaults(k_factor_mode='latent')
     rot_group.add_argument(
         '--use_r1', action='store_true', default=True,
         help='Use R1 global rotation')
@@ -113,8 +135,12 @@ def create_parser() -> argparse.ArgumentParser:
                              help='R1 training epochs')
     train_group.add_argument('--r2_epochs', type=int, default=5,
                              help='R2 training epochs')
-    train_group.add_argument('--butterfly_epochs', type=int, default=10,
-                             help='Butterfly R3/R4 training epochs')
+    train_group.add_argument(
+        '--butterfly_epochs', type=int, default=100,
+        help='Butterfly R3/R4 training epochs. Paper reports convergence '
+             'in 500-700 gradient steps with 86%% improvement in the first '
+             '200 steps. With 128 activation samples and batch_size=64, '
+             '100 epochs yields ~200 steps.')
     train_group.add_argument('--batch_size', type=int, default=64,
                              help='Training batch size')
     train_group.add_argument('--cos_lr', action='store_true', default=False,

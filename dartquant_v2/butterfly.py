@@ -178,31 +178,64 @@ class ButterflyFactored(nn.Module):
 
     Handles dimensions like 11008 (Llama-2-7B intermediate_size) by
     decomposing as n = K * m where m is power of 2, and applying
-    butterfly rotation to the m-dimensional sub-blocks while using a
-    fixed factor matrix for the K-dimensional part.
+    butterfly rotation to the m-dimensional sub-blocks.  For the
+    K-dimensional cross-block mixing factor, two parameterizations are
+    available:
+
+    **Latent QR-Orth** (default, ``k_factor_mode='latent'``):
+        An unconstrained latent matrix ``Z ∈ R^{K×K}`` is optimized,
+        and the orthogonal factor is extracted via QR decomposition
+        ``Q, _ = torch.linalg.qr(Z)`` at each forward pass.  This is
+        the same OR-Orth approach used by R1/R2 (Algorithm 1 in
+        Section 2.3 of the report).  It is numerically robust and
+        computationally cheap for the small K values encountered in
+        practice (e.g. K = 40 for dim = 5120).
+
+    **Cayley** (``k_factor_mode='cayley'``):
+        ``Q = (I − A)(I + A)^{-1}`` where ``A`` is skew-symmetric.
+        Guarantees strict orthogonality but requires an O(K³) matrix
+        solve per forward pass.  May suffer from gradient instability
+        when eigenvalues of ``(I + A)`` approach zero.
 
     For R4 where intermediate_size may not be power of 2.
 
     Args:
         total_dim: The full dimension (may not be power of 2)
+        k_factor_mode: Parameterization for the K-dimensional factor.
+            ``'latent'`` (default) — unconstrained matrix + QR (OR-Orth).
+            ``'cayley'`` — Cayley transform with skew-symmetric param.
     """
 
-    def __init__(self, total_dim: int):
+    def __init__(self, total_dim: int, k_factor_mode: str = 'latent'):
         super().__init__()
         self.total_dim = total_dim
+        self.k_factor_mode = k_factor_mode
 
         if total_dim > 0 and (total_dim & (total_dim - 1)) == 0:
-            # Pure power of 2 - use standard butterfly
+            # Pure power of 2 - use standard butterfly directly
             self.K = 1
             self.m = total_dim
             self.butterfly = ButterflyRotation(total_dim)
-            self.register_buffer('hadK', torch.ones(1, 1))
         else:
             # Factor as K * m where m = total_dim / K is power of 2
             self.K, self.m = self._find_factorization(total_dim)
             self.butterfly = ButterflyRotation(self.m)
-            # Use a fixed Hadamard-like matrix for the K-dimensional part
-            self.register_buffer('hadK', self._get_hadamard_factor(self.K))
+
+            if k_factor_mode == 'latent':
+                # OR-Orth: unconstrained latent matrix, orthogonal Q
+                # extracted via QR at each forward pass.
+                # Identity initialisation => training starts with K-dim
+                # unmixed, matching the Cayley A=0 => Q=I behaviour.
+                self.latent_matrix = nn.Parameter(
+                    torch.eye(self.K, self.K))
+            elif k_factor_mode == 'cayley':
+                # Cayley: skew-symmetric param, A=0 => Q=I.
+                self.cayley_A = nn.Parameter(
+                    torch.zeros(self.K, self.K))
+            else:
+                raise ValueError(
+                    f"Unknown k_factor_mode '{k_factor_mode}'. "
+                    "Choose 'latent' or 'cayley'.")
 
     @staticmethod
     def _find_factorization(n: int) -> tuple:
@@ -224,15 +257,44 @@ class ButterflyFactored(nn.Module):
                     return K, m
         raise ValueError(f"Cannot factorize {n} as K * (power of 2)")
 
-    @staticmethod
-    def _get_hadamard_factor(K: int) -> torch.Tensor:
-        """Get a K x K orthogonal matrix for the factor dimension."""
-        # Generate via QR decomposition of random matrix
-        torch.manual_seed(42)  # Deterministic for reproducibility
-        M = torch.randn(K, K, dtype=torch.float64)
-        Q, R = torch.linalg.qr(M)
-        Q *= torch.sign(torch.diag(R)).unsqueeze(0)
-        return Q.float()
+    def _get_cayley_Q(self) -> torch.Tensor:
+        """Compute orthogonal K x K matrix via Cayley parameterization.
+
+        Q = (I + A_skew)^{-1} (I - A_skew)
+
+        where A_skew = (A - A^T) / 2 is the skew-symmetric part of
+        self.cayley_A.  This guarantees Q is orthogonal for any real A.
+        torch.linalg.solve is used for numerical stability and is
+        auto-differentiable, so gradients flow back to cayley_A.
+        """
+        A_skew = (self.cayley_A - self.cayley_A.T) / 2.0
+        I = torch.eye(self.K, device=self.cayley_A.device,
+                       dtype=self.cayley_A.dtype)
+        # solve(I + A, I - A) = (I + A)^{-1} (I - A)
+        Q = torch.linalg.solve(I + A_skew, I - A_skew)
+        return Q
+
+    def _get_latent_Q(self) -> torch.Tensor:
+        """Compute orthogonal K x K matrix via QR decomposition (OR-Orth).
+
+        An unconstrained latent matrix Z is maintained as nn.Parameter.
+        At each forward pass, ``Q, _ = torch.linalg.qr(Z)`` extracts the
+        orthogonal factor.  torch.linalg.qr is auto-differentiable, so
+        gradients flow back through Z.
+
+        This is the same approach used by R1 (R1_QR) and R2 (R2_Per_Head)
+        in trainers.py, extended here to the K-dimensional cross-block
+        factor of the factored butterfly.
+        """
+        Q, _ = torch.linalg.qr(self.latent_matrix)
+        return Q
+
+    def _get_Q(self) -> torch.Tensor:
+        """Dispatch to the appropriate K-factor parameterization."""
+        if self.k_factor_mode == 'cayley':
+            return self._get_cayley_Q()
+        else:
+            return self._get_latent_Q()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply factored butterfly rotation.
@@ -252,10 +314,10 @@ class ButterflyFactored(nn.Module):
         x = self.butterfly(x)
         x = x.reshape(batch, self.K, self.m)
 
-        # Apply hadK factor to the K dimension
-        # x: (batch, K, m) -> hadK @ x over K dim
-        hadK = self.hadK.to(x.device).to(x.dtype)
-        x = torch.einsum('ij,bjk->bik', hadK, x)
+        # Apply learnable K-factor to the K dimension
+        # x: (batch, K, m) -> Q_K @ x over K dim
+        Q_K = self._get_Q().to(x.dtype)
+        x = torch.einsum('ij,bjk->bik', Q_K, x)
 
         # Normalize
         x = x / math.sqrt(self.total_dim)
@@ -267,7 +329,7 @@ class ButterflyFactored(nn.Module):
 
         Reverses the three steps of forward():
           1. Undo normalization (multiply by sqrt(total_dim))
-          2. Apply hadK^T to the K dimension
+          2. Apply Q_K^T to the K dimension (orthogonal)
           3. Apply butterfly.inverse_forward to the m dimension
         """
         if self.K == 1:
@@ -279,9 +341,9 @@ class ButterflyFactored(nn.Module):
         # Step 1: undo normalization
         x = x * math.sqrt(self.total_dim)
 
-        # Step 2: apply hadK^T over the K dimension
-        hadK = self.hadK.to(x.device).to(x.dtype)
-        x = torch.einsum('ji,bjk->bik', hadK, x)  # hadK.T
+        # Step 2: apply Q_K^T over the K dimension (Q is orthogonal)
+        Q_K = self._get_Q().to(x.dtype)
+        x = torch.einsum('ji,bjk->bik', Q_K, x)  # Q_K.T
 
         # Step 3: apply inverse butterfly to each m-dim sub-block
         batch = x.shape[0]

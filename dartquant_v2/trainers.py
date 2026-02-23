@@ -362,6 +362,9 @@ def train_butterfly(
     quantizer_type: str = 'none',
     lambda_recon: float = 0.1,
     quant_block_size: int = 64,
+    weight_matrices: torch.Tensor = None,
+    weight_quantizer_type: str = 'none',
+    k_factor_mode: str = 'latent',
 ) -> nn.Module:
     """Train a Butterfly Givens rotation.
 
@@ -369,19 +372,28 @@ def train_butterfly(
     may not be power of 2).
 
     The total loss combines the distribution-shaping loss with an optional
-    quantization reconstruction loss (doc Section 2.1.7 Phase 3):
+    quantization reconstruction loss (paper Eq 17).
 
-        L_total = L_dist(R3 @ X_in)
-                  + lambda_recon * ||X_in - R3^T @ FakeQuant(R3 @ X_in)||^2
+    **Weight-aware mode** (when weight_matrices is provided, for R4):
 
-    The reconstruction term uses a straight-through estimator (STE) so that
-    gradients flow back through the rotation parameters even though the
-    fake-quantizer's argmin/round operations have zero gradients.
+        L_recon = ||W @ x - Q(W @ B^T) @ Q(B @ x)||^2
+
+    where Q denotes Dequant(Quant(·)), B is the butterfly matrix, and W is
+    the down_proj weight.  This jointly accounts for both weight and
+    activation quantization error, matching the paper's formulation.
+
+    **Activation-only mode** (when weight_matrices is None, for R3):
+
+        L_recon = ||X_in - B^T @ Q(B @ X_in)||^2
+
+    Both modes use a straight-through estimator (STE) so that gradients
+    flow back through the rotation parameters despite the non-differentiable
+    quantizer.
 
     Args:
         activations: Tensor of shape (N, dim)
         dim: Rotation dimension
-        loss_fn_name: Loss function name ('whip', 'swd_unif', 'swd_gauss')
+        loss_fn_name: Loss function name
         label: Label for logging (e.g., "R3" or "R4")
         lr: Learning rate
         momentum: SGD momentum
@@ -390,12 +402,23 @@ def train_butterfly(
         cos_lr: Use cosine annealing LR scheduler
         optim: Optimizer ('sgd' or 'adam')
         device: Device string
-        quantizer_type: Fake quantizer for L_recon. One of:
+        quantizer_type: Fake quantizer for activation L_recon. One of:
             'nf4'  - NF4 non-uniform quantizer (pairs with swd_gauss)
             'int4' - INT4 symmetric uniform quantizer (pairs with swd_unif)
             'none' - Disable L_recon (original behaviour, default)
         lambda_recon: Weight for L_recon relative to L_dist (default 0.1)
         quant_block_size: Per-block size used by the fake quantizer (default 64)
+        weight_matrices: Optional tensor of shape (num_weights, out_dim, dim)
+            containing down_proj weight matrices for weight-aware reconstruction
+            loss (paper Eq 17). Only used for R4 where butterfly is baked into
+            weights. When None, falls back to activation-only reconstruction.
+        weight_quantizer_type: Fake quantizer for weight path. Same choices as
+            quantizer_type. Only used when weight_matrices is not None.
+        k_factor_mode: Parameterization for the K-dimensional factor in
+            ButterflyFactored (non-power-of-2 dims only).
+            'latent' (default) - unconstrained matrix + QR decomposition
+                (OR-Orth, same as R1/R2).
+            'cayley' - Cayley transform with skew-symmetric param.
 
     Returns:
         Trained ButterflyRotation or ButterflyFactored module
@@ -417,11 +440,38 @@ def train_butterfly(
 
     use_recon = fake_quant is not None and lambda_recon > 0.0
 
+    # Build optional weight fake quantizer for joint reconstruction loss (Eq 17)
+    weight_fake_quant: nn.Module | None = None
+    if weight_matrices is not None and weight_quantizer_type != 'none':
+        if weight_quantizer_type == 'nf4':
+            weight_fake_quant = NF4FakeQuantizer(block_size=quant_block_size).to(device)
+        elif weight_quantizer_type == 'int4':
+            weight_fake_quant = INT4FakeQuantizer(block_size=quant_block_size).to(device)
+        else:
+            raise ValueError(
+                f"Unknown weight_quantizer_type '{weight_quantizer_type}'. "
+                "Choose from 'nf4', 'int4', or 'none'."
+            )
+
+    use_weight_recon = (weight_matrices is not None and
+                        fake_quant is not None and
+                        weight_fake_quant is not None and
+                        lambda_recon > 0.0)
+
+    if use_weight_recon:
+        weight_matrices = weight_matrices.float().to(device)
+        num_weight_samples = weight_matrices.shape[0]
+        logging.info(
+            f"  Weight-aware recon (Eq 17) enabled: "
+            f"{num_weight_samples} weight matrices, "
+            f"shape {tuple(weight_matrices.shape)}"
+        )
+
     # Choose butterfly type based on dimension
     if dim > 0 and (dim & (dim - 1)) == 0:
         butterfly = ButterflyRotation(dim).to(device)
     else:
-        butterfly = ButterflyFactored(dim).to(device)
+        butterfly = ButterflyFactored(dim, k_factor_mode=k_factor_mode).to(device)
 
     optimizer = _create_optimizer(butterfly.parameters(), optim, lr, momentum)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None
@@ -435,7 +485,12 @@ def train_butterfly(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     butterfly.train()
-    recon_tag = f" + {lambda_recon}*L_recon[{quantizer_type}]" if use_recon else ""
+    if use_weight_recon:
+        recon_tag = f" + {lambda_recon}*L_recon_Eq17[act={quantizer_type},w={weight_quantizer_type}]"
+    elif use_recon:
+        recon_tag = f" + {lambda_recon}*L_recon[{quantizer_type}]"
+    else:
+        recon_tag = ""
     logging.info(
         f"Training Butterfly {label} (dim={dim}), {epochs} epochs, "
         f"loss={loss_fn_name}{recon_tag}"
@@ -452,15 +507,40 @@ def train_butterfly(
             # Distribution loss: L_dist(X_out)
             dist_loss = loss_fn(outputs)
 
-            if use_recon:
-                # Fake-quantize with STE so gradients flow through R3 parameters.
-                # Forward : x_hat  = FakeQuant(outputs)   (true quantized values)
-                # Backward: d/d_outputs treated as identity (straight-through)
+            if use_weight_recon:
+                # ── Paper Eq 17: joint weight + activation reconstruction ──
+                # L_recon = ||Wx - Q(W@B^T) · Q(B@x)||^2
+                # where Q = Dequant∘Quant (fake quantize-dequantize)
+
+                # Sample a random layer's weight from the bank
+                w_idx = torch.randint(0, num_weight_samples, (1,)).item()
+                W = weight_matrices[w_idx]  # (out_dim, dim)
+
+                # STE for activation quantisation: Bx
+                with torch.no_grad():
+                    Bx_q = fake_quant(outputs)
+                Bx_ste = outputs + (Bx_q - outputs).detach()
+
+                # Rotate weight rows by B^T and STE-quantise: WB^T
+                W_rotated = butterfly.inverse_forward(W)  # (out_dim, dim)
+                with torch.no_grad():
+                    WBt_q = weight_fake_quant(W_rotated)
+                WBt_ste = W_rotated + (WBt_q - W_rotated).detach()
+
+                # Ground-truth vs quantised output
+                y_true = batch @ W.T            # (batch_sz, out_dim)
+                y_hat = Bx_ste @ WBt_ste.T      # (batch_sz, out_dim)
+                recon_loss = F.mse_loss(y_true, y_hat)
+
+                loss = dist_loss + lambda_recon * recon_loss
+
+            elif use_recon:
+                # ── Activation-only reconstruction (for R3 online rotation) ──
+                # L_recon = ||X_in - B^T @ FakeQuant(B @ X_in)||^2
                 with torch.no_grad():
                     x_hat_q = fake_quant(outputs)
                 x_hat = outputs + (x_hat_q - outputs).detach()  # STE
 
-                # Reconstruction loss: L_recon = ||X_in - R3^T @ x_hat||^2
                 x_recon = butterfly.inverse_forward(x_hat)
                 recon_loss = F.mse_loss(batch, x_recon)
 

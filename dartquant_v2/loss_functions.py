@@ -1,16 +1,18 @@
 """
 Loss functions for rotation matrix training.
 
-Five loss functions:
-  - whip:     Original DartQuant Whip loss (exp-based repulsion from zero)
-  - swd_unif: Sliced Wasserstein Distance to Uniform distribution
-  - swd_gauss: Sliced Wasserstein Distance to Gaussian distribution
-  - kl_unif:  KL divergence to Uniform via differential-entropy maximization
-  - kl_gauss: KL divergence to Gaussian via moment matching (skewness + kurtosis)
+Seven loss functions:
+  - whip:        Original DartQuant Whip loss (exp-based repulsion from zero)
+  - swd_unif:    Sliced Wasserstein Distance to Uniform distribution
+  - swd_gauss:   Sliced Wasserstein Distance to Gaussian distribution
+  - kl_unif:     KL divergence to Uniform via differential-entropy maximization
+  - kl_gauss:    KL divergence to Gaussian via moment matching (skewness + kurtosis)
+  - bin_kl_unif: Discrete-bin KL to Uniform over INT4 quantizer levels (paper Eq 19)
+  - bin_kl_nf4:  Discrete-bin KL to Uniform over NF4 quantizer levels (paper Eq 19)
 
 Recommended pairings:
-  INT4 quantizer → whip / swd_unif / kl_unif
-  NF4  quantizer → swd_gauss / kl_gauss
+  INT4 quantizer → whip / swd_unif / kl_unif / bin_kl_unif
+  NF4  quantizer → swd_gauss / kl_gauss / bin_kl_nf4
 """
 
 import math
@@ -184,15 +186,134 @@ def calc_kl_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================================
+# Discrete-bin KL divergence losses (paper Eq 19)
+# ============================================================================
+
+def calc_bin_kl_unif_loss(outputs: torch.Tensor,
+                          num_levels: int = 15,
+                          temperature: float = 50.0) -> torch.Tensor:
+    """Discrete-bin KL divergence to Uniform over INT4 quantizer levels.
+
+    Computes KL(P_bins || Uniform) where bins are the actual INT4 quantizer
+    levels.  Uses a differentiable soft-histogram via sigmoid to assign
+    activations to bins, enabling gradient-based optimisation.
+
+    For INT4 with 15 symmetric levels in [-7, 7] (scaled by b/7):
+      bin edges are midpoints between consecutive levels, with boundary
+      sentinels one step beyond the outermost levels.
+
+    This directly prevents "pathological bin concentration" by forcing
+    activations to be evenly distributed across quantiser intervals.
+
+    Args:
+        outputs:     Rotated activations, shape (...,)
+        num_levels:  Number of quantiser levels (default 15 for INT4 symmetric)
+        temperature: Sigmoid temperature for soft binning (higher = sharper)
+
+    Pairs naturally with INT4 uniform quantiser.
+    """
+    x_flat = outputs.reshape(-1).float()
+
+    # Compute scale: b = sqrt(3) * RMS, matching INT4 symmetric range
+    with torch.no_grad():
+        rms = torch.sqrt(torch.mean(x_flat ** 2)).clamp(min=1e-8)
+        b = math.sqrt(3) * rms
+
+    # INT4 levels: 15 equally-spaced levels in [-b, b]
+    levels = torch.linspace(-b.item(), b.item(), steps=num_levels,
+                            device=x_flat.device)
+
+    # Bin edges: midpoints between consecutive levels, plus sentinels
+    midpoints = (levels[:-1] + levels[1:]) / 2.0         # (num_levels - 1,)
+    step = levels[1] - levels[0]
+    neg_sentinel = (levels[0] - step).unsqueeze(0)        # one step below min
+    pos_sentinel = (levels[-1] + step).unsqueeze(0)       # one step above max
+    edges = torch.cat([neg_sentinel, midpoints, pos_sentinel])  # (num_levels + 1,)
+
+    # Soft histogram via sigmoid
+    # sigs[i, j] = sigma(T * (x[j] - edges[i])),  shape (num_levels + 1, N)
+    sigs = torch.sigmoid(temperature * (x_flat.unsqueeze(0) - edges.unsqueeze(1)))
+
+    # bin_probs[i] = mean(sigs[i] - sigs[i+1])
+    bin_probs = (sigs[:-1] - sigs[1:]).mean(dim=1)       # (num_levels,)
+
+    # Normalise for numerical stability (should already sum to ~1)
+    bin_probs = bin_probs.clamp(min=1e-8)
+    bin_probs = bin_probs / bin_probs.sum()
+
+    # KL(P || Uniform) = sum p_i * log(p_i * num_levels)
+    kl = (bin_probs * torch.log(bin_probs * num_levels)).sum()
+    return kl
+
+
+def calc_bin_kl_nf4_loss(outputs: torch.Tensor,
+                          temperature: float = 50.0) -> torch.Tensor:
+    """Discrete-bin KL divergence to Uniform over NF4 quantizer levels.
+
+    Same approach as calc_bin_kl_unif_loss but uses the non-uniform NF4
+    codebook levels (16 levels from the QLoRA paper, optimal for N(0,1)).
+    Activations are first normalised by absmax to match NF4's per-block
+    [-1, 1] normalisation.
+
+    When activations are Gaussian, the NF4 levels produce equal-probability
+    bins, so KL(P_bins || Uniform) = 0.  Minimising this loss therefore
+    drives activations toward Gaussian shape in a way that is aligned
+    with the actual quantiser.
+
+    Args:
+        outputs:     Rotated activations, shape (...,)
+        temperature: Sigmoid temperature for soft binning (higher = sharper)
+
+    Pairs naturally with NF4 (Normal Float 4-bit) quantiser.
+    """
+    x_flat = outputs.reshape(-1).float()
+
+    # Normalise to [-1, 1] by absmax (matching NF4 per-block normalisation)
+    with torch.no_grad():
+        absmax = x_flat.abs().max().clamp(min=1e-8)
+    x_norm = x_flat / absmax
+
+    # NF4 quantisation levels (from nf4_quantizer.py / QLoRA paper)
+    nf4_levels = torch.tensor([
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+        0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+        0.7229568362236023, 1.0,
+    ], device=x_flat.device, dtype=x_flat.dtype)
+    num_levels = nf4_levels.shape[0]   # 16
+
+    # Bin edges: midpoints between consecutive NF4 levels, plus sentinels
+    midpoints = (nf4_levels[:-1] + nf4_levels[1:]) / 2.0
+    neg_sentinel = torch.tensor([-1.5], device=x_flat.device, dtype=x_flat.dtype)
+    pos_sentinel = torch.tensor([1.5], device=x_flat.device, dtype=x_flat.dtype)
+    edges = torch.cat([neg_sentinel, midpoints, pos_sentinel])  # (17,)
+
+    # Soft histogram via sigmoid
+    sigs = torch.sigmoid(temperature * (x_norm.unsqueeze(0) - edges.unsqueeze(1)))
+    bin_probs = (sigs[:-1] - sigs[1:]).mean(dim=1)       # (16,)
+
+    # Normalise for numerical stability
+    bin_probs = bin_probs.clamp(min=1e-8)
+    bin_probs = bin_probs / bin_probs.sum()
+
+    # KL(P || Uniform) = sum p_i * log(p_i * num_levels)
+    kl = (bin_probs * torch.log(bin_probs * num_levels)).sum()
+    return kl
+
+
+# ============================================================================
 # Registry
 # ============================================================================
 
 _LOSS_REGISTRY = {
-    'whip':      calc_whip_loss,
-    'swd_unif':  calc_swd_unif_loss,
-    'swd_gauss': calc_swd_gauss_loss,
-    'kl_unif':   calc_kl_unif_loss,
-    'kl_gauss':  calc_kl_gauss_loss,
+    'whip':        calc_whip_loss,
+    'swd_unif':    calc_swd_unif_loss,
+    'swd_gauss':   calc_swd_gauss_loss,
+    'kl_unif':     calc_kl_unif_loss,
+    'kl_gauss':    calc_kl_gauss_loss,
+    'bin_kl_unif': calc_bin_kl_unif_loss,
+    'bin_kl_nf4':  calc_bin_kl_nf4_loss,
 }
 
 
@@ -200,7 +321,8 @@ def get_loss_fn(loss_name: str):
     """Get loss function by name.
 
     Args:
-        loss_name: One of 'whip', 'swd_unif', 'swd_gauss', 'kl_unif', 'kl_gauss'
+        loss_name: One of 'whip', 'swd_unif', 'swd_gauss', 'kl_unif',
+                   'kl_gauss', 'bin_kl_unif', 'bin_kl_nf4'
 
     Returns:
         Callable loss function that takes (outputs: Tensor) -> Tensor

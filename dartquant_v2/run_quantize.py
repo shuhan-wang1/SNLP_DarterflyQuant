@@ -67,8 +67,8 @@ from dartquant_v2.pipeline import run_full_pipeline
 
 # Recommended loss/quantizer pairings
 _RECOMMENDED_PAIRINGS = {
-    'int4': ['whip', 'swd_unif'],
-    'nf4': ['swd_gauss'],
+    'int4': ['whip', 'swd_unif', 'kl_unif'],
+    'nf4':  ['swd_gauss', 'kl_gauss'],
 }
 
 

@@ -41,11 +41,13 @@ def create_parser() -> argparse.ArgumentParser:
     loss_group = parser.add_argument_group('Loss Function')
     loss_group.add_argument(
         '--loss', type=str, required=True,
-        choices=['whip', 'swd_unif', 'swd_gauss'],
+        choices=['whip', 'swd_unif', 'swd_gauss', 'kl_unif', 'kl_gauss'],
         help='Loss function for rotation training. '
-             'whip: original DartQuant exponential repulsion. '
-             'swd_unif: Sliced Wasserstein Distance to Uniform (pairs with int4). '
-             'swd_gauss: Gaussian SWD (pairs with nf4). '
+             'whip: original DartQuant exponential repulsion (int4). '
+             'swd_unif: Sliced Wasserstein Distance to Uniform (int4). '
+             'swd_gauss: Gaussian SWD (nf4). '
+             'kl_unif: KL divergence to Uniform via entropy maximisation (int4). '
+             'kl_gauss: KL divergence to Gaussian via moment matching (nf4). '
              'REQUIRED - no default.')
 
     # ==== Quantizer Type (REQUIRED) ====

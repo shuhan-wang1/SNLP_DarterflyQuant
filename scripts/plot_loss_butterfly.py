@@ -25,6 +25,7 @@ import sys
 import gc
 import math
 import random
+import csv
 import warnings
 import numpy as np
 import torch
@@ -574,6 +575,7 @@ def plot_loss_distribution(original_acts: np.ndarray,
     ]
 
     fig, axes = plt.subplots(1, 4, figsize=(28, 6))
+    csv_rows = []
     for ax, (title, data, color, pdf, pdf_lbl) in zip(axes, panels):
         d = np.clip(data.flatten(), lo, hi)
         counts, _, _ = ax.hist(d, bins=bins, density=True, color=color,
@@ -594,9 +596,11 @@ def plot_loss_distribution(original_acts: np.ndarray,
         # Statistics annotation
         k   = compute_kurtosis(data)
         rms = math.sqrt(max(float(np.mean(data.astype(np.float64) ** 2)), 1e-12))
-        ax.text(0.97, 0.97, f'Kurt={k:.2f}\nRMS={rms:.3f}\nStd={float(data.std()):.3f}',
+        std = float(data.std())
+        ax.text(0.97, 0.97, f'Kurt={k:.2f}\nRMS={rms:.3f}\nStd={std:.3f}',
                 transform=ax.transAxes, ha='right', va='top', fontsize=8,
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.85))
+        csv_rows.append([title, layer_idx, k, rms, std])
 
         ax.set_title(f'{title}\n(Layer {layer_idx})', fontsize=10, fontweight='bold')
         ax.set_xlabel('Activation Value', fontsize=9)
@@ -613,6 +617,13 @@ def plot_loss_distribution(original_acts: np.ndarray,
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'    Saved: {os.path.basename(save_path)}')
+
+    csv_path = save_path.replace('.png', '.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['panel', 'layer_idx', 'kurtosis', 'rms', 'std'])
+        writer.writerows(csv_rows)
+    print(f'    Saved: {os.path.basename(csv_path)}')
 
 
 def plot_loss_training_curves(histories: dict,   # {loss_name: {layer_idx: [float]}}
@@ -649,6 +660,18 @@ def plot_loss_training_curves(histories: dict,   # {loss_name: {layer_idx: [floa
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'    Saved: {os.path.basename(save_path)}')
+
+    csv_path = save_path.replace('.png', '.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['layer_idx', 'loss_name', 'epoch', 'loss_value'])
+        for loss_name in styles:
+            for layer_idx in layer_indices:
+                h = histories.get(loss_name, {}).get(layer_idx)
+                if h:
+                    for epoch, val in enumerate(h, 1):
+                        writer.writerow([layer_idx, loss_name, epoch, val])
+    print(f'    Saved: {os.path.basename(csv_path)}')
 
 
 def plot_butterfly_distribution(original_flat: np.ndarray,
@@ -698,6 +721,20 @@ def plot_butterfly_distribution(original_flat: np.ndarray,
     plt.close()
     print(f'    Saved: {os.path.basename(save_path)}')
 
+    csv_path = save_path.replace('.png', '.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['panel', 'layer_idx', 'rotation_label', 'loss_fn_name',
+                         'loss_value', 'kurtosis'])
+        panel_names  = ['original', 'hadamard', 'butterfly']
+        panel_arrays = [original_flat, had_flat, bf_flat]
+        panel_losses = [None, had_loss, bf_loss]
+        for pname, pdata, ploss in zip(panel_names, panel_arrays, panel_losses):
+            k = compute_kurtosis(pdata)
+            writer.writerow([pname, layer_idx, rotation_label, loss_fn_name,
+                             '' if ploss is None else ploss, k])
+    print(f'    Saved: {os.path.basename(csv_path)}')
+
 
 def plot_variance_uniformity(var_orig: np.ndarray,
                               var_had: np.ndarray,
@@ -723,7 +760,7 @@ def plot_variance_uniformity(var_orig: np.ndarray,
     ax.axhline(ideal, color='crimson', ls='--', lw=1.5,
                label=f'Ideal (mean var={ideal:.4f})')
 
-    ax.set_xlabel('Head Dimension Index (0 = lowest RoPE frequency)', fontsize=11)
+    ax.set_xlabel('Head Dimension Index (0 = highest RoPE frequency)', fontsize=11)
     ax.set_ylabel('Per-Dimension Variance', fontsize=11)
     model_short = model_name.split('/')[-1]
     ax.set_title(
@@ -740,6 +777,14 @@ def plot_variance_uniformity(var_orig: np.ndarray,
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'    Saved: {os.path.basename(save_path)}')
+
+    csv_path = save_path.replace('.png', '.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['dim_index', 'var_original', 'var_hadamard', 'var_butterfly'])
+        for i, (vo, vh, vb) in enumerate(zip(var_orig, var_had, var_bf)):
+            writer.writerow([i, float(vo), float(vh), float(vb)])
+    print(f'    Saved: {os.path.basename(csv_path)}')
 
 
 def plot_butterfly_training_curves(bf_histories: dict,   # {loss_name: {layer_idx: [float]}}
@@ -793,6 +838,21 @@ def plot_butterfly_training_curves(bf_histories: dict,   # {loss_name: {layer_id
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'    Saved: {os.path.basename(save_path)}')
+
+    csv_path = save_path.replace('.png', '.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['layer_idx', 'loss_name', 'type', 'epoch', 'loss_value'])
+        for loss_name in bf_styles:
+            for layer_idx in layer_indices:
+                h = bf_histories.get(loss_name, {}).get(layer_idx)
+                if h:
+                    for epoch, val in enumerate(h, 1):
+                        writer.writerow([layer_idx, loss_name, 'butterfly', epoch, val])
+                hv = had_losses.get(loss_name, {}).get(layer_idx)
+                if hv is not None and not math.isinf(hv):
+                    writer.writerow([layer_idx, loss_name, 'hadamard_baseline', '', hv])
+    print(f'    Saved: {os.path.basename(csv_path)}')
 
 
 # ============================================================================

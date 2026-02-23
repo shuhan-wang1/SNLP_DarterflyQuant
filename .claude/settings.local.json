@@ -7,7 +7,11 @@
       "Bash(dir:*)",
       "Bash(python3:*)",
       "Bash(git -C /c/Users/shuhan/Desktop/UCL/snlp/int4_quantization_darkquant log --oneline -20)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:learnopencv.com)",
+      "WebFetch(domain:amaarora.github.io)"
     ]
   }
 }

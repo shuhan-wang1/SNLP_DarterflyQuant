@@ -14,16 +14,16 @@ Pipeline mirroring:
       → per-head rotation (R2_Per_Head from dartquant_v2.trainers)
   R3: hook q_proj outputs, reshape to (N*num_heads, head_dim)
       → Butterfly Givens rotation (mirrors pipeline.collect_r3_activations)
-  R4: collect from ALL layers' mlp.down_proj inputs, concatenate
-      → Butterfly Givens rotation (mirrors pipeline.collect_r4_activations)
+  R4: fixed Random Hadamard transform (no butterfly training)
+      → Hadamard applied at pipeline runtime; no comparison experiment.
 
 Experiments:
   Experiment 1: R1 loss function comparison (Whip / SWD_Unif / SWD_Gauss)
     - All-layer pipeline-style activation collection
     - Distribution histograms + training loss curves
   Experiment 2: R2 per-head rotation (report final per-layer loss)
-  Experiment 3: Butterfly (R3/R4) vs Hadamard
-    - R3 and R4 distributions + variance uniformity + training curves
+  Experiment 3: Butterfly R3 vs Hadamard (R4 skipped — uses fixed Hadamard)
+    - R3 distributions + variance uniformity + training curves
 
 Configuration mirrors scripts/stat_and_download.py exactly.
 Output directory: {CACHE_DIR}/dartquant_v2_plots/
@@ -94,7 +94,7 @@ LR_LOSS     = 1e-3    # learning rate for R1 / R2
 LR_BF       = 1e-3    # learning rate for Butterfly R3/R4
 MOMENTUM    = 0.9
 EPOCHS_LOSS = 10      # R1/R2 epochs (matches pipeline --r1_epochs 10)
-EPOCHS_BF   = 250      # Butterfly epochs (matches pipeline --butterfly_epochs)
+EPOCHS_BF   = 20      # Butterfly epochs (matches pipeline --butterfly_epochs)
 BATCH_SIZE  = 64
 
 # ============================================================================
@@ -1818,7 +1818,9 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
                                calib_data, layer_indices,
                                model_name, model_clean):
     """
-    Experiment 3: Butterfly (R3 + R4) — per-layer independent training (Flaw 2 fix).
+    Experiment 3: Butterfly (R3 only) — per-layer independent training (Flaw 2 fix).
+
+    R4 uses a fixed Random Hadamard transform (no butterfly training or comparison).
 
     Flaw 2 fix: Each transformer layer has a distinct activation covariance Σ_l.
     Training a single global butterfly on all-layer concatenated activations causes
@@ -1832,118 +1834,17 @@ def run_experiment3_butterfly(model, arch_wrapper: _ArchWrapper,
       kl_unif  — Vasicek entropy maximisation → Uniform target (INT4)
       kl_gauss — Gram-Charlier moment matching → Gaussian target (NF4)
 
-    R4 (down_proj inputs, dim=intermediate_size):
-      Joint weight+activation reconstruction loss (paper Eq 17, Flaw 1 fix):
-        L_total = L_KL(B·x) + λ · ||W·x − Q(W·B^T) · Q(B·x)||²_F
-      Prevents optimizer from reducing distribution loss at the expense of
-      catastrophic condition-number blow-up in the rotated weight matrix W·B^T.
-
     R3 (Q+K proj outputs, dim=head_dim):
       Activation-only reconstruction loss (Flaw 1 fix), joint Q+K (Flaw 3 fix):
         L_total = L_KL(B·x) + λ · ||x − B^T · Q(B·x)||²
 
     Plots per selected layer:
-      {model_clean}_butterfly_R4_layer{l}.png
       {model_clean}_butterfly_R3_layer{l}.png
-      {model_clean}_butterfly_R4_curves_perlayer.png
       {model_clean}_butterfly_R3_curves_perlayer.png
       {model_clean}_R3_variance_layer{l}.png
     """
-    print("\n  [Exp 3] Butterfly vs Hadamard (R3+R4) — per-layer training (Flaw 2 fix)")
+    print("\n  [Exp 3] Butterfly R3 — per-layer training (Flaw 2 fix) | R4 = Random Hadamard (fixed)")
     dev = _model_device(model)
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # R4: Collect ALL layers in a single forward pass, then train per-layer.
-    # Each layer's butterfly sees only its own down_proj activations and its
-    # own weight matrix — no gradient leakage between layers.
-    # ═══════════════════════════════════════════════════════════════════════
-    print("\n  --- R4 (down_proj inputs, per-layer butterfly + Eq17 recon, dim=intermediate_size) ---")
-    r4_targets = arch_wrapper.r4_collection_targets()
-    print(f"  Collecting R4 activations: {len(r4_targets)} targets (single forward pass) ...")
-    r4_raw = collect_pipeline_activations(model, calib_data, r4_targets, dev)
-
-    int_size = arch_wrapper.intermediate_size
-    if not r4_raw:
-        print("  Skipping R4: no activations collected")
-    else:
-        if int_size is None:
-            int_size = list(r4_raw.values())[0].shape[-1]
-
-        bf_hist_r4  = {'kl_unif': {}, 'kl_gauss': {}}
-        had_loss_r4 = {'kl_unif': {}, 'kl_gauss': {}}
-        is_pow2_r4  = int_size > 0 and (int_size & (int_size - 1)) == 0
-
-        for layer_idx in layer_indices:
-            layer_key = r4_targets[layer_idx]
-            if layer_key not in r4_raw:
-                print(f"  Layer {layer_idx}: R4 activations not found, skipping")
-                continue
-
-            acts_l = r4_raw[layer_key].numpy().astype(np.float32).reshape(-1, int_size)
-            print(f"  Layer {layer_idx}: R4 acts={acts_l.shape}")
-
-            # ── Hadamard baseline ───────────────────────────────────────────
-            if not is_pow2_r4:
-                had_acts_l = acts_l.copy()
-                hv_u = hv_g = float('inf')
-                print(f"  Layer {layer_idx}: int_size={int_size} not pow-2, skip Hadamard")
-            else:
-                had_acts_l = apply_hadamard_fwht(acts_l)
-                hv_u       = compute_hadamard_loss(acts_l, 'kl_unif')
-                hv_g       = compute_hadamard_loss(acts_l, 'kl_gauss')
-                print(f"  Layer {layer_idx}: Hadamard R4 kl_unif={hv_u:.4f},"
-                      f" kl_gauss={hv_g:.4f}")
-            had_loss_r4['kl_unif'][layer_idx]  = hv_u
-            had_loss_r4['kl_gauss'][layer_idx] = hv_g
-
-            # ── Weight bank for Eq 17 (this layer's down_proj only) ─────────
-            # Shape: (1, hidden_size, int_size) = (1, out_dim, dim)
-            W_bank = arch_wrapper._down_proj_weight_for_layer(layer_idx).unsqueeze(0)
-
-            # ── Per-layer butterfly [kl_unif] + Eq17 INT4 weight+act quant ──
-            print(f"  Layer {layer_idx}: Training R4 butterfly [kl_unif + Eq17 INT4] ...")
-            bf_u, hist_u = train_butterfly_with_history(
-                acts_l, int_size, 'kl_unif',
-                quantizer_type='int4', weight_quantizer_type='int4',
-                weight_matrices=W_bank, lambda_recon=0.1,
-            )
-            bf_acts_u = apply_butterfly_to_acts(bf_u, acts_l)
-            with torch.no_grad():
-                bf_loss_u = _get_loss_fn('kl_unif')(
-                    torch.tensor(bf_acts_u, device=DEVICE)).item()
-            bf_hist_r4['kl_unif'][layer_idx] = hist_u
-
-            # ── Per-layer butterfly [kl_gauss] + Eq17 NF4 act / INT4 weight ─
-            print(f"  Layer {layer_idx}: Training R4 butterfly [kl_gauss + Eq17 NF4/INT4] ...")
-            bf_g, hist_g = train_butterfly_with_history(
-                acts_l, int_size, 'kl_gauss',
-                quantizer_type='nf4', weight_quantizer_type='int4',
-                weight_matrices=W_bank, lambda_recon=0.1,
-            )
-            bf_acts_g = apply_butterfly_to_acts(bf_g, acts_l)
-            with torch.no_grad():
-                bf_loss_g = _get_loss_fn('kl_gauss')(
-                    torch.tensor(bf_acts_g, device=DEVICE)).item()
-            bf_hist_r4['kl_gauss'][layer_idx] = hist_g
-
-            print(f"  Layer {layer_idx}: R4 bf_kl_unif={bf_loss_u:.4f} (had={hv_u:.4f}), "
-                  f"bf_kl_gauss={bf_loss_g:.4f} (had={hv_g:.4f})")
-
-            # ── Per-layer distribution plot (kl_unif butterfly shown) ────────
-            save_path = os.path.join(PLOT_DIR,
-                                     f"{model_clean}_butterfly_R4_layer{layer_idx}.png")
-            plot_butterfly_distribution(
-                acts_l.flatten(), had_acts_l.flatten(), bf_acts_u.flatten(),
-                hv_u, bf_loss_u, 'R4', layer_idx, 'kl_unif', model_name, save_path
-            )
-
-        # ── Summary: per-layer training curves ─────────────────────────────
-        if any(bf_hist_r4[k] for k in bf_hist_r4):
-            save_path = os.path.join(PLOT_DIR,
-                                     f"{model_clean}_butterfly_R4_curves_perlayer.png")
-            plot_butterfly_training_curves(
-                bf_hist_r4, had_loss_r4, 'R4', layer_indices, model_name, save_path
-            )
 
     # ═══════════════════════════════════════════════════════════════════════
     # R3: Collect ALL layers (Q+K) in a single forward pass, then train per-layer.

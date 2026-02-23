@@ -478,6 +478,60 @@ def train_r2_all_layers(
 # Butterfly Training (for R3 and R4)
 # ============================================================================
 
+def _init_butterfly_from_hadamard(
+    butterfly: 'ButterflyRotation',
+    dim: int,
+    device,
+    n_steps: int = 300,
+    lr: float = 0.05,
+):
+    """Warm-start ButterflyRotation angles by fitting to a random Hadamard matrix.
+
+    Generates H = WHT_normalized * diag(D), where D is a random ±1 diagonal,
+    then minimises ||B(θ) - H||_F with Adam for n_steps steps.
+    This starts the main butterfly training from the Hadamard point rather than
+    the identity (θ = 0), matching DartQuant's original Random Hadamard baseline.
+
+    Skipped silently for ButterflyFactored (non-power-of-2 dims).
+    """
+    if not isinstance(butterfly, ButterflyRotation):
+        return  # ButterflyFactored: leave at identity
+
+    # ── Build random Hadamard target ─────────────────────────────────────────
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(
+            _os.path.dirname(__file__), '..', 'DartQuant', 'fake_quant'))
+        from hadamard_utils import random_hadamard_matrix
+        H = random_hadamard_matrix(dim, device).float()
+    except (ImportError, Exception):
+        # Pure PyTorch fallback: WHT_normalized * random column signs
+        D = (torch.randint(0, 2, (dim,)) * 2 - 1).float().to(device)
+        x = torch.eye(dim, device=device)
+        h = 1
+        while h < dim:
+            x = x.reshape(dim, dim // (2 * h), 2, h)
+            a = x[:, :, 0, :].contiguous()
+            b = x[:, :, 1, :].contiguous()
+            x = torch.stack([a + b, a - b], dim=2).reshape(dim, dim)
+            h *= 2
+        H = (x / math.sqrt(dim)) * D.unsqueeze(0)
+
+    H = H.detach()
+    I_mat = torch.eye(dim, device=device, dtype=torch.float32)
+    init_opt = torch.optim.Adam(butterfly.parameters(), lr=lr)
+    butterfly.train()
+    for _ in range(n_steps):
+        init_opt.zero_grad()
+        loss = ((butterfly.forward(I_mat) - H) ** 2).sum()
+        loss.backward()
+        init_opt.step()
+
+    with torch.no_grad():
+        fit_loss = ((butterfly.forward(I_mat) - H) ** 2).sum().item()
+    logging.info(f"  Butterfly Hadamard init (dim={dim}): fit loss = {fit_loss:.4f}")
+
+
 def train_butterfly(
     activations: torch.Tensor,
     dim: int,
@@ -603,6 +657,9 @@ def train_butterfly(
         butterfly = ButterflyRotation(dim).to(device)
     else:
         butterfly = ButterflyFactored(dim, k_factor_mode=k_factor_mode).to(device)
+
+    # Warm-start from random Hadamard (mirrors DartQuant's original R3/R4 baseline)
+    _init_butterfly_from_hadamard(butterfly, dim, device)
 
     optimizer = _create_optimizer(butterfly.parameters(), optim, lr, momentum)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None

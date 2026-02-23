@@ -253,6 +253,8 @@ except ImportError as e:
                 raise ValueError(f"ButterflyRotation requires power-of-2 dim, got {dim}")
             self.dim = dim
             self.num_layers = int(math.log2(dim))
+            # Initialize to 0 (identity); Hadamard warm-start done by
+            # _init_butterfly_from_hadamard() before the main training loop.
             self.angles = nn.Parameter(torch.zeros(self.num_layers, dim // 2))
             for l in range(self.num_layers):
                 stride = 2 ** l
@@ -1084,6 +1086,53 @@ def train_r2_with_history(
 
 # ── Butterfly (R3 / R4) ──────────────────────────────────────────────────────
 
+def _init_butterfly_from_hadamard(butterfly: nn.Module, dim: int,
+                                   n_steps: int = 300, lr: float = 0.05):
+    """Warm-start butterfly angles by fitting to a random Hadamard matrix.
+
+    Mirrors dartquant_v2.trainers._init_butterfly_from_hadamard:
+      H = WHT_normalized * diag(D),  D = random ±1 diagonal
+      Minimise ||B(θ) - H||_F with Adam for n_steps steps.
+
+    Only applies to power-of-2 dims (ButterflyRotation with .angles attribute).
+    """
+    if not (dim > 0 and (dim & (dim - 1)) == 0):
+        return  # ButterflyFactored: skip
+    if not hasattr(butterfly, 'angles'):
+        return
+
+    # ── Build random Hadamard target ──────────────────────────────────────────
+    try:
+        from hadamard_utils import random_hadamard_matrix
+        H = random_hadamard_matrix(dim, DEVICE).float()
+    except (ImportError, Exception):
+        # Pure PyTorch fallback: WHT_normalized * random column signs
+        D = (torch.randint(0, 2, (dim,)) * 2 - 1).float().to(DEVICE)
+        x = torch.eye(dim, device=DEVICE)
+        h = 1
+        while h < dim:
+            x = x.reshape(dim, dim // (2 * h), 2, h)
+            a = x[:, :, 0, :].contiguous()
+            b = x[:, :, 1, :].contiguous()
+            x = torch.stack([a + b, a - b], dim=2).reshape(dim, dim)
+            h *= 2
+        H = (x / math.sqrt(dim)) * D.unsqueeze(0)
+
+    H = H.detach()
+    I_mat = torch.eye(dim, device=DEVICE, dtype=torch.float32)
+    init_opt = torch.optim.Adam(butterfly.parameters(), lr=lr)
+    butterfly.train()
+    for _ in range(n_steps):
+        init_opt.zero_grad()
+        loss = ((butterfly.forward(I_mat) - H) ** 2).sum()
+        loss.backward()
+        init_opt.step()
+
+    with torch.no_grad():
+        fit_loss = ((butterfly.forward(I_mat) - H) ** 2).sum().item()
+    print(f"    Butterfly Hadamard init (dim={dim}): fit loss = {fit_loss:.4f}")
+
+
 def train_butterfly_with_history(
     acts_np: np.ndarray,
     dim: int,
@@ -1135,6 +1184,9 @@ def train_butterfly_with_history(
     is_pow2   = dim > 0 and (dim & (dim - 1)) == 0
     butterfly = (ButterflyRotation(dim) if is_pow2
                  else ButterflyFactored(dim, k_factor_mode=k_factor_mode)).to(DEVICE)
+
+    # ── Warm-start from random Hadamard (mirrors DartQuant R3/R4 baseline) ───
+    _init_butterfly_from_hadamard(butterfly, dim)
 
     if optim_name == 'sgd':
         optimizer = torch.optim.SGD(butterfly.parameters(), lr=lr, momentum=momentum)

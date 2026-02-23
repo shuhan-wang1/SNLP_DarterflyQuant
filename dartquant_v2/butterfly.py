@@ -8,7 +8,8 @@ Key properties:
   - K = log2(d) layers, each with d/2 independent Givens rotations
   - Total learnable parameters: (d/2) * log2(d)
   - Always orthogonal by construction (product of Givens rotations)
-  - Identity initialization (all angles = 0) for stable training start
+  - Identity initialization (angles = 0); Hadamard warm-start done at
+    training time via _init_butterfly_from_hadamard() in trainers.py
 
 Reference: docs/report_2_en.md Section 2.1
 """
@@ -42,7 +43,8 @@ class ButterflyRotation(nn.Module):
 
         # (d/2) angles per butterfly layer, K = log2(d) layers
         # Total: (d/2) * log2(d) learnable parameters
-        # Initialize to 0 (identity rotation)
+        # Initialize to 0 (identity); Hadamard warm-start is applied by
+        # _init_butterfly_from_hadamard() in trainers.py at training time.
         self.angles = nn.Parameter(torch.zeros(self.num_layers, dim // 2))
 
         # Pre-compute pairing indices for each layer

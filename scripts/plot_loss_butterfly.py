@@ -114,6 +114,7 @@ try:
     from dartquant_v2.unified_model import get_arch_config
     from dartquant_v2.loss_functions import (
         calc_whip_loss, calc_swd_unif_loss, calc_swd_gauss_loss,
+        calc_kl_unif_loss, calc_kl_gauss_loss,
         get_loss_fn,
     )
     from dartquant_v2.butterfly import ButterflyRotation, ButterflyFactored

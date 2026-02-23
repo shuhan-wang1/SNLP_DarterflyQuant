@@ -897,7 +897,7 @@ def _make_init_matrix(size: int, device, mode: str = 'random') -> torch.Tensor:
 # ── R1 ───────────────────────────────────────────────────────────────────────
 
 def train_r1_with_history(
-    acts_input,               # dict {name: Tensor} or np.ndarray (N, hidden_size)
+    acts_single_layer,        # np.ndarray or Tensor (N, hidden_size) for ONE layer
     hidden_size: int,
     loss_fn_name: str,
     lr: float             = LR_LOSS,
@@ -911,40 +911,31 @@ def train_r1_with_history(
     train_subset_size: float = 1.0,
 ):
     """
-    Train R1 global rotation matrix (QR-Orth parameterization).
+    Train R1 rotation matrix for a SINGLE LAYER's activations.
 
-    Exactly mirrors dartquant_v2.trainers.train_r1:
-      - Accepts dict input (multi-layer activations) same as pipeline Step 4
+    Mirrors dartquant_v2.trainers.train_r1 for one layer:
+      - Accepts a single tensor/array of shape (N, hidden_size)
       - Hadamard or random initialization via _make_init_matrix
       - SGD (default) or Adam optimizer
       - Optional CosineAnnealingLR scheduler
       - Gradient accumulation support
       - QR extraction at end: R1 = QR(R1.matrix)[0]
 
-    Extra: returns per-epoch mean loss history list for plotting.
+    Called per-layer by run_experiment1_r1_comparison so that each layer's
+    rotation is optimised independently on that layer's own activation
+    distribution (same approach as R2 / train_r2_with_history).
 
     Returns:
         Q       : np.ndarray (hidden_size, hidden_size), float32
-        history : list[float]
+        history : list[float]  per-epoch mean loss
     """
     loss_fn = _get_loss_fn(loss_fn_name)
 
-    # ── Prepare data  (mirrors train_r1 lines 193–206) ──────────────────────
-    if isinstance(acts_input, dict):
-        all_acts = []
-        for name in sorted(acts_input.keys()):
-            act = acts_input[name]
-            if isinstance(act, torch.Tensor):
-                all_acts.append(act.reshape(-1, hidden_size).float().cpu())
-            else:
-                arr = np.nan_to_num(np.asarray(act), nan=0.0,
-                                    posinf=65504, neginf=-65504)
-                all_acts.append(
-                    torch.tensor(arr, dtype=torch.float32).reshape(-1, hidden_size)
-                )
-        all_acts = torch.cat(all_acts, dim=0)
+    # ── Prepare data (single layer) ──────────────────────────────────────────
+    if isinstance(acts_single_layer, torch.Tensor):
+        all_acts = acts_single_layer.reshape(-1, hidden_size).float().cpu()
     else:
-        arr      = np.nan_to_num(np.asarray(acts_input), nan=0.0,
+        arr      = np.nan_to_num(np.asarray(acts_single_layer), nan=0.0,
                                   posinf=65504, neginf=-65504)
         all_acts = torch.tensor(arr, dtype=torch.float32).reshape(-1, hidden_size)
 
@@ -1675,20 +1666,27 @@ def run_experiment1_r1_comparison(model, arch_wrapper: _ArchWrapper,
                                    calib_data, layer_indices,
                                    model_name, model_clean):
     """
-    Experiment 1: R1 loss function comparison — pipeline-style collection.
+    Experiment 1: R1 loss function comparison — per-layer independent training.
 
     Collection mirrors pipeline.py Step 4:
-      targets = [up_proj, q_proj] for EVERY layer (not just selected ones)
-    Training mirrors dartquant_v2.trainers.train_r1 via train_r1_with_history.
+      targets = [up_proj, q_proj] for EVERY layer (single forward pass)
+
+    Training (per-layer, like R2):
+      activations are grouped by layer index; up_proj + q_proj inputs for the
+      same layer are concatenated, then each layer trains its own R1_QR
+      independently.  No cross-layer gradient mixing.
+
+    Three loss functions are compared (Whip / SWD-Unif / SWD-Gauss), each
+    producing a separate per-layer R1 for visualization.
 
     Plots:
-      {model_clean}_loss_dist_R1.png      – 4-panel histogram
-      {model_clean}_loss_curves_R1.png    – training convergence
+      {model_clean}_loss_dist_R1.png      – 4-panel histogram (representative layer)
+      {model_clean}_loss_curves_R1.png    – per-layer training convergence
     """
-    print("\n  [Exp 1] R1 Loss Function Comparison (all-layer pipeline collection)")
+    print("\n  [Exp 1] R1 Loss Function Comparison — per-layer independent training")
     dev = _model_device(model)
 
-    # ── Collect (mirrors pipeline Step 4) ────────────────────────────────────
+    # ── Collect (mirrors pipeline Step 4 — single forward pass) ──────────────
     targets = arch_wrapper.r1_collection_targets()
     print(f"  Collecting R1 activations: {len(targets)} targets "
           f"(all {arch_wrapper.num_layers} layers × up_proj+q_proj) ...")
@@ -1699,40 +1697,65 @@ def run_experiment1_r1_comparison(model, arch_wrapper: _ArchWrapper,
     total_rows = sum(v.shape[0] for v in acts_dict.values())
     print(f"  Collected {len(acts_dict)} tensors, total rows: {total_rows}")
 
-    hidden_size   = arch_wrapper.hidden_size
+    hidden_size = arch_wrapper.hidden_size
+
+    # ── Group activations by layer (up_proj + q_proj combined per layer) ─────
+    acts_per_layer: dict = {}
+    for name, acts in acts_dict.items():
+        lid = arch_wrapper.layer_index_from_name(name)
+        if lid < 0:
+            continue
+        if lid not in acts_per_layer:
+            acts_per_layer[lid] = []
+        acts_per_layer[lid].append(acts.float().reshape(-1, hidden_size))
+    for lid in acts_per_layer:
+        acts_per_layer[lid] = torch.cat(acts_per_layer[lid], dim=0)
+
+    available_layers = sorted(acts_per_layer.keys())
+    print(f"  Grouped into {len(available_layers)} layers "
+          f"({sum(v.shape[0] for v in acts_per_layer.values())} total rows)")
+
+    # Representative layer for distribution plot (first in layer_indices)
+    rep = layer_indices[0]
+    if rep not in acts_per_layer:
+        rep = available_layers[0]
+    rep_acts_2d = acts_per_layer[rep].numpy().astype(np.float32)
+
     all_histories = {k: {} for k in ('whip', 'swd_unif', 'swd_gauss')}
     rotated_flat  = {}
 
-    # Choose representative acts for distribution plot
-    # (first selected layer's up_proj input, same intuition as pipeline)
-    lp  = arch_wrapper._layers_path()
-    up  = arch_wrapper._up_proj_attr()
-    rep = layer_indices[0]
-    rep_key = f"{lp}.{rep}.{up}"
-    if rep_key not in acts_dict:
-        rep_key = f"{lp}.{rep}.{arch_wrapper._q_proj_attr()}"
-    rep_acts = acts_dict.get(rep_key, list(acts_dict.values())[0]).numpy().astype(np.float32)
-    rep_acts_2d = rep_acts.reshape(-1, hidden_size)
-
-    # ── Train R1 for each loss function ──────────────────────────────────────
+    # ── Train R1 per layer for each loss function ─────────────────────────────
     for loss_name in ('whip', 'swd_unif', 'swd_gauss'):
-        print(f"  Training R1 [{loss_name}] on {total_rows} all-layer rows ...")
-        Q, history = train_r1_with_history(
-            acts_dict, hidden_size, loss_name,
-            init_mode='random',          # 'hadamard' if hadamard_utils available
-            accumulation_steps=1,
-        )
-        # Apply rotation to representative activations for distribution plot
-        rotated_flat[loss_name] = (rep_acts_2d @ Q).flatten()
-        # Broadcast same global R1 history to each displayed layer index
+        print(f"\n  Training R1 [{loss_name}] — per-layer independent ...")
         for layer_idx in layer_indices:
+            if layer_idx not in acts_per_layer:
+                print(f"    Layer {layer_idx}: no activations, skipping")
+                continue
+            acts_l = acts_per_layer[layer_idx].numpy().astype(np.float32)
+            print(f"    Layer {layer_idx}: {acts_l.shape[0]} rows ...")
+            Q_l, history = train_r1_with_history(
+                acts_l, hidden_size, loss_name,
+                init_mode='random', accumulation_steps=1,
+            )
             all_histories[loss_name][layer_idx] = history
+            # Store representative layer's rotated acts for distribution plot
+            if layer_idx == rep:
+                rotated_flat[loss_name] = (rep_acts_2d @ Q_l).flatten()
 
-    # ── Distribution plot ─────────────────────────────────────────────────────
+        # Fallback: if rep layer skipped, store zeros placeholder
+        if loss_name not in rotated_flat:
+            rotated_flat[loss_name] = rep_acts_2d.flatten()
+
+        final_losses = {lid: all_histories[loss_name][lid][-1]
+                        for lid in layer_indices if lid in all_histories[loss_name]}
+        print(f"    [{loss_name}] final losses: "
+              + ", ".join(f"L{lid}={v:.4f}" for lid, v in final_losses.items()))
+
+    # ── Distribution plot (representative layer) ──────────────────────────────
     save_path = os.path.join(PLOT_DIR, f"{model_clean}_loss_dist_R1.png")
     plot_loss_distribution(rep_acts_2d, rotated_flat, rep, model_name, save_path)
 
-    # ── Training curve plot ──────────────────────────────────────────────────
+    # ── Training curve plot (one subplot per selected layer) ──────────────────
     if any(all_histories[k] for k in all_histories):
         save_path = os.path.join(PLOT_DIR, f"{model_clean}_loss_curves_R1.png")
         plot_loss_training_curves(all_histories, layer_indices, model_name, save_path)

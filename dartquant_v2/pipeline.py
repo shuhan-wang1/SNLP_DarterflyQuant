@@ -39,7 +39,7 @@ if _CALIBRATER_PATH not in sys.path:
     sys.path.insert(0, _CALIBRATER_PATH)
 
 from .unified_model import UnifiedQuantModel, _deep_getattr, _deep_setattr
-from .trainers import train_r1, train_r2_all_layers, train_butterfly
+from .trainers import train_r1, train_r1_all_layers, train_r2_all_layers, train_butterfly
 from .nf4_quantizer import apply_nf4_to_model
 
 DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
@@ -405,6 +405,73 @@ def apply_r1_rotation(model, R1, umodel: UnifiedQuantModel, smooth_scale=None):
 
     cleanup_memory()
     logging.info("R1 rotation applied to model.")
+
+
+def apply_r1_rotation_per_layer(model, R1_dict: dict,
+                                 umodel: UnifiedQuantModel, smooth_scale=None):
+    """Apply per-layer R1 rotations to model weights (offline).
+
+    Unlike apply_r1_rotation (which uses a single global R1), each transformer
+    layer l uses its own R1_l from R1_dict[l].
+
+    Within each layer the rotation is applied symmetrically:
+      Input projections  (Q, K, V, up_proj, gate_proj): W = W @ R1_l
+      Output projections (o_proj, down_proj):            W = R1_l^T @ W
+
+    This ensures the layer's internal computation is in the rotated space while
+    the residual bypass (x_l = x + layer(x)) remains in the original space —
+    the R1_l from the output projection exactly cancels the R1_l baked into the
+    input projections for the bypass path.
+
+    Embeddings and lm_head are NOT rotated (no single global rotation exists).
+
+    Args:
+        model:    HuggingFace model.
+        R1_dict:  dict {layer_idx (int) → Tensor (hidden_size, hidden_size)}.
+        umodel:   UnifiedQuantModel for arch-aware accessor methods.
+        smooth_scale: Unused; kept for API parity with apply_r1_rotation.
+    """
+    layers = umodel.get_layers()
+    for idx, layer in enumerate(tqdm(layers, desc="Applying per-layer R1")):
+        if idx not in R1_dict:
+            continue
+        Q = R1_dict[idx].to(device=DEV, dtype=torch.float64)
+
+        q_proj, k_proj, v_proj, o_proj = umodel.get_attn_projs(layer)
+
+        # Input sides: W = W @ R1_l
+        for W in [q_proj, k_proj, v_proj]:
+            dtype = W.weight.dtype
+            W_    = W.weight.to(device=DEV, dtype=torch.float64)
+            W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+        # Output side: W_o = R1_l^T @ W_o
+        dtype = o_proj.weight.data.dtype
+        W_    = o_proj.weight.data.to(device=DEV, dtype=torch.float64)
+        o_proj.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        if o_proj.bias is not None:
+            b = o_proj.bias.data.to(device=DEV, dtype=torch.float64)
+            o_proj.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+        # MLP inputs: W = W @ R1_l
+        for W in umodel.get_mlp_input_projs(layer):
+            dtype = W.weight.dtype
+            W_    = W.weight.data.to(device=DEV, dtype=torch.float64)
+            W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+        # MLP output: W_down = R1_l^T @ W_down
+        for W in umodel.get_all_mlp_output_projs(layer):
+            dtype = W.weight.data.dtype
+            W_    = W.weight.data.to(device=DEV, dtype=torch.float64)
+            W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+            if W.bias is not None:
+                b = W.bias.data.to(device=DEV, dtype=torch.float64)
+                W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+        cleanup_memory()
+
+    logging.info(f"Per-layer R1 rotations applied to model "
+                 f"({len(R1_dict)} layers).")
 
 
 def apply_r2_rotation(model, R2_dict, umodel: UnifiedQuantModel, smooth_scale=None):
@@ -790,15 +857,24 @@ def run_full_pipeline(args):
         )
     logging.info(f"  Calibration data: {calib_data.shape}")
 
-    # ======== Step 4: Train R1 ========
-    R1 = None
+    # ======== Step 4: Train R1 (per-layer) ========
+    R1_dict = {}
     if args.use_r1:
         if args.r1_path:
             logging.info(f"\n[4/12] Loading R1 from {args.r1_path}...")
             r1_data = torch.load(args.r1_path, map_location='cpu')
-            R1 = r1_data['R1'] if isinstance(r1_data, dict) else r1_data
+            # Support both new per-layer dict {int: Tensor} and legacy single Tensor
+            if isinstance(r1_data, dict) and all(isinstance(k, int) for k in r1_data):
+                R1_dict = r1_data
+            elif isinstance(r1_data, dict) and 'R1' in r1_data:
+                # Legacy format: broadcast single matrix to all layers
+                R1_single = r1_data['R1']
+                R1_dict = {i: R1_single for i in range(umodel.num_layers)}
+            else:
+                # Legacy format: plain tensor — broadcast to all layers
+                R1_dict = {i: r1_data for i in range(umodel.num_layers)}
         else:
-            logging.info("\n[4/12] Collecting activations and training R1...")
+            logging.info("\n[4/12] Collecting activations and training R1 (per-layer)...")
             model.to(DEV)
 
             # Collect R1 training data (MLP and attention inputs)
@@ -819,7 +895,7 @@ def run_full_pipeline(args):
             model.cpu()
             cleanup_memory()
 
-            R1 = train_r1(
+            R1_dict = train_r1_all_layers(
                 activations=r1_activations,
                 hidden_size=umodel.hidden_size,
                 loss_fn_name=args.loss,
@@ -838,13 +914,13 @@ def run_full_pipeline(args):
     else:
         logging.info("\n[4/12] R1 disabled, skipping...")
 
-    # ======== Step 5: Apply R1 ========
-    if R1 is not None:
-        logging.info("\n[5/12] Applying R1 to model...")
+    # ======== Step 5: Apply R1 (per-layer) ========
+    if R1_dict:
+        logging.info("\n[5/12] Applying per-layer R1 rotations to model...")
         smooth_scale = None
         if args.smooth:
             smooth_scale = torch.load(args.smooth)
-        apply_r1_rotation(model, R1, umodel, smooth_scale)
+        apply_r1_rotation_per_layer(model, R1_dict, umodel, smooth_scale)
     else:
         logging.info("\n[5/12] No R1, skipping rotation...")
 

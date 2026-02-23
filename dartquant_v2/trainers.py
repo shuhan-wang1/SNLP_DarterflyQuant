@@ -252,6 +252,137 @@ def train_r1(
     return R1.rotate.data.detach()
 
 
+def _parse_layer_idx(name: str) -> int:
+    """Parse integer layer index from a dotted module path.
+
+    E.g. "model.layers.3.mlp.up_proj" → 3
+    Returns -1 if no digit part is found.
+    """
+    for part in name.split('.'):
+        if part.isdigit():
+            return int(part)
+    return -1
+
+
+def train_r1_all_layers(
+    activations: dict,
+    hidden_size: int,
+    loss_fn_name: str,
+    lr: float = 1e-3,
+    momentum: float = 0.9,
+    epochs: int = 10,
+    batch_size: int = 64,
+    cos_lr: bool = False,
+    optim: str = 'sgd',
+    init_mode: str = 'hadamard',
+    accumulation_steps: int = 1,
+    train_subset_size: float = 1.0,
+    device: str = 'cuda',
+) -> dict:
+    """Train per-layer R1 rotation matrices independently (like train_r2_all_layers).
+
+    Instead of pooling all layers' activations into a single gradient descent
+    (as train_r1 does), this function trains a separate R1_QR for each layer
+    using only that layer's own activations.  This preserves each layer's
+    individual activation distribution rather than averaging over all layers,
+    and prevents gradient cancellation from mixing layers with different
+    covariance structures.
+
+    Per-layer entries from the same layer (e.g. both up_proj and q_proj inputs
+    of layer l) are concatenated before training — giving the optimizer a
+    richer sample of that layer's residual-stream distribution.
+
+    Args:
+        activations:  Dict mapping module paths to activation tensors.
+                      Multiple entries per layer are concatenated automatically.
+                      Example keys: "model.layers.0.mlp.up_proj",
+                                    "model.layers.0.self_attn.q_proj"
+        hidden_size:  Model hidden dimension.
+        loss_fn_name: Loss function name (same choices as train_r1).
+        lr, momentum, epochs, batch_size, cos_lr, optim,
+        init_mode, accumulation_steps, train_subset_size, device:
+                      Same semantics as train_r1.
+
+    Returns:
+        dict {layer_idx (int) → R1 matrix Tensor (hidden_size, hidden_size),
+              dtype float64}  — one entry per layer found in activations.
+    """
+    loss_fn = get_loss_fn(loss_fn_name)
+    device  = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    # ── Group activations by layer index ─────────────────────────────────────
+    acts_per_layer: dict = {}
+    for name, acts in activations.items():
+        lid = _parse_layer_idx(name)
+        if lid < 0:
+            continue
+        if isinstance(acts, torch.Tensor):
+            t = acts.reshape(-1, hidden_size).float().cpu()
+        else:
+            t = torch.tensor(
+                np.nan_to_num(acts, nan=0.0, posinf=65504, neginf=-65504),
+                dtype=torch.float32,
+            ).reshape(-1, hidden_size)
+        acts_per_layer.setdefault(lid, []).append(t)
+
+    for lid in acts_per_layer:
+        acts_per_layer[lid] = torch.cat(acts_per_layer[lid], dim=0)
+
+    # ── Train one R1_QR per layer ─────────────────────────────────────────────
+    R1_dict: dict = {}
+    for layer_idx in sorted(acts_per_layer.keys()):
+        all_acts = acts_per_layer[layer_idx]
+        dataset  = TensorDataset(all_acts)
+
+        R1 = R1_QR(hidden_size).to(device)
+        R1.matrix.data = _get_init_matrix(hidden_size, init_mode, device).float()
+
+        optimizer = _create_optimizer(R1.parameters(), optim, lr, momentum)
+        scheduler = (CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
+                     if cos_lr else None)
+
+        R1.train()
+        logging.info(f"Training R1 layer {layer_idx} with {loss_fn_name} loss, "
+                     f"{len(all_acts)} samples")
+
+        for epoch in range(epochs):
+            loss_log = []
+            num_samples = max(1, int(len(dataset) * train_subset_size))
+            indices  = np.random.choice(len(dataset), size=num_samples, replace=False)
+            sampler  = RandomSampler(torch.utils.data.Subset(dataset, indices))
+            dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
+
+            for batch_idx, (batch_samples,) in enumerate(dataloader):
+                batch_samples = batch_samples.to(device).float().reshape(-1, hidden_size)
+                outputs = R1(batch_samples)
+                loss    = loss_fn(outputs) / accumulation_steps
+                loss.backward()
+
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                loss_log.append(loss.detach())
+
+            if scheduler:
+                scheduler.step()
+
+            mean_loss = torch.stack(loss_log).mean()
+            if (epoch + 1) % max(1, epochs // 5) == 0 or epoch == 0:
+                lr_str = (f", LR: {scheduler.get_last_lr()[0]:.4e}"
+                          if scheduler else "")
+                logging.info(
+                    f"  R1 Layer {layer_idx} Epoch [{epoch+1}/{epochs}], "
+                    f"{loss_fn_name} Loss: {mean_loss.item():.6f}{lr_str}"
+                )
+
+        R1_dict[layer_idx] = R1.rotate.data.detach()
+
+    logging.info(f"Per-layer R1 training complete. "
+                 f"Trained {len(R1_dict)} layers.")
+    return R1_dict
+
+
 # ============================================================================
 # R2 Training
 # ============================================================================

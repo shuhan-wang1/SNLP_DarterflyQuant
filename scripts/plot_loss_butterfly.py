@@ -79,7 +79,7 @@ print(f"Plot dir  : {PLOT_DIR}")
 # Target models (same as user setup)
 MODELS = [
     "meta-llama/Llama-3.2-1B",
-    "meta-llama/Llama-3.2-1B-Instruct",
+    #"meta-llama/Llama-3.2-1B-Instruct",
 ]
 
 # ── Data / collection settings ──────────────────────────────────────────────

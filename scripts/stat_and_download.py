@@ -233,6 +233,70 @@ def plot_activation_distribution(activations: np.ndarray, title: str, save_path:
     print(f"    ✓ Saved plot: {save_path}")
 
 
+# ============================================================================
+# DATASET DEFINITIONS
+# ============================================================================
+# Each entry: (description, hf_repo, config_name_or_None, splits_to_download)
+STANDARD_DATASETS = [
+    ("WikiText-2",   "wikitext",          "wikitext-2-raw-v1", ["train", "validation", "test"]),
+    ("MMLU",         "cais/mmlu",          "all",               ["test", "validation"]),
+    ("GSM8K",        "openai/gsm8k",       "main",              ["train", "test"]),
+    ("ARC-Challenge","allenai/ai2_arc",    "ARC-Challenge",     ["train", "validation", "test"]),
+    ("HellaSwag",    "Rowan/hellaswag",    None,                ["train", "validation"]),
+    ("WinoGrande",   "allenai/winogrande", "winogrande_xl",     ["train", "validation"]),
+    ("PTB",          "ptb-text-only",      "penn_treebank",     ["train", "validation", "test"]),
+]
+
+# C4: only download 1 validation shard for evaluation (train not needed; wikitext used for calibration)
+C4_DATA_FILES = {
+    "validation": ["en/c4-validation.00000-of-00008.json.gz"],
+}
+
+
+def download_datasets():
+    """Download all benchmark / calibration datasets to HF_DATASETS_CACHE."""
+    print("\n" + "="*80)
+    print("Downloading Datasets")
+    print("="*80)
+
+    cache = os.environ["HF_DATASETS_CACHE"]
+
+    # ── Standard datasets ────────────────────────────────────────────────────
+    for desc, repo, cfg, splits in STANDARD_DATASETS:
+        print(f"\n  [{desc}] {repo}" + (f" / {cfg}" if cfg else ""))
+        for split in splits:
+            try:
+                if cfg:
+                    ds = load_dataset(repo, cfg, split=split,
+                                     cache_dir=cache, token=HF_TOKEN)
+                else:
+                    ds = load_dataset(repo, split=split,
+                                     cache_dir=cache, token=HF_TOKEN)
+                print(f"    ✓ {split}: {len(ds):,} samples")
+                del ds
+            except Exception as e:
+                print(f"    ✗ {split}: {e}")
+
+    # ── C4 (validation only) ─────────────────────────────────────────────────
+    print(f"\n  [C4] allenai/c4  (validation only: {len(C4_DATA_FILES['validation'])} shard)")
+    for split, files in C4_DATA_FILES.items():
+        try:
+            ds = load_dataset(
+                "allenai/c4",
+                data_files={split: files},
+                split=split,
+                cache_dir=cache,
+                token=HF_TOKEN,
+            )
+            print(f"    ✓ {split}: {len(ds):,} samples")
+            del ds
+        except Exception as e:
+            print(f"    ✗ {split}: {e}")
+
+    print("\n  ✓ Dataset download complete")
+    print(f"  ✓ Saved to: {cache}")
+
+
 def analyze_model(model_name: str):
     """Analyze activation distributions for a single model."""
     print(f"\n{'='*80}")
@@ -350,7 +414,10 @@ def main():
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
-    
+
+    # Download datasets first
+    download_datasets()
+
     # Process each model sequentially
     for model_name in MODELS:
         analyze_model(model_name)

@@ -94,7 +94,7 @@ LR_LOSS     = 1e-3    # learning rate for R1 / R2
 LR_BF       = 1e-3    # learning rate for Butterfly R3/R4
 MOMENTUM    = 0.9
 EPOCHS_LOSS = 10      # R1/R2 epochs (matches pipeline --r1_epochs 10)
-EPOCHS_BF   = 20      # Butterfly epochs (matches pipeline --butterfly_epochs)
+EPOCHS_BF   = 250      # Butterfly epochs (matches pipeline --butterfly_epochs)
 BATCH_SIZE  = 64
 
 # ============================================================================

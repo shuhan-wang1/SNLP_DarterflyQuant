@@ -2,7 +2,7 @@
 
 > UCL SNLP 项目 — INT4 (W4A4) 权重-激活联合量化研究
 
-DartQuant v2 是一个**一键执行**的统一量化管道，基于 DartQuant 框架构建，集成了 6 项核心创新：支持多种损失函数、NF4 量化器、通用模型接口、以及可学习的 Butterfly 旋转算法。无需复杂配置，即可对任意 LLM 模型进行高效的 INT4 后训练量化。
+DartQuant v2 是一个**一键执行**的统一量化管道，基于 DartQuant 框架构建，集成了多项核心创新：支持 7 种损失函数、NF4 量化器、通用模型接口（含 MoE）、**逐层独立 R1 训练**，以及可学习的 Butterfly 旋转算法（含 Hadamard 预热、权重感知重建损失）。无需复杂配置，即可对任意 LLM 模型进行高效的 INT4 后训练量化。
 
 ---
 
@@ -11,16 +11,17 @@ DartQuant v2 是一个**一键执行**的统一量化管道，基于 DartQuant �
 | 特性 | DartQuant v1 | DartQuant v2 | 改进 |
 |------|------------|------------|------|
 | 一键执行 | 否 | 是 | 完整管道编排 |
-| 损失函数 | Whip 损失 | Whip / SWD_Unif / SWD_Gauss | 3 种可选 |
+| 损失函数 | Whip 损失 | Whip / SWD_Unif / SWD_Gauss / KL_Unif / KL_Gauss / Bin_KL_Unif / Bin_KL_NF4 | **7 种可选** |
 | 量化器 | INT4 仅 | INT4 / NF4 | 支持 NF4 |
+| R1 训练 | 全局单矩阵 | **逐层独立训练** | 更精确，避免梯度混叠 |
 | Dense 模型 | Llama/OPT 硬编码 | 自动检测，可扩展 | 注册新架构只需新建文件 |
 | MoE 模型 | 不支持 | 原生支持（Mixtral、Qwen2-MoE） | 专家共享 R4，无需子类化 |
-| R3/R4 旋转 | 固定 Hadamard | 可学习 Butterfly | 性能更优 |
+| R3/R4 旋转 | 固定 Hadamard | 可学习 Butterfly（含 Hadamard 预热 + Eq17 权重感知重建） | 性能更优 |
 | 使用门槛 | 高（需修改代码） | 低（命令行参数） | 易用性提升 |
 
 ---
 
-## 新增 6 大功能详解
+## 新增功能详解
 
 ### 功能 1：一键统一量化脚本
 
@@ -95,14 +96,14 @@ layers     = umodel.get_layers()
 attn_q, attn_k, attn_v, attn_o = umodel.get_attn_projs(layer)
 ```
 
-**默认支持**：Llama（所有版本）、OPT。
+**默认支持**：Llama（所有版本）、OPT（所有尺寸）、Mixtral、Qwen2-MoE。
 
 **添加新架构示例**：
 ```python
 from dartquant_v2.unified_model import register_arch, ModelArchConfig
 
 config = ModelArchConfig(
-    embeddings_path="model.embed_tokens",
+    embed_tokens_path="model.embed_tokens",
     layers_path="model.layers",
     lm_head_path="lm_head",
     # ... 其他路径 ...
@@ -112,86 +113,66 @@ register_arch("YourModelConfig", config)
 
 ---
 
-### 功能 4：SWD_Unif 损失函数
+### 功能 4：逐层独立 R1 训练
 
-**原理**：Sliced Wasserstein Distance (SWD) 匹配均匀分布，自动发现最优量化范围。
+**v2 的 R1 变化**：原始 DartQuant 将所有层的激活混合后训练单一全局旋转矩阵；v2 为每一个 Transformer 层独立训练 R1，使用该层自身的激活数据。
 
-**损失公式**：
-```
-1. 对激活值排序：x_sorted = sort(x, dim=-1)
-2. 计算均匀分布范围：b = sqrt(3) * RMS(x)
-3. 生成均匀分位数：target ~ Uniform[-b, b]
-4. 损失 = ||x_sorted - target||^2
-```
+**优势**：
+- 保留每层的激活分布特性，不被其他层的分布均值化
+- 避免层间梯度相互抵消（不同层协方差结构混合导致的梯度取消）
+- 同层多模块的激活（如 `up_proj` 和 `q_proj`）自动合并训练
 
-**与 Whip 损失对比**：
+**函数映射**：
 
-| 对比项 | Whip | SWD_Unif |
-|--------|------|----------|
-| 原理 | 指数排斥 exp(-\|x\|) | Wasserstein 匹配 |
-| 分布假设 | 无 | 均匀分布 |
-| 参数调优 | 少 | 无（自适应） |
-| 性能 | 基线 | 更优 |
+| 行为 | v1（旧） | v2（新） |
+|------|---------|---------|
+| R1 训练 | `train_r1()` 全局单矩阵 | `train_r1_all_layers()` 每层独立 |
+| R1 应用 | `apply_r1_rotation()` 单矩阵广播 | `apply_r1_rotation_per_layer()` 逐层应用 |
+| 输出格式 | 单个 Tensor `(hidden_size, hidden_size)` | `dict {layer_idx → Tensor}` |
 
-**推荐配对**：INT4 + SWD_Unif
-
-**使用示例**：
-```bash
-python dartquant_v2/run_quantize.py \
-    --model meta-llama/Llama-3.2-1B \
-    --loss swd_unif \
-    --quantizer_type int4 \
-    --nsamples 128
-```
+**向后兼容**：`--r1_path` 加载时同时兼容旧版单矩阵格式（自动广播到所有层）和新版逐层字典格式。
 
 ---
 
-### 功能 5：Gaussian SWD 损失 + --quantizer_type 参数
+### 功能 5：扩展损失函数（7 种）
 
-**原理**：匹配高斯分布，特别适合 NF4 假设的高斯分布。
+v2 新增 4 种损失函数，共支持 7 种：
 
-**损失公式**：
-```
-1. 对激活值排序：x_sorted = sort(x, dim=-1)
-2. 估计标准差：sigma = sqrt(mean(x^2))
-3. 生成高斯分位数：target = Phi^{-1}((i-0.5)/n) * sigma
-   其中 Phi^{-1}(p) = sqrt(2) * erfinv(2p - 1)
-4. 损失 = ||x_sorted - target||^2
-```
+#### 原有损失（v1 继承）
 
-**--quantizer_type 参数**（必需，无默认值）：
-```bash
---quantizer_type int4    # 标准均匀量化（GPTQ/RTN）
---quantizer_type nf4     # NF4 权重量化（bitsandbytes）
-```
+| 损失函数 | 原理 | 推荐配对 |
+|---------|------|---------|
+| `whip` | 指数排斥 `exp(-|x|)`，推离零点 | INT4 |
+| `swd_unif` | Sliced Wasserstein Distance to Uniform | INT4 |
+| `swd_gauss` | Sliced Wasserstein Distance to Gaussian | NF4 |
 
-**推荐配对**：NF4 + SWD_Gauss
+#### 新增损失（v2）
 
-**使用示例**：
-```bash
-python dartquant_v2/run_quantize.py \
-    --model meta-llama/Llama-3.2-1B \
-    --loss swd_gauss \
-    --quantizer_type nf4 \
-    --nsamples 128
-```
+| 损失函数 | 原理 | 推荐配对 |
+|---------|------|---------|
+| `kl_unif` | KL 散度至均匀分布（Vasicek 间距熵估计，最大化熵）| INT4 |
+| `kl_gauss` | KL 散度至高斯分布（Gram-Charlier 矩匹配，最小化偏度²+峰度²）| NF4 |
+| `bin_kl_unif` | 离散 bin KL 散度至 INT4 量化级别均匀分布（论文 Eq 19）| INT4 |
+| `bin_kl_nf4` | 离散 bin KL 散度至 NF4 量化级别均匀分布（论文 Eq 19）| NF4 |
 
-**参数配对建议**（不遵循会给出警告，不会报错）：
+**完整推荐配对**：
 
 | quantizer_type | 推荐 loss | 不推荐 |
 |----------------|-----------|--------|
-| int4 | whip / swd_unif | swd_gauss |
-| nf4 | swd_gauss | whip / swd_unif |
+| int4 | whip / swd_unif / kl_unif / bin_kl_unif | swd_gauss / kl_gauss / bin_kl_nf4 |
+| nf4 | swd_gauss / kl_gauss / bin_kl_nf4 | whip / swd_unif / kl_unif / bin_kl_unif |
+
+> 不遵循推荐配对会输出警告，但不会报错（允许实验）。
 
 ---
 
-### 功能 6：Butterfly Givens 旋转
+### 功能 6：Butterfly Givens 旋转（R3/R4）
 
 **原理**：O(d log d) 复杂度的可学习旋转算法，相比固定 Hadamard 矩阵，可通过训练进一步改善激活分布。
 
 **应用范围（仅 R3 和 R4）**：
-- R3：Attention 头内旋转（Q, K 在 RoPE 之后）
-- R4：MLP 中间层旋转（down_proj 输入）
+- R3：Attention 头内旋转（Q, K 在 RoPE 之后），在线应用
+- R4：MLP 中间层旋转（down_proj 输入），离线烘焙到权重 + 在线应用
 - 不应用于 R1 / R2（保留 QR-Orth 参数化）
 
 **算法概要**：
@@ -202,9 +183,44 @@ K = log2(d) 层（例如 d=64 时，K=6 层）
 总复杂度：O(d log d)
 ```
 
+**Hadamard 预热（v2 新增）**：
+- 初始化：angles = 0（等价单位矩阵）
+- 训练前：通过 300 步 Adam 优化将 Butterfly 拟合到随机 Hadamard 矩阵，作为主训练的起点
+- 效果：与 DartQuant 原始 Random Hadamard 基线保持一致，避免从全零角度出发的冷启动
+
+**自动选择 Butterfly 损失**（v2 新增）：
+- `--quantizer_type int4` → 自动选择 `kl_unif` 作为 Butterfly 损失
+- `--quantizer_type nf4`  → 自动选择 `kl_gauss` 作为 Butterfly 损失
+- 此选择独立于 R1/R2 使用的 `--loss` 参数
+
+**R4 权重感知重建损失 - Eq 17（v2 新增）**：
+
+R4 会离线烘焙到 `down_proj` 权重中，因此使用联合权重+激活重建损失：
+
+```
+L_total = L_dist(B @ x) + λ · L_recon_Eq17
+
+L_recon_Eq17 = ||Wx - Q(W @ B^T) · Q(B @ x)||²
+```
+
+其中 Q 为伪量化器（Dequant∘Quant），B 为 Butterfly 矩阵，W 为 down_proj 权重。梯度通过直通估计器（STE）传回旋转参数。
+
+**R3 激活仅重建损失**（R3 在线应用，无权重路径）：
+
+```
+L_recon = ||X_in - B^T @ FakeQuant(B @ X_in)||²
+```
+
 **维度支持**：
-- 2 次方维度（64, 128, 256 ...）：直接使用 Butterfly
-- 非 2 次方维度（11008, 5120 ...）：自动分解，混合使用 Hadamard + Butterfly
+- 2 次方维度（64, 128, 256 ...）：直接使用 `ButterflyRotation`
+- 非 2 次方维度（11008, 5120 ...）：自动使用 `ButterflyFactored`（K×m 分解，m 为 2 次方）
+
+**K 因子参数化**（`ButterflyFactored` 专用，用于非 2 次方维度的跨块混合）：
+
+| 参数 | 原理 | 特点 |
+|------|------|------|
+| `--latent`（默认）| 无约束矩阵 Z，每次前向通过 QR 提取正交因子（OR-Orth，与 R1/R2 方法相同）| 数值稳定，推荐 |
+| `--cayley` | Cayley 变换 `Q=(I-A)(I+A)^{-1}`，A 为反对称矩阵 | 严格正交，但需 O(K³) 矩阵求解 |
 
 **与固定 Hadamard 对比**：
 
@@ -213,6 +229,7 @@ K = log2(d) 层（例如 d=64 时，K=6 层）
 | 计算复杂度 | O(d log d) | O(d log d) |
 | 参数数量 | 0（固定） | K * d/2 个角度 |
 | 可优化 | 否 | 是 |
+| 初始化 | 随机 Hadamard | 预热到随机 Hadamard |
 
 **使用示例**：
 ```bash
@@ -236,21 +253,22 @@ int4_quantization_darkquant/
 |   |-- run_quantize.py                   # 一键执行脚本（入口）
 |   |-- pipeline.py                       # 12 步完整流程
 |   |-- args.py                           # 参数解析
-|   |-- loss_functions.py                 # whip / swd_unif / swd_gauss
+|   |-- loss_functions.py                 # 7 种损失函数（whip/swd_*/kl_*/bin_kl_*）
 |   |-- unified_model.py                  # UnifiedQuantModel（架构通用化）
 |   |-- nf4_quantizer.py                  # NF4 量化（bitsandbytes）
-|   |-- butterfly.py                      # Butterfly Givens 旋转
-|   |-- trainers.py                       # R1/R2/Butterfly 训练器
+|   |-- int4_quantizer.py                 # INT4 伪量化器（Butterfly 重建损失用）
+|   |-- butterfly.py                      # Butterfly Givens 旋转（ButterflyRotation / ButterflyFactored）
+|   |-- trainers.py                       # R1（逐层）/ R2 / Butterfly 训练器
 |   `-- arch/                             # [架构注册中心] 按公司/类型分组
 |       |-- __init__.py                   # 统一入口，触发所有注册
 |       |-- dense/                        # Dense（非 MoE）模型
 |       |   |-- __init__.py
 |       |   |-- llama.py                  # Meta Llama 全家族（1/2/3/3.1/3.2）
-|       |   `-- opt.py                    # Meta OPT 全家族
+|       |   `-- opt.py                    # Meta OPT 全家族（125M~66B）
 |       `-- moe/                          # MoE 模型
 |           |-- __init__.py
 |           |-- mixtral.py                # Mistral AI Mixtral 8x7B / 8x22B
-|           `-- qwen_moe.py               # Alibaba Qwen2-MoE
+|           `-- qwen_moe.py               # Alibaba Qwen2-MoE（Qwen1.5-MoE / Qwen2-57B）
 |
 |-- DartQuant/                            # [参考] DartQuant 原始实现
 |   |-- fake_quant/                       # 假量化模块（R1-R4 应用、INT4 量化）
@@ -271,11 +289,83 @@ int4_quantization_darkquant/
 |   `-- *.md                              # 其他研究笔记
 |
 |-- scripts/                              # [工具脚本]
+|   |-- plot_loss_butterfly.py            # 损失函数 & Butterfly 可视化实验（R1/R2/R3 分布对比）
 |   |-- validation.py                     # 损失函数对比验证
+|   |-- validation_joint.py              # 联合损失验证
 |   `-- *.py                              # 其他辅助脚本
 |
 `-- requirements.txt                      # Python 依赖列表
 ```
+
+---
+
+## 支持的模型
+
+所有模型通过 `dartquant_v2/arch/` 中的注册文件实现端到端完整支持（LayerNorm 融合 → R1/R2/R3/R4 训练与应用 → INT4/NF4 量化 → PPL 评估）。
+
+### Dense 模型
+
+#### Meta Llama 系列（`LlamaConfig`，注册于 `arch/dense/llama.py`）
+
+覆盖 Llama-1、Llama-2、Llama-3、Llama-3.1、Llama-3.2 全系列，共享同一配置类名 `LlamaConfig`，所有变体自动支持，包括 Base 和 Instruct 版本。
+
+| 版本 | 典型模型 ID |
+|------|------------|
+| Llama-1 | `huggyllama/llama-7b`、`huggyllama/llama-13b`、`huggyllama/llama-30b`、`huggyllama/llama-65b` |
+| Llama-2 | `meta-llama/Llama-2-7b-hf`、`meta-llama/Llama-2-13b-hf`、`meta-llama/Llama-2-70b-hf` |
+| Llama-2 Instruct | `meta-llama/Llama-2-7b-chat-hf`、`meta-llama/Llama-2-13b-chat-hf`、`meta-llama/Llama-2-70b-chat-hf` |
+| Llama-3 | `meta-llama/Meta-Llama-3-8B`、`meta-llama/Meta-Llama-3-70B` |
+| Llama-3 Instruct | `meta-llama/Meta-Llama-3-8B-Instruct`、`meta-llama/Meta-Llama-3-70B-Instruct` |
+| Llama-3.1 | `meta-llama/Llama-3.1-8B`、`meta-llama/Llama-3.1-70B`、`meta-llama/Llama-3.1-405B` |
+| Llama-3.1 Instruct | `meta-llama/Llama-3.1-8B-Instruct`、`meta-llama/Llama-3.1-70B-Instruct` |
+| Llama-3.2 | `meta-llama/Llama-3.2-1B`、`meta-llama/Llama-3.2-3B` |
+| Llama-3.2 Instruct | `meta-llama/Llama-3.2-1B-Instruct`、`meta-llama/Llama-3.2-3B-Instruct` |
+
+#### Meta OPT 系列（`OPTConfig`，注册于 `arch/dense/opt.py`）
+
+覆盖 OPT-125M 到 OPT-66B 所有尺寸。主要用于调试和小规模验证。
+
+| 典型模型 ID |
+|------------|
+| `facebook/opt-125m` |
+| `facebook/opt-1.3b` |
+| `facebook/opt-6.7b` |
+| `facebook/opt-13b` |
+| `facebook/opt-30b` |
+| `facebook/opt-66b` |
+
+> **OPT 特殊处理**：无 RoPE（绝对位置嵌入）、无门控 MLP（仅 fc1/fc2）、需要 mean-baking（LayerNorm 均值偏移消除）。这些差异已在注册配置中自动处理。
+
+### MoE 模型
+
+#### Mistral AI Mixtral 系列（`MixtralConfig`，注册于 `arch/moe/mixtral.py`）
+
+| 典型模型 ID |
+|------------|
+| `mistralai/Mixtral-8x7B-v0.1` |
+| `mistralai/Mixtral-8x22B-v0.1` |
+
+> 专家命名：`w1`（up-gate）、`w3`（gate）、`w2`（down）；无共享专家；所有专家共享同一 R4 矩阵。
+
+#### Alibaba Qwen2-MoE 系列（`Qwen2MoeConfig`，注册于 `arch/moe/qwen_moe.py`）
+
+| 典型模型 ID |
+|------------|
+| `Qwen/Qwen1.5-MoE-A2.7B` |
+| `Qwen/Qwen1.5-MoE-A2.7B-Chat` |
+| `Qwen/Qwen2-57B-A14B` |
+| `Qwen/Qwen2-57B-A14B-Instruct` |
+
+> 专家命名：`up_proj`/`gate_proj`/`down_proj`（与 Llama 一致）；有常驻共享专家（`mlp.shared_expert`）；R1 和 R4 同时应用于路由专家和共享专家。
+
+### MoE 旋转应用规则
+
+（依据 `docs/SNLP_report_1_v1_en.md` 第 2.4.4 节）
+
+| 旋转 | 应用方式 |
+|------|---------|
+| R1 | 应用于每个专家的 up/gate 输入投影（`W @ R1`）和 down 输出投影（`R1^T @ W`），包括 Qwen2-MoE 的共享专家 |
+| R4 | 所有专家共享同一 R4 矩阵，离线烘焙到每个专家的 down_proj 权重中，避免重复存储 |
 
 ---
 
@@ -293,7 +383,7 @@ pip install -r requirements.txt
 - `bitsandbytes >= 0.39`（NF4 必需）
 - `numpy`, `scipy`
 
-### 2. 基础用法（4 个常见场景）
+### 2. 基础用法（5 个常见场景）
 
 #### 场景 A：INT4 + Whip 损失（原始 DartQuant 行为）
 ```bash
@@ -327,7 +417,17 @@ python dartquant_v2/run_quantize.py \
     --ppl_eval_dataset wikitext2
 ```
 
-#### 场景 D：带可学习 Butterfly R3/R4 的 INT4
+#### 场景 D：INT4 + KL 散度损失（新增）
+```bash
+python dartquant_v2/run_quantize.py \
+    --model meta-llama/Llama-3.2-1B \
+    --loss kl_unif \
+    --quantizer_type int4 \
+    --w_bits 4 --a_bits 4 \
+    --nsamples 128
+```
+
+#### 场景 E：带可学习 Butterfly R3/R4 的 INT4
 ```bash
 python dartquant_v2/run_quantize.py \
     --model meta-llama/Llama-3.2-1B \
@@ -345,8 +445,8 @@ python dartquant_v2/run_quantize.py \
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| `--model` | HF 模型名 | meta-llama/Llama-3.2-1B、facebook/opt-125m 等 |
-| `--loss` | whip / swd_unif / swd_gauss | 旋转训练损失函数，必需 |
+| `--model` | HF 模型名 | `meta-llama/Llama-3.2-1B`、`facebook/opt-125m` 等 |
+| `--loss` | whip / swd_unif / swd_gauss / kl_unif / kl_gauss / bin_kl_unif / bin_kl_nf4 | 旋转训练损失函数，必需（共 7 种） |
 | `--quantizer_type` | int4 / nf4 | 量化方法，必需 |
 
 #### 量化配置参数
@@ -355,26 +455,42 @@ python dartquant_v2/run_quantize.py \
 |------|--------|------|
 | `--w_bits` | 4 | 权重位数 |
 | `--a_bits` | 4 | 激活位数 |
-| `--w_groupsize` | 128 | 权重分组大小 |
-| `--a_groupsize` | 128 | 激活分组大小 |
+| `--w_groupsize` | -1（逐通道） | 权重分组大小 |
+| `--a_groupsize` | -1（逐通道） | 激活分组大小 |
+| `--w_rtn` | False | 使用 RTN 代替 GPTQ 进行权重量化 |
 | `--butterfly` | False | 启用可学习 Butterfly R3/R4 |
+
+#### Butterfly 专用参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--butterfly_epochs` | 100 | Butterfly R3/R4 训练轮数（论文建议 500-700 步，100 epochs × batch 约等于 200 步） |
+| `--lambda_recon` | 0.1 | 量化重建损失 L_recon 的权重（仅在 `--butterfly` 启用时生效） |
+| `--quant_block_size` | 64 | Butterfly 训练中伪量化器的分块大小 |
+| `--latent` | （默认）| ButterflyFactored K 因子使用 QR-Orth 参数化（推荐） |
+| `--cayley` | — | ButterflyFactored K 因子使用 Cayley 参数化 |
 
 #### 训练配置参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--r1_epochs` | 10 | R1 训练轮数 |
+| `--r1_epochs` | 10 | R1 训练轮数（逐层独立训练） |
 | `--r2_epochs` | 5 | R2 训练轮数 |
 | `--batch_size` | 64 | 训练批大小 |
 | `--lr` | 0.001 | 学习率 |
 | `--momentum` | 0.9 | SGD 动量 |
+| `--cos_lr` | False | 使用余弦退火学习率 |
+| `--optim` | sgd | 优化器（sgd / adam） |
+| `--accumulation_steps` | 1 | 梯度累积步数 |
+| `--rotate_mode` | hadamard | R1/R2 初始化方式（hadamard / random） |
 
 #### 数据与评估参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--nsamples` | 128 | 校准数据样本数 |
-| `--cal_dataset` | wikitext2 | 校准数据集 |
+| `--seqlen` | 2048 | 序列长度 |
+| `--cal_dataset` | wikitext2 | 校准数据集（wikitext2 / c4 / ptb） |
 | `--ppl_eval_dataset` | wikitext2 | PPL 评估数据集 |
 | `--seed` | 0 | 随机种子 |
 
@@ -385,57 +501,57 @@ python dartquant_v2/run_quantize.py \
 ```
 步骤 1：参数解析 & 模型加载
   读取 --loss --quantizer_type --butterfly
-  UnifiedQuantModel 自动检测模型架构
+  UnifiedQuantModel 自动检测模型架构（LlamaConfig / OPTConfig / MixtralConfig / Qwen2MoeConfig）
 
 步骤 2：LayerNorm 融合
   将 LayerNorm 权重吸收到相邻线性层
   使旋转变换对 LayerNorm 透明（必须在旋转前执行）
 
-步骤 3：R1 激活数据收集
-  Hook Attention 输入和 MLP 输入
-  收集完整训练数据
+步骤 3：校准数据加载
+  加载 wikitext2/c4/ptb 校准集，--nsamples 条序列
 
-步骤 4：R1 全局旋转训练
-  使用指定损失函数（Whip / SWD_Unif / SWD_Gauss）
-  SGD 优化，得到 d_model x d_model 正交旋转矩阵
+步骤 4：R1 逐层激活收集 & 训练（v2 关键变化）
+  为每一层独立收集 mlp.up_proj 和 self_attn.q_proj 的输入激活
+  对每层分别使用指定损失函数（Whip / SWD / KL / Bin_KL）训练独立 R1_QR
+  输出：dict {layer_idx → (hidden_size, hidden_size) 正交矩阵}
 
-步骤 5：R1 离线应用
-  旋转词嵌入、Attention 输入/输出、MLP 输入/输出、LM Head
-  更新模型权重
+步骤 5：R1 逐层应用（离线）
+  对每层独立旋转：输入侧 W = W @ R1_l，输出侧 W = R1_l^T @ W
+  涵盖：Q/K/V（输入）、O（输出）、MLP up/gate（输入）、MLP down（输出）
 
-步骤 6：R2 激活数据收集
-  Hook Q,K,V,O 投影层（R1 应用后）
-  逐层收集激活
+步骤 6：R2 激活收集 & 训练
+  Hook self_attn.o_proj 输入（R1 应用后）
+  对每层训练 R2_Per_Head（逐 KV 头 head_dim×head_dim 旋转）
 
-步骤 7：R2 按头旋转训练
-  为每层每个 Attention 头训练 d_head x d_head 旋转
-  得到 num_layers x num_heads 个 R2 矩阵
+步骤 7：R2 离线应用
+  旋转 V 投影输出（R2^T @ W_v）、O 投影输入（W_o @ R2）
 
-步骤 8：R2 离线应用
-  旋转 V 投影输出、O 投影输入
-  更新模型权重
-
-步骤 9：R3/R4 处理
+步骤 8：R3/R4 处理
   若启用 --butterfly：
-    收集 R3（post-RoPE Q,K）和 R4（down_proj 输入）激活
-    训练可学习 Butterfly Givens 旋转
-    Butterfly R4：离线烘焙到权重 + 在线应用
-    Butterfly R3：在线应用
+    R4：收集 down_proj 输入激活 + 采样权重矩阵 bank
+        训练 ButterflyRotation/ButterflyFactored（Hadamard 预热 + Eq17 联合损失）
+        离线将 Butterfly R4 烘焙到 down_proj 权重
+    R3：收集 q_proj 输出激活
+        训练 ButterflyRotation（Hadamard 预热 + 激活重建损失）
+        在线应用（注册为 buffer）
   否则（默认）：
-    固定 Hadamard R4：离线烘焙到权重 + 在线应用
-    固定 Hadamard R3：在线应用
+    固定随机 Hadamard R4：离线烘焙到 down_proj 权重 + 在线应用
+    固定随机 Hadamard R3：在线应用
 
-步骤 10：激活量化包装
+步骤 9：激活量化包装（仅 int4）
   添加 ActQuantWrapper 到所有 Linear 层
-  配置按层量化参数
+  配置 R4 / R3 在线 Hadamard（或 Butterfly）
 
-步骤 11：权重量化
-  若 --quantizer_type int4：GPTQ 或 RTN 方法
-  若 --quantizer_type nf4：bitsandbytes NF4
+步骤 10：权重量化
+  若 --quantizer_type int4：GPTQ（基于 Hessian）或 RTN 方法
+  若 --quantizer_type nf4：bitsandbytes NF4 权重替换
+
+步骤 11：模型设备分配
+  单卡（默认）或多卡（--distribute）
 
 步骤 12：困惑度评估 & 报告
-  在 WikiText2 或 C4 上评估困惑度
-  输出量化后模型性能
+  在指定数据集（wikitext2/c4/ptb）上评估困惑度
+  输出结果并保存到 output_dir/results.txt
 ```
 
 ---
@@ -446,7 +562,7 @@ python dartquant_v2/run_quantize.py \
 
 **公式**：
 ```
-L = sum(exp(-|x|)) / n
+L = mean( sum_i exp(-|x_i|) )
 ```
 
 推动激活分布远离零点，使分布更均匀，降低量化误差。
@@ -457,81 +573,88 @@ L = sum(exp(-|x|)) / n
 
 ### SWD_Unif 损失（均匀分布）
 
-**公式**：
+**公式**（逐维度独立计算）：
 ```
-b      = sqrt(3) * RMS(x)
-target = Uniform[-b, b] 的等间距分位数
-Loss   = ||sort(x) - target||^2
+b_j    = sqrt(3) * RMS(x[:,j])
+target = Uniform[-b_j, b_j] 的等间距分位数
+Loss   = mean_j ||sort_j(x) - target_j||^2
 ```
 
-**优势**：
-- 自适应范围，无超参数
-- 分布感知，性能稳定
-- 特别适合 INT4 均匀量化
+**优势**：自适应范围、无超参数、特别适合 INT4 均匀量化。
 
 ---
 
 ### Gaussian SWD 损失（高斯分布）
 
-**公式**：
+**公式**（逐维度独立计算）：
 ```
-sigma  = sqrt(mean(x^2))
-p_i    = (i - 0.5) / n          (每个排序后元素的概率位置)
-target = Phi^{-1}(p_i) * sigma  (正态分布分位数)
-Loss   = ||sort(x) - target||^2
+sigma_j = sqrt(mean(x[:,j]^2))
+p_i     = (i - 0.5) / n
+target  = Phi^{-1}(p_i) * sigma_j  (正态分布分位数)
+Loss    = mean_j ||sort_j(x) - target_j||^2
 ```
 
-其中 `Phi^{-1}(p) = sqrt(2) * erfinv(2p - 1)`（逆正态分布函数）。
+**优势**：与 NF4 高斯假设匹配、自适应标准差估计。
 
-**优势**：
-- 与 NF4 高斯假设匹配
-- 自适应标准差估计
-- 分布感知的量化
+---
+
+### KL_Unif 损失（熵最大化）
+
+**原理**：Vasicek (1976) 间距熵估计器，最大化每维度的微分熵，驱动样本均匀分布。
+
+**公式**（逐维度独立）：
+```
+H_j ≈ (1/B) Σ_i log(B · Δx_i^j)  （间距估计的微分熵）
+L   = -mean_j H_j                  （最小化负熵 = 最大化熵）
+```
+
+**优势**：理论上直接最小化与均匀分布的 KL 散度（b_j 旋转不变，可消去）。
+
+---
+
+### KL_Gauss 损失（矩匹配）
+
+**原理**：Gram-Charlier 代理损失，最小化偏度²和峰度²，驱动分布趋向高斯形状。
+
+**公式**（逐维度独立）：
+```
+L_j = skewness_j²  +  excess_kurtosis_j²
+L   = mean_j L_j
+```
+
+**优势**：高斯分布时 γ₁=γ₂=0，损失为零；与 NF4 假设精确匹配。
+
+---
+
+### Bin_KL 损失（离散 bin KL，论文 Eq 19）
+
+**原理**：对量化级别使用软直方图，直接最小化激活在每个量化 bin 上的分布与均匀分布的 KL 散度。
+
+- `bin_kl_unif`：基于 INT4 量化级别（15 个等间距 bin，逐维度自适应范围）
+- `bin_kl_nf4`：基于 NF4 量化级别（16 个非均匀 bin，来自 QLoRA 论文）
 
 ---
 
 ### Butterfly Givens 旋转
 
-**算法结构**：
+**算法结构（d=8 示例，K=3 层）**：
 ```
-输入：维度 d（2 的幂）
-层数 K = log2(d)
-
-第 l 层配对方式（l = 0, 1, ..., K-1）：
-  stride = 2^(l+1)
-  配对 (i, i + 2^l)，其中 i mod stride < 2^l
-
-d=8 的例子（K=3）：
-  层 0（stride=2）: (0,1), (2,3), (4,5), (6,7)
-  层 1（stride=4）: (0,2), (1,3), (4,6), (5,7)
-  层 2（stride=8）: (0,4), (1,5), (2,6), (3,7)
+层 0（stride=2）: (0,1), (2,3), (4,5), (6,7)
+层 1（stride=4）: (0,2), (1,3), (4,6), (5,7)
+层 2（stride=8）: (0,4), (1,5), (2,6), (3,7)
 
 每对使用 Givens 旋转：
-  [cos(theta)  sin(theta)]
-  [-sin(theta) cos(theta)]
+  [cos(θ)  sin(θ)]
+  [-sin(θ) cos(θ)]
 
-初始化：theta = 0（等价于单位矩阵）
-训练：通过梯度下降学习最优角度 theta
+初始化：θ = 0（等价单位矩阵）
+预热：300 步拟合随机 Hadamard 矩阵
+训练：通过梯度下降学习最优角度 θ
 ```
 
 ---
 
 ## 模型支持与扩展
-
-### 内置支持模型
-
-所有内置注册在 `dartquant_v2/arch/` 下，导入 `dartquant_v2` 时自动生效。
-
-| 系列 | 配置类名 | 架构 | 注册文件 | 典型模型 |
-|------|---------|------|---------|---------|
-| Meta Llama | LlamaConfig | Dense | arch/dense/llama.py | Llama-2-7B、Llama-3-8B、Llama-3.2-1B |
-| Meta OPT | OPTConfig | Dense | arch/dense/opt.py | OPT-125M、OPT-1.3B、OPT-30B |
-| Mistral AI Mixtral | MixtralConfig | MoE | arch/moe/mixtral.py | Mixtral-8x7B、Mixtral-8x22B |
-| Alibaba Qwen2-MoE | Qwen2MoeConfig | MoE | arch/moe/qwen_moe.py | Qwen1.5-MoE-A2.7B、Qwen2-57B-A14B |
-
-MoE 模型的旋转矩阵应用规则（依据 docs/SNLP_report_1_v1_en.md 第 2.4.4 节）：
-- R1 应用于每个专家的输入投影（up/gate）和输出投影（down，右乘 R1^T）
-- R4 所有专家共享同一矩阵，烘焙到每个专家的 down_proj 权重中
 
 ### 如何添加新的 Dense 架构
 
@@ -672,19 +795,33 @@ register_arch("YourMoeConfig", ModelArchConfig(
 
 ---
 
-### Q3：Butterfly 对性能的影响？
+### Q3：7 种损失函数如何选择？
+
+| 量化目标 | 推荐损失 | 说明 |
+|---------|---------|------|
+| INT4（快速基线） | `whip` | 原始 DartQuant，收敛快 |
+| INT4（分布感知） | `swd_unif` | SWD 匹配均匀分布，性能稳定 |
+| INT4（信息理论） | `kl_unif` | 最大化微分熵，理论最优 |
+| INT4（量化感知） | `bin_kl_unif` | 直接优化量化 bin 分布 |
+| NF4（分布感知） | `swd_gauss` | SWD 匹配高斯分布 |
+| NF4（信息理论） | `kl_gauss` | 矩匹配驱向高斯 |
+| NF4（量化感知） | `bin_kl_nf4` | 直接优化 NF4 级别分布 |
+
+---
+
+### Q4：Butterfly 对性能的影响？
 
 通常能带来 0.1~0.3 困惑度的改善，具体取决于模型大小和数据集。
 
 权衡：
-- 优势：性能更优
-- 劣势：训练时间延长约 20%
+- 优势：性能更优，可学习旋转适应具体模型
+- 劣势：训练时间延长约 20%，`--butterfly_epochs` 建议 ≥ 100
 
 建议先用基础设置快速验证，再启用 `--butterfly` 以获得最优结果。
 
 ---
 
-### Q4：如何处理显存不足？
+### Q5：如何处理显存不足？
 
 按优先级调整：
 
@@ -695,7 +832,7 @@ register_arch("YourMoeConfig", ModelArchConfig(
 
 ---
 
-### Q5：如何评估量化后的模型？
+### Q6：如何评估量化后的模型？
 
 流程内已自动完成困惑度评估，评估结果会在最后输出：
 
@@ -708,6 +845,23 @@ Quantized Model PPL:  8.74  (WikiText2)
 
 ---
 
+### Q7：如何运行损失函数和 Butterfly 可视化实验？
+
+使用 `scripts/plot_loss_butterfly.py`：
+
+```bash
+python scripts/plot_loss_butterfly.py
+```
+
+该脚本完整镜像 dartquant_v2 管道的旋转矩阵计算（跳过权重量化和 PPL 评估），生成三组实验图像：
+- **实验 1**：R1 损失函数对比（Whip / SWD_Unif / SWD_Gauss），含激活分布直方图和训练曲线
+- **实验 2**：R2 逐头旋转，报告每层最终损失
+- **实验 3**：Butterfly R3 与 Hadamard 对比，含分布图和方差均匀性曲线
+
+输出路径：`/root/autodl-tmp/dartquant_v2_plots/`（可在脚本顶部 `PLOT_DIR` 修改）
+
+---
+
 ## 完整端到端示例
 
 ```bash
@@ -717,8 +871,6 @@ python dartquant_v2/run_quantize.py \
     --loss swd_unif \
     --quantizer_type int4 \
     --w_bits 4 --a_bits 4 \
-    --w_groupsize 128 \
-    --a_groupsize 128 \
     --r1_epochs 10 \
     --r2_epochs 5 \
     --batch_size 64 \
@@ -730,19 +882,34 @@ python dartquant_v2/run_quantize.py \
     --seed 42
 ```
 
+```bash
+# INT4 + Butterfly + KL 损失，进阶示例
+python dartquant_v2/run_quantize.py \
+    --model meta-llama/Llama-3.2-1B \
+    --loss kl_unif \
+    --quantizer_type int4 \
+    --butterfly \
+    --butterfly_epochs 200 \
+    --lambda_recon 0.1 \
+    --w_bits 4 --a_bits 4 \
+    --nsamples 128 \
+    --seed 42
+```
+
 ---
 
 ## 技术细节
 
-- **R1**：d_model x d_model 全局旋转，应用于嵌入、Attention 和 MLP
-- **R2**：d_head x d_head 按头旋转，应用于 Attention 的 V 和 O
-- **R3**：d_head x d_head 旋转，在 RoPE 之后在线应用于 Q, K
-- **R4**：d_inter x d_inter 旋转，离线烘焙到 down_proj 权重 + 在线应用
-- **QR-Orth**：通过 QR 分解参数化无约束矩阵，保证正交性
+- **R1**（v2 逐层）：每层独立的 hidden_size × hidden_size 正交矩阵，应用于嵌入、Attention 输入/输出、MLP 输入/输出
+- **R2**：head_dim × head_dim 按头旋转，应用于 Attention 的 V 投影输出和 O 投影输入
+- **R3**：head_dim × head_dim 旋转，在 RoPE 之后在线应用于 Q, K
+- **R4**：intermediate_size × intermediate_size 旋转，离线烘焙到 down_proj 权重 + 在线应用
+- **QR-Orth**：通过 QR 分解参数化无约束矩阵，保证正交性（用于 R1、R2 及 ButterflyFactored K 因子）
+- **Butterfly**：通过 Givens 角度参数化，O(d log d) 复杂度，天然正交，Hadamard 预热
 
 详见研究报告：
-- 第一阶段：`docs/SNLP_report_1_v1_en.md`（SWD_Unif, QR-Orth）
-- 第二阶段：`docs/report_2_en.md`（Butterfly, Gaussian SWD）
+- 第一阶段：`docs/SNLP_report_1_v1_en.md`（SWD_Unif, QR-Orth, 逐层 R1）
+- 第二阶段：`docs/report_2_en.md`（Butterfly, Gaussian SWD, KL 损失, Eq 17 重建损失）
 
 ---
 

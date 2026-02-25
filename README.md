@@ -358,6 +358,16 @@ int4_quantization_darkquant/
 
 > 专家命名：`up_proj`/`gate_proj`/`down_proj`（与 Llama 一致）；有常驻共享专家（`mlp.shared_expert`）；R1 和 R4 同时应用于路由专家和共享专家。
 
+#### Deepseek
+ 系列（`DeepseekConfig`，注册于 `arch/moe/deepseek_moe.py`）
+
+| 典型模型 ID |
+|------------|
+| `deepseek-ai/deepseek-moe-16b-base` |
+| `deepseek-ai/deepseek-moe-16b-chat` |
+
+> 专家命名：`up_proj`/`gate_proj`/`down_proj`（与 Llama 和 Qwen 一致）；有常驻共享专家（`mlp.shared_expert`）；R1 和 R4 同时应用于路由专家和共享专家。
+
 ### MoE 旋转应用规则
 
 （依据 `docs/SNLP_report_1_v1_en.md` 第 2.4.4 节）

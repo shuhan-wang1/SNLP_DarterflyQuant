@@ -43,12 +43,12 @@ def load_local_dataset(dataset_name, split='train'):
     """从本地加载数据集"""
     if dataset_name not in LOCAL_DATASET_PATHS:
         raise ValueError(f'未知数据集: {dataset_name}')
-    
+
     base_path = LOCAL_DATASET_PATHS[dataset_name]
-    
+
     if not os.path.exists(base_path):
         raise FileNotFoundError(f'数据集目录不存在: {base_path}')
-    
+
     # 尝试使用 datasets 库加载
     try:
         ds = load_from_disk(base_path)
@@ -60,11 +60,11 @@ def load_local_dataset(dataset_name, split='train'):
             return ds
     except Exception as e:
         print(f"load_from_disk 失败: {e}")
-    
+
     # 列出目录中的所有文件
     files = os.listdir(base_path)
     print(f"目录 {base_path} 中的文件: {files}")
-    
+
     # 使用 Dataset.from_file 直接加载 arrow 文件
     arrow_files = [f for f in files if f.endswith('.arrow') and split in f]
     if arrow_files:
@@ -74,7 +74,7 @@ def load_local_dataset(dataset_name, split='train'):
             return ds
         except Exception as e:
             print(f"Dataset.from_file 失败: {e}")
-    
+
     # 查找匹配 split 的 parquet 文件
     parquet_files = [f for f in files if f.endswith('.parquet') and split in f]
     if parquet_files:
@@ -90,7 +90,7 @@ def load_local_dataset(dataset_name, split='train'):
                 for key in data:
                     all_data[key].extend(data[key])
         return all_data
-    
+
     # 查找 json 文件
     json_files = [f for f in files if f.endswith('.json')]
     if json_files:
@@ -100,7 +100,7 @@ def load_local_dataset(dataset_name, split='train'):
         if data_json:
             with open(os.path.join(base_path, data_json[0]), 'r') as f:
                 return json.load(f)
-    
+
     raise FileNotFoundError(f'在 {base_path} 中找不到 {split} 数据集文件')
 
 

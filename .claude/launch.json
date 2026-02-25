@@ -1,0 +1,22 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "stat-and-download",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["scripts/stat_and_download.py"],
+      "port": 0
+    },
+    {
+      "name": "dartquant-v2-example",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "dartquant_v2/run_quantize.py",
+        "--model", "meta-llama/Llama-3.2-1B",
+        "--loss", "swd_unif",
+        "--quantizer_type", "int4"
+      ],
+      "port": 0
+    }
+  ]
+}

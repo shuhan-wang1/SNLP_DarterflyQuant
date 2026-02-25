@@ -11,7 +11,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:learnopencv.com)",
-      "WebFetch(domain:amaarora.github.io)"
+      "WebFetch(domain:amaarora.github.io)",
+      "Bash(xargs -I {} sh -c 'if [ -f {}/__init__.py ]; then echo {}; fi')"
     ]
   }
 }

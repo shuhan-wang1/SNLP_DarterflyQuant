@@ -31,23 +31,29 @@ import os
 import logging
 
 # ── Local-only cache configuration ───────────────────────────────────────────
-# All models and datasets must be downloaded in advance (e.g. via
-# scripts/stat_and_download.py).  Network access is completely disabled so
-# that the pipeline fails fast with a clear error if a required file is
-# missing, rather than silently hanging on a download.
+# All models and datasets must be downloaded in advance on the Myriad login
+# node (e.g. via scripts/prepare_assets.sh).  Compute nodes have no internet
+# access, so we set offline flags to fail fast with a clear error if a file
+# is missing rather than silently hanging on a download attempt.
 #
-# Cache directories: honour existing env vars so users can override paths,
-#   but default to the standard AutoDL layout.
-# Offline flags: set to "1" unconditionally; set to "0" in your shell env
-#   only if you explicitly need to allow downloads for a specific run.
-_CACHE_DIR = "/root/autodl-tmp"
-_HF_HOME   = os.path.join(_CACHE_DIR, "huggingface")
+# Priority for cache directory:
+#   1. $HF_HOME already set in environment (e.g. by submit_job.sh)
+#   2. UCL Myriad Scratch default
+#
+# To allow downloads (login node only), export TRANSFORMERS_OFFLINE=0 before
+# running this script.
+_DEFAULT_HF_HOME = "/home/ucab327/Scratch/huggingface"
+_HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
+
 os.environ.setdefault("HF_HOME",           _HF_HOME)
 os.environ.setdefault("TRANSFORMERS_CACHE", _HF_HOME)
-os.environ.setdefault("HF_DATASETS_CACHE",  os.path.join(_CACHE_DIR, "datasets"))
+os.environ.setdefault("HF_DATASETS_CACHE",
+                      os.path.join(_HF_HOME, "datasets"))
 
 # Block all HuggingFace network calls (transformers + datasets).
 # These env vars are checked by the HF libraries before any network request.
+# Set TRANSFORMERS_OFFLINE=0 / HF_DATASETS_OFFLINE=0 in your shell to
+# temporarily re-enable downloads (login node only).
 if os.environ.get("TRANSFORMERS_OFFLINE") != "0":
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 if os.environ.get("HF_DATASETS_OFFLINE") != "0":

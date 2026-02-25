@@ -11,6 +11,7 @@ Optional arguments:
   --cayley          Use Cayley parameterization for the non-power-of-2 K-factor
 """
 
+import os
 import argparse
 
 
@@ -28,14 +29,24 @@ def create_parser() -> argparse.ArgumentParser:
     model_group.add_argument('--hf_token', type=str, default=None,
                              help='HuggingFace access token')
     model_group.add_argument(
-        '--cache_dir', type=str, default='/root/autodl-tmp/huggingface',
-        help='Cache directory for HuggingFace model weights. '
-             'Default matches scripts/stat_and_download.py so models already '
-             'downloaded by that script are reused without re-downloading.')
+        '--cache_dir', type=str,
+        default=os.environ.get('HF_HOME', '/home/ucab327/Scratch/huggingface'),
+        help='HuggingFace hub cache directory for model weights. '
+             'Reads $HF_HOME if set, otherwise falls back to '
+             '/home/ucab327/Scratch/huggingface. '
+             'Override with --cache_dir or by exporting HF_HOME before running.')
     model_group.add_argument(
-        '--datasets_cache_dir', type=str, default='/root/autodl-tmp/datasets',
-        help='Cache directory for HuggingFace datasets. '
-             'Default matches scripts/stat_and_download.py.')
+        '--datasets_cache_dir', type=str,
+        default=os.environ.get(
+            'HF_DATASETS_CACHE',
+            os.path.join(
+                os.environ.get('HF_HOME', '/home/ucab327/Scratch/huggingface'),
+                'datasets'
+            )
+        ),
+        help='HuggingFace datasets cache directory. '
+             'Reads $HF_DATASETS_CACHE, then $HF_HOME/datasets, '
+             'then falls back to the Scratch default.')
     model_group.add_argument('--seed', type=int, default=0,
                              help='Random seed')
 

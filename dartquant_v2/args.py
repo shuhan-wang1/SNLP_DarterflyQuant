@@ -30,17 +30,17 @@ def create_parser() -> argparse.ArgumentParser:
                              help='HuggingFace access token')
     model_group.add_argument(
         '--cache_dir', type=str,
-        default=os.environ.get('HF_HOME', '/home/ucab327/Scratch/huggingface'),
+        default=os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'),
         help='HuggingFace hub cache directory for model weights. '
              'Reads $HF_HOME if set, otherwise falls back to '
-             '/home/ucab327/Scratch/huggingface. '
+             '/root/autodl-tmp/huggingface. '
              'Override with --cache_dir or by exporting HF_HOME before running.')
     model_group.add_argument(
         '--datasets_cache_dir', type=str,
         default=os.environ.get(
             'HF_DATASETS_CACHE',
             os.path.join(
-                os.environ.get('HF_HOME', '/home/ucab327/Scratch/huggingface'),
+                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'),
                 'datasets'
             )
         ),

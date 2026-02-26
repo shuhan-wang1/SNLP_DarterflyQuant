@@ -47,11 +47,11 @@ HF_TOKEN = os.environ.get("HF_TOKEN", None)
 # ── Cache directories ────────────────────────────────────────────────────────
 # Priority:
 #   1. $HF_HOME already exported in the shell  (e.g. by the user or a wrapper)
-#   2. UCL Myriad Scratch default below
+#   2. autodl default cache directory
 #
 # The same variable is read by dartquant_v2/run_quantize.py so models and
 # datasets downloaded here are found automatically by the training pipeline.
-_DEFAULT_HF_HOME = "/home/ucab327/Scratch/huggingface"
+_DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 
 # Expose to sub-processes and the HuggingFace libraries imported below.

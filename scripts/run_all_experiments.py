@@ -37,7 +37,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Cache directory resolution (same logic as run_quantize.py)
 # ---------------------------------------------------------------------------
-_DEFAULT_HF_HOME = "/home/ucab327/Scratch/huggingface"
+_DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 _DATASETS_CACHE = os.environ.get(
     "HF_DATASETS_CACHE", os.path.join(_HF_HOME, "datasets")

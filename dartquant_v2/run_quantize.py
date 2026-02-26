@@ -37,12 +37,11 @@ import logging
 # is missing rather than silently hanging on a download attempt.
 #
 # Priority for cache directory:
-#   1. $HF_HOME already set in environment (e.g. by submit_job.sh)
-#   2. UCL Myriad Scratch default
+#   1. $HF_HOME already set in environment
+#   2. autodl default cache directory
 #
-# To allow downloads (login node only), export TRANSFORMERS_OFFLINE=0 before
-# running this script.
-_DEFAULT_HF_HOME = "/home/ucab327/Scratch/huggingface"
+# To allow downloads, export TRANSFORMERS_OFFLINE=0 before running this script.
+_DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 
 os.environ.setdefault("HF_HOME",           _HF_HOME)

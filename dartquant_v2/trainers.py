@@ -384,7 +384,169 @@ def train_r1_all_layers(
 
 
 # ============================================================================
-# R2 Training
+# Single-layer R1 Training (memory-efficient: called per-layer from pipeline)
+# ============================================================================
+
+def train_r1_single_layer(
+    acts: torch.Tensor,
+    hidden_size: int,
+    loss_fn_name: str,
+    lr: float = 1e-3,
+    momentum: float = 0.9,
+    epochs: int = 10,
+    batch_size: int = 64,
+    cos_lr: bool = False,
+    optim: str = 'sgd',
+    init_mode: str = 'hadamard',
+    accumulation_steps: int = 1,
+    train_subset_size: float = 1.0,
+    device='cuda',
+    layer_idx: int = 0,
+) -> torch.Tensor:
+    """Train R1 rotation for a single layer.
+
+    Memory-efficient: called from the pipeline per-layer instead of
+    collecting all layers' activations at once.
+
+    Args:
+        acts: Activation tensor (N, hidden_size) — already concatenated
+              from all targets for this layer.
+        layer_idx: Layer index (for logging only).
+
+    Returns:
+        Trained rotation matrix tensor (hidden_size, hidden_size), float64.
+    """
+    loss_fn = get_loss_fn(loss_fn_name)
+    if isinstance(device, str):
+        device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    acts = acts.float().cpu()
+    dataset = TensorDataset(acts)
+
+    R1 = R1_QR(hidden_size).to(device)
+    R1.matrix.data = _get_init_matrix(hidden_size, init_mode, device).float()
+
+    optimizer = _create_optimizer(R1.parameters(), optim, lr, momentum)
+    scheduler = (CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
+                 if cos_lr else None)
+
+    R1.train()
+    logging.info(f"  Training R1 layer {layer_idx} ({loss_fn_name}, "
+                 f"{len(acts)} samples)")
+
+    for epoch in range(epochs):
+        loss_log = []
+        num_samples = max(1, int(len(dataset) * train_subset_size))
+        indices = np.random.choice(len(dataset), size=num_samples, replace=False)
+        sampler = RandomSampler(torch.utils.data.Subset(dataset, indices))
+        dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
+
+        for batch_idx, (batch_samples,) in enumerate(dataloader):
+            batch_samples = batch_samples.to(device).float().reshape(-1, hidden_size)
+            outputs = R1(batch_samples)
+            loss = loss_fn(outputs) / accumulation_steps
+            loss.backward()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            loss_log.append(loss.detach())
+
+        if scheduler:
+            scheduler.step()
+
+        mean_loss = torch.stack(loss_log).mean()
+        if (epoch + 1) % max(1, epochs // 5) == 0 or epoch == 0:
+            lr_str = (f", LR: {scheduler.get_last_lr()[0]:.4e}"
+                      if scheduler else "")
+            logging.info(
+                f"    R1 L{layer_idx} Epoch [{epoch+1}/{epochs}], "
+                f"Loss: {mean_loss.item():.6f}{lr_str}"
+            )
+
+    return R1.rotate.data.detach()
+
+
+# ============================================================================
+# Single-layer R2 Training (memory-efficient)
+# ============================================================================
+
+def train_r2_single_layer(
+    acts: torch.Tensor,
+    hidden_size: int,
+    num_heads: int,
+    kv_heads: int,
+    loss_fn_name: str,
+    lr: float = 1e-3,
+    momentum: float = 0.9,
+    epochs: int = 5,
+    batch_size: int = 128,
+    cos_lr: bool = False,
+    optim: str = 'sgd',
+    accumulation_steps: int = 2,
+    device='cuda',
+    layer_idx: int = 0,
+    layers_path: str = 'model.layers',
+) -> tuple:
+    """Train R2 rotation for a single layer.
+
+    Returns:
+        (key, rotation_tensor) where key = "model.layers.{i}.self_attn.R2"
+    """
+    loss_fn = get_loss_fn(loss_fn_name)
+    if isinstance(device, str):
+        device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    if isinstance(acts, np.ndarray):
+        acts = torch.tensor(
+            np.nan_to_num(acts, nan=0.0, posinf=65504, neginf=-65504),
+            dtype=torch.float32
+        )
+    acts = acts.float()
+    dataset = TensorDataset(acts)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    R2 = R2_Per_Head(hidden_size, num_heads, kv_heads).to(device)
+    R2.matrix.data = _get_multi_head_init(
+        hidden_size, num_heads, kv_heads, 'hadamard', device
+    ).float()
+
+    optimizer = _create_optimizer(R2.parameters(), optim, lr, momentum)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None
+
+    R2.train()
+    logging.info(f"  Training R2 layer {layer_idx}...")
+
+    for epoch in range(epochs):
+        loss_log = []
+        for batch_idx, (batch_samples,) in enumerate(dataloader):
+            batch_samples = batch_samples.to(device).float()
+            outputs = R2(batch_samples)
+            loss = loss_fn(outputs) / accumulation_steps
+            loss.backward()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            loss_log.append(loss.detach())
+
+        if scheduler:
+            scheduler.step()
+
+        if (epoch + 1) == epochs:
+            mean_loss = torch.stack(loss_log).mean()
+            logging.info(
+                f"    R2 L{layer_idx} final Loss: {mean_loss.item():.6f}"
+            )
+
+    key = f"{layers_path}.{layer_idx}.self_attn.R2"
+    return key, R2.rotate.data.detach()
+
+
+# ============================================================================
+# R2 Training (batch — kept for backward compat)
 # ============================================================================
 
 def train_r2_all_layers(

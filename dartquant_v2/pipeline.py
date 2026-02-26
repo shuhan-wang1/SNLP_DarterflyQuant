@@ -915,39 +915,56 @@ def run_full_pipeline(args):
             logging.info("\n[4/12] Collecting activations and training R1 (per-layer)...")
             model.to(DEV)
 
-            # Collect R1 training data (MLP and attention inputs)
-            r1_targets = []
-            for i in range(umodel.num_layers):
-                layers_prefix = umodel.arch.layers_path
+            # Collect + train one layer at a time to avoid storing all
+            # activations in RAM at once (~22 GB for a 22-layer model).
+            from .trainers import train_r1_single_layer
+            layers_prefix = umodel.arch.layers_path
+
+            for layer_idx in range(umodel.num_layers):
+                # Build targets for this layer only
+                layer_targets = []
                 if umodel.arch.mlp_up_proj_attr:
-                    r1_targets.append(
-                        f"{layers_prefix}.{i}.{umodel.arch.mlp_up_proj_attr}"
+                    layer_targets.append(
+                        f"{layers_prefix}.{layer_idx}.{umodel.arch.mlp_up_proj_attr}"
                     )
-                r1_targets.append(
-                    f"{layers_prefix}.{i}.{umodel.arch.q_proj_attr}"
+                layer_targets.append(
+                    f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
 
-            r1_activations = collect_activations(
-                model, calib_data, r1_targets, DEV
-            )
-            model.cpu()
-            cleanup_memory()
+                # Collect activations for this layer only
+                layer_acts = collect_activations(
+                    model, calib_data, layer_targets, DEV
+                )
 
-            R1_dict = train_r1_all_layers(
-                activations=r1_activations,
-                hidden_size=umodel.hidden_size,
-                loss_fn_name=args.loss,
-                lr=args.lr,
-                momentum=args.momentum,
-                epochs=args.r1_epochs,
-                batch_size=args.batch_size,
-                cos_lr=args.cos_lr,
-                optim=args.optim,
-                init_mode=args.rotate_mode,
-                accumulation_steps=args.accumulation_steps,
-                train_subset_size=args.train_subset_size,
-            )
-            del r1_activations
+                # Concatenate the targets for this layer
+                all_acts = torch.cat(
+                    [a.reshape(-1, umodel.hidden_size) for a in layer_acts.values()],
+                    dim=0
+                )
+
+                # Train R1 for this layer on GPU
+                R1_dict[layer_idx] = train_r1_single_layer(
+                    acts=all_acts,
+                    hidden_size=umodel.hidden_size,
+                    loss_fn_name=args.loss,
+                    lr=args.lr,
+                    momentum=args.momentum,
+                    epochs=args.r1_epochs,
+                    batch_size=args.batch_size,
+                    cos_lr=args.cos_lr,
+                    optim=args.optim,
+                    init_mode=args.rotate_mode,
+                    accumulation_steps=args.accumulation_steps,
+                    train_subset_size=args.train_subset_size,
+                    device=DEV,
+                    layer_idx=layer_idx,
+                )
+
+                del layer_acts, all_acts
+                cleanup_memory()
+
+            logging.info(f"  R1 training complete for {len(R1_dict)} layers.")
+            model.cpu()
             cleanup_memory()
     else:
         logging.info("\n[4/12] R1 disabled, skipping...")
@@ -972,45 +989,48 @@ def run_full_pipeline(args):
             logging.info("\n[6/12] Collecting activations and training R2...")
             model.to(DEV)
 
-            r2_targets = []
+            from .trainers import train_r2_single_layer
             layers_prefix = umodel.arch.layers_path
-            for i in range(umodel.num_layers):
-                r2_targets.append(
-                    f"{layers_prefix}.{i}.{umodel.arch.o_proj_attr}"
+
+            for layer_idx in range(umodel.num_layers):
+                r2_target = [
+                    f"{layers_prefix}.{layer_idx}.{umodel.arch.o_proj_attr}"
+                ]
+
+                layer_acts = collect_activations(
+                    model, calib_data, r2_target, DEV
                 )
 
-            r2_raw_acts = collect_activations(
-                model, calib_data, r2_targets, DEV
-            )
+                # Get the single target's activations
+                acts = list(layer_acts.values())[0] if layer_acts else None
+                if acts is None:
+                    logging.warning(f"  No R2 activations for layer {layer_idx}")
+                    continue
+
+                key, rotation = train_r2_single_layer(
+                    acts=acts,
+                    hidden_size=umodel.hidden_size,
+                    num_heads=umodel.num_heads,
+                    kv_heads=umodel.kv_heads,
+                    loss_fn_name=args.loss,
+                    lr=args.lr,
+                    momentum=args.momentum,
+                    epochs=args.r2_epochs,
+                    batch_size=args.batch_size * 2,
+                    cos_lr=args.cos_lr,
+                    optim=args.optim,
+                    accumulation_steps=max(args.accumulation_steps, 2),
+                    device=DEV,
+                    layer_idx=layer_idx,
+                    layers_path=layers_prefix,
+                )
+                R2_dict[key] = rotation
+
+                del layer_acts, acts
+                cleanup_memory()
+
+            logging.info(f"  R2 training complete for {len(R2_dict)} layers.")
             model.cpu()
-            cleanup_memory()
-
-            # Reorganize by layer id
-            r2_per_layer = {}
-            for name, acts in r2_raw_acts.items():
-                # Extract layer index from name
-                parts = name.split('.')
-                for j, p in enumerate(parts):
-                    if p.isdigit():
-                        layer_id = int(p)
-                        r2_per_layer[layer_id] = acts
-                        break
-
-            R2_dict = train_r2_all_layers(
-                activations_per_layer=r2_per_layer,
-                hidden_size=umodel.hidden_size,
-                num_heads=umodel.num_heads,
-                kv_heads=umodel.kv_heads,
-                loss_fn_name=args.loss,
-                lr=args.lr,
-                momentum=args.momentum,
-                epochs=args.r2_epochs,
-                batch_size=args.batch_size * 2,  # R2 uses larger batch (default: 128)
-                cos_lr=args.cos_lr,
-                optim=args.optim,
-                accumulation_steps=max(args.accumulation_steps, 2),
-            )
-            del r2_raw_acts, r2_per_layer
             cleanup_memory()
     else:
         logging.info("\n[6/12] R2 disabled, skipping...")

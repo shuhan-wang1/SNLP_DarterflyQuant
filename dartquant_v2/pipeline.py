@@ -150,6 +150,9 @@ def _replace_norms(model, umodel: UnifiedQuantModel):
         target_class = transformers.models.llama.modeling_llama.LlamaRMSNorm
     elif norm_class_name == "LayerNorm":
         target_class = nn.LayerNorm
+    elif norm_class_name == "Qwen3RMSNorm":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+        target_class = Qwen3RMSNorm
     else:
         logging.warning(f"Unknown norm class: {norm_class_name}, skipping replacement")
         return

@@ -37,16 +37,11 @@ def create_parser() -> argparse.ArgumentParser:
              'Override with --cache_dir or by exporting HF_HOME before running.')
     model_group.add_argument(
         '--datasets_cache_dir', type=str,
-        default=os.environ.get(
-            'HF_DATASETS_CACHE',
-            os.path.join(
-                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'),
-                'datasets'
-            )
-        ),
+        default=os.environ.get('HF_DATASETS_CACHE', '/root/autodl-tmp/datasets'),
         help='HuggingFace datasets cache directory. '
-             'Reads $HF_DATASETS_CACHE, then $HF_HOME/datasets, '
-             'then falls back to the Scratch default.')
+             'Reads $HF_DATASETS_CACHE if set, otherwise falls back to '
+             '/root/autodl-tmp/datasets. '
+             'Override with --datasets_cache_dir or by exporting HF_DATASETS_CACHE.')
     model_group.add_argument('--seed', type=int, default=0,
                              help='Random seed')
 

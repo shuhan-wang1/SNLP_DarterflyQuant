@@ -39,9 +39,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 _DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
-_DATASETS_CACHE = os.environ.get(
-    "HF_DATASETS_CACHE", os.path.join(_HF_HOME, "datasets")
-)
+_DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", "/root/autodl-tmp/datasets")
 
 logging.basicConfig(
     level=logging.INFO,

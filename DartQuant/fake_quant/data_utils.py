@@ -5,9 +5,7 @@ import json
 
 # Cache directory: read from HF_HOME (set by run_quantize.py), fallback to autodl default
 MODEL_CACHE_DIR = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
-DATASETS_CACHE_DIR = os.environ.get(
-    'HF_DATASETS_CACHE', os.path.join(MODEL_CACHE_DIR, 'datasets')
-)
+DATASETS_CACHE_DIR = os.environ.get('HF_DATASETS_CACHE', '/root/autodl-tmp/datasets')
 
 from transformers import AutoTokenizer
 from datasets import load_dataset, load_from_disk, Dataset

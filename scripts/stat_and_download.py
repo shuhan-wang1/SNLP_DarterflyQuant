@@ -57,7 +57,9 @@ HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 # Expose to sub-processes and the HuggingFace libraries imported below.
 os.environ["HF_HOME"]           = HF_HOME
 os.environ["TRANSFORMERS_CACHE"] = HF_HOME
-os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_HOME, "datasets")
+os.environ["HF_DATASETS_CACHE"] = os.environ.get(
+    "HF_DATASETS_CACHE", "/root/autodl-tmp/datasets"
+)
 
 # NOTE: We do NOT set HF_DATASETS_OFFLINE or TRANSFORMERS_OFFLINE here.
 #       This script is meant to run on the login node where internet IS

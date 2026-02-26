@@ -796,6 +796,44 @@ def evaluate_model(model, args, umodel: UnifiedQuantModel):
     return results
 
 
+def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
+    """Run zero-shot benchmarks via lm-evaluation-harness."""
+    try:
+        import lm_eval
+        from lm_eval.models.huggingface import HFLM
+    except ImportError:
+        logging.error("lm_eval not installed. pip install lm-eval==0.4.3")
+        return {}
+
+    tokenizer = umodel.get_tokenizer()
+    hflm = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        batch_size=args.lm_eval_batch_size,
+    )
+
+    task_names = args.lm_eval_tasks
+    logging.info(f"  lm_eval tasks: {task_names}")
+
+    raw_results = lm_eval.simple_evaluate(hflm, tasks=task_names)['results']
+
+    # Extract accuracy (prefer acc_norm over acc)
+    metrics = {}
+    for task, result in raw_results.items():
+        acc = result.get('acc_norm,none', result.get('acc,none', None))
+        if acc is not None:
+            metrics[task] = round(acc * 100, 2)
+    if metrics:
+        metrics['acc_avg'] = round(
+            sum(metrics.values()) / len(metrics), 2
+        )
+
+    for task, acc in metrics.items():
+        logging.info(f"  {task}: {acc:.2f}%")
+
+    return metrics
+
+
 # ============================================================================
 # Main Pipeline
 # ============================================================================
@@ -816,7 +854,7 @@ def run_full_pipeline(args):
     logging.info(f"  Loss:           {args.loss}")
     logging.info(f"  Quantizer:      {args.quantizer_type}")
     logging.info(f"  Butterfly:      {args.butterfly}")
-    logging.info(f"  W{args.w_bits}A{args.a_bits}")
+    logging.info(f"  W{args.w_bits}A{args.a_bits}KV{args.k_bits}")
     logging.info("=" * 70)
 
     # ======== Step 1: Load Model ========
@@ -1098,12 +1136,21 @@ def run_full_pipeline(args):
         model.to(DEV)
 
     # ======== Step 12: Evaluate ========
-    results = {}
+    ppl_results = {}
+    lm_eval_results = {}
+
     if args.ppl_eval:
         logging.info("\n[12/12] Evaluating perplexity...")
-        results = evaluate_model(model, args, umodel)
-    else:
+        ppl_results = evaluate_model(model, args, umodel)
+
+    if args.lm_eval:
+        logging.info("\n[12/12] Running lm_eval zero-shot benchmarks...")
+        lm_eval_results = evaluate_model_lm_eval(model, args, umodel)
+
+    if not args.ppl_eval and not args.lm_eval:
         logging.info("\n[12/12] Evaluation disabled.")
+
+    results = ppl_results  # backward compat for return value
 
     # ======== Save Results ========
     logging.info("\n" + "=" * 70)
@@ -1113,8 +1160,11 @@ def run_full_pipeline(args):
     logging.info(f"  Loss:      {args.loss}")
     logging.info(f"  Quantizer: {args.quantizer_type}")
     logging.info(f"  Butterfly: {args.butterfly}")
-    for dataset, ppl in results.items():
+    logging.info(f"  Config:    W{args.w_bits}A{args.a_bits}KV{args.k_bits}")
+    for dataset, ppl in ppl_results.items():
         logging.info(f"  {dataset.upper()} PPL: {ppl:.2f}")
+    for task, acc in lm_eval_results.items():
+        logging.info(f"  {task}: {acc:.2f}%")
     logging.info("=" * 70)
 
     # Save rotations
@@ -1147,8 +1197,12 @@ def run_full_pipeline(args):
         f.write(f"butterfly: {args.butterfly}\n")
         f.write(f"w_bits: {args.w_bits}\n")
         f.write(f"a_bits: {args.a_bits}\n")
-        for dataset, ppl in results.items():
+        f.write(f"k_bits: {args.k_bits}\n")
+        f.write(f"v_bits: {args.v_bits}\n")
+        for dataset, ppl in ppl_results.items():
             f.write(f"{dataset}_ppl: {ppl:.4f}\n")
+        for task, acc in lm_eval_results.items():
+            f.write(f"lm_eval_{task}: {acc:.4f}\n")
     logging.info(f"Results saved to {results_path}")
 
     logging.info("\nDone!")

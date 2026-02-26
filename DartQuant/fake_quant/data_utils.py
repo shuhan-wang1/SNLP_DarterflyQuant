@@ -3,16 +3,14 @@ import os
 import logging
 import json
 
-# 设置缓存目录
-MODEL_CACHE_DIR = '/root/autodl-tmp'
-os.environ['MODELSCOPE_CACHE'] = MODEL_CACHE_DIR
-os.environ['HF_DATASETS_CACHE'] = os.path.join(MODEL_CACHE_DIR, 'datasets')
-os.environ['HF_DATASETS_OFFLINE'] = '1'  # 强制离线模式
+# Cache directory: read from HF_HOME (set by run_quantize.py), fallback to autodl default
+MODEL_CACHE_DIR = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
+os.environ.setdefault('HF_DATASETS_CACHE', os.path.join(MODEL_CACHE_DIR, 'datasets'))
 
-from modelscope import AutoTokenizer
+from transformers import AutoTokenizer
 from datasets import load_from_disk, Dataset
 
-# HuggingFace 到本地模型路径的映射
+# Legacy modelscope model paths (backward compat for old downloads)
 MODEL_NAME_MAPPING = {
     'meta-llama/Llama-2-7b-hf': '/root/autodl-tmp/models/shakechen/Llama-2-7b-hf',
     'meta-llama/Llama-2-13b-hf': '/root/autodl-tmp/models/shakechen/Llama-2-13b-hf',
@@ -107,7 +105,10 @@ def load_local_dataset(dataset_name, split='train'):
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 
     model = convert_model_name(model)
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, use_fast=False, trust_remote_code=True,
+        cache_dir=MODEL_CACHE_DIR, token=hf_token,
+    )
 
     if eval_mode:
         # 使用本地数据集
@@ -144,7 +145,10 @@ def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
 
     model = convert_model_name(model)
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, use_fast=False, trust_remote_code=True,
+        cache_dir=MODEL_CACHE_DIR, token=hf_token,
+    )
 
     if eval_mode:
         # C4 数据集较大，如果本地没有则报错
@@ -156,7 +160,10 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
 def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 
     model = convert_model_name(model)
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, use_fast=False, trust_remote_code=True,
+        cache_dir=MODEL_CACHE_DIR, token=hf_token,
+    )
 
     if eval_mode:
         # 使用本地数据集

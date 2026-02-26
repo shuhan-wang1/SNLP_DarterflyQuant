@@ -208,12 +208,12 @@ def create_parser() -> argparse.ArgumentParser:
 
     # ==== KV-Cache Quantization ====
     kv_group = parser.add_argument_group('KV-Cache Quantization')
-    kv_group.add_argument('--k_bits', type=int, default=16,
+    kv_group.add_argument('--k_bits', type=int, default=4,
                           help='K-cache quantization bits')
     kv_group.add_argument('--k_groupsize', type=int, default=-1)
     kv_group.add_argument('--k_asym', action='store_true', default=False)
     kv_group.add_argument('--k_clip_ratio', type=float, default=1.0)
-    kv_group.add_argument('--v_bits', type=int, default=16,
+    kv_group.add_argument('--v_bits', type=int, default=4,
                           help='V-cache quantization bits')
     kv_group.add_argument('--v_groupsize', type=int, default=-1)
     kv_group.add_argument('--v_asym', action='store_true', default=False)
@@ -239,6 +239,16 @@ def create_parser() -> argparse.ArgumentParser:
                             choices=['wikitext2', 'ptb', 'c4'],
                             help='Evaluation datasets')
     eval_group.add_argument('--ppl_eval_batch_size', type=int, default=1)
+    eval_group.add_argument('--lm_eval', action='store_true', default=False,
+                            help='Run zero-shot benchmarks via lm-evaluation-harness')
+    eval_group.add_argument('--no_lm_eval', action='store_false', dest='lm_eval')
+    eval_group.add_argument(
+        '--lm_eval_tasks', type=str, nargs='+',
+        default=['piqa', 'hellaswag', 'arc_easy', 'arc_challenge',
+                 'winogrande', 'mmlu'],
+        help='lm_eval zero-shot tasks')
+    eval_group.add_argument('--lm_eval_batch_size', type=int, default=32,
+                            help='Batch size for lm_eval')
 
     # ==== Output ====
     out_group = parser.add_argument_group('Output')

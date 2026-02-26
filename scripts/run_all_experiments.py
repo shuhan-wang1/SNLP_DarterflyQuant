@@ -63,8 +63,11 @@ KNOWN_MODELS = [
     "facebook/opt-6.7b",
 ]
 
-# Evaluation datasets supported by the pipeline
+# Evaluation datasets supported by the pipeline (perplexity)
 EVAL_DATASETS = ["wikitext2", "ptb", "c4"]
+
+# Default lm_eval zero-shot tasks
+LM_EVAL_TASKS = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "mmlu"]
 
 # Calibration datasets
 CAL_DATASETS = ["wikitext2", "ptb", "c4"]
@@ -242,7 +245,8 @@ def _model_short(model_name: str) -> str:
 # Runner
 # ============================================================================
 
-def build_command(exp: dict, output_root: str, extra_args: list[str]) -> list[str]:
+def build_command(exp: dict, output_root: str, extra_args: list[str],
+                  lm_eval: bool = False) -> list[str]:
     """Build the CLI command for a single experiment."""
     output_dir = os.path.join(output_root, exp["name"])
     cmd = [
@@ -258,9 +262,11 @@ def build_command(exp: dict, output_root: str, extra_args: list[str]) -> list[st
     if exp["butterfly"]:
         cmd.append("--butterfly")
 
-    # INT4 default settings
-    if exp["quantizer_type"] == "int4":
-        cmd.extend(["--w_bits", "4", "--a_bits", "4"])
+    # w4a4kv4 defaults
+    cmd.extend(["--w_bits", "4", "--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
+
+    if lm_eval:
+        cmd.append("--lm_eval")
 
     cmd.extend(extra_args)
 
@@ -280,7 +286,7 @@ def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
 
     if dry_run:
         log.info("  [DRY RUN] Skipping execution.")
-        return {"name": exp["name"], "status": "dry_run", "ppl": {}}
+        return {"name": exp["name"], "status": "dry_run", "ppl": {}, "lm_eval": {}}
 
     start = time.time()
     try:
@@ -302,6 +308,7 @@ def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
                 "stderr": result.stderr[-1000:],
                 "elapsed_s": elapsed,
                 "ppl": {},
+                "lm_eval": {},
             }
 
         # Parse PPL results from the output directory
@@ -312,44 +319,59 @@ def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
                 break
 
         ppl_results = {}
+        lm_eval_results = {}
         if output_dir:
             results_file = os.path.join(output_dir, "results.txt")
             if os.path.isfile(results_file):
-                ppl_results = _parse_results_file(results_file)
+                ppl_results, lm_eval_results = _parse_results_file(results_file)
 
         log.info(f"  SUCCESS ({elapsed:.0f}s)")
         for ds, ppl in ppl_results.items():
             log.info(f"    {ds} PPL: {ppl:.2f}")
+        for task, acc in lm_eval_results.items():
+            log.info(f"    {task}: {acc:.2f}%")
 
         return {
             "name": exp["name"],
             "status": "success",
             "elapsed_s": elapsed,
             "ppl": ppl_results,
+            "lm_eval": lm_eval_results,
         }
 
     except subprocess.TimeoutExpired:
         log.error("  TIMEOUT (>2h)")
-        return {"name": exp["name"], "status": "timeout", "ppl": {}}
+        return {"name": exp["name"], "status": "timeout", "ppl": {}, "lm_eval": {}}
     except Exception as e:
         log.error(f"  ERROR: {e}")
-        return {"name": exp["name"], "status": "error", "error": str(e), "ppl": {}}
+        return {"name": exp["name"], "status": "error", "error": str(e), "ppl": {}, "lm_eval": {}}
 
 
-def _parse_results_file(path: str) -> dict:
-    """Parse the results.txt file written by pipeline.py."""
+def _parse_results_file(path: str) -> tuple[dict, dict]:
+    """Parse the results.txt file written by pipeline.py.
+
+    Returns (ppl_dict, lm_eval_dict).
+    """
     ppl = {}
+    lm_eval = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line.endswith("_ppl:") or "_ppl:" in line:
+            if line.startswith("lm_eval_"):
+                parts = line.split(":")
+                task = parts[0].replace("lm_eval_", "").strip()
+                try:
+                    lm_eval[task] = float(parts[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif "_ppl:" in line:
                 parts = line.split(":")
                 ds_name = parts[0].replace("_ppl", "").strip()
                 try:
                     ppl[ds_name] = float(parts[1].strip())
                 except (ValueError, IndexError):
                     pass
-    return ppl
+    return ppl, lm_eval
 
 
 # ============================================================================
@@ -359,12 +381,15 @@ def _parse_results_file(path: str) -> dict:
 def print_summary(all_results: list[dict], experiments: list[dict]):
     """Print a final summary table."""
     print("\n")
-    print("=" * 90)
+    print("=" * 100)
     print("  EXPERIMENT SUMMARY")
-    print("=" * 90)
+    print("=" * 100)
 
     # Build lookup from name to experiment config
     exp_map = {e["name"]: e for e in experiments}
+
+    # Check if any results have lm_eval data
+    has_lm_eval = any(res.get("lm_eval") for res in all_results)
 
     # Group by experiment group
     groups = {}
@@ -375,12 +400,21 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
 
     for group_name, items in groups.items():
         print(f"\n  [{group_name.upper()}]")
-        print(f"  {'Experiment':<45} {'Status':<10} {'wikitext2':>10} {'ptb':>10} {'c4':>10} {'Time':>8}")
-        print(f"  {'-'*45} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+        header = f"  {'Experiment':<45} {'Status':<10} {'wikitext2':>10} {'ptb':>10} {'c4':>10}"
+        if has_lm_eval:
+            header += f" {'acc_avg':>10}"
+        header += f" {'Time':>8}"
+        print(header)
+        sep = f"  {'-'*45} {'-'*10} {'-'*10} {'-'*10} {'-'*10}"
+        if has_lm_eval:
+            sep += f" {'-'*10}"
+        sep += f" {'-'*8}"
+        print(sep)
 
         for exp, res in items:
             status = res.get("status", "?")
             ppl = res.get("ppl", {})
+            lm = res.get("lm_eval", {})
             w2 = f"{ppl['wikitext2']:.2f}" if "wikitext2" in ppl else "-"
             pt = f"{ppl['ptb']:.2f}" if "ptb" in ppl else "-"
             c4 = f"{ppl['c4']:.2f}" if "c4" in ppl else "-"
@@ -397,9 +431,14 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
             else:
                 label += " | Had"
 
-            print(f"  {label:<45} {status:<10} {w2:>10} {pt:>10} {c4:>10} {time_str:>8}")
+            row = f"  {label:<45} {status:<10} {w2:>10} {pt:>10} {c4:>10}"
+            if has_lm_eval:
+                avg = f"{lm['acc_avg']:.2f}" if "acc_avg" in lm else "-"
+                row += f" {avg:>10}"
+            row += f" {time_str:>8}"
+            print(row)
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
 
 
 # ============================================================================
@@ -445,6 +484,10 @@ def parse_args():
     parser.add_argument(
         "--hf_token", type=str, default=None,
         help="HuggingFace access token.",
+    )
+    parser.add_argument(
+        "--lm_eval", action="store_true", default=False,
+        help="Also run lm_eval zero-shot benchmarks (MMLU, ARC, etc.).",
     )
 
     return parser.parse_args()
@@ -519,7 +562,7 @@ def main():
 
     for i, exp in enumerate(experiments, 1):
         log.info(f"\n[{i}/{len(experiments)}] Starting: {exp['name']}")
-        cmd = build_command(exp, output_root, extra_args)
+        cmd = build_command(exp, output_root, extra_args, lm_eval=args.lm_eval)
         result = run_experiment(cmd, exp, dry_run=args.dry_run)
         all_results.append(result)
 

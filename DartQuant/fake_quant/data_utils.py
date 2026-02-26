@@ -5,10 +5,12 @@ import json
 
 # Cache directory: read from HF_HOME (set by run_quantize.py), fallback to autodl default
 MODEL_CACHE_DIR = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
-os.environ.setdefault('HF_DATASETS_CACHE', os.path.join(MODEL_CACHE_DIR, 'datasets'))
+DATASETS_CACHE_DIR = os.environ.get(
+    'HF_DATASETS_CACHE', os.path.join(MODEL_CACHE_DIR, 'datasets')
+)
 
 from transformers import AutoTokenizer
-from datasets import load_from_disk, Dataset
+from datasets import load_dataset, load_from_disk, Dataset
 
 # Legacy modelscope model paths (backward compat for old downloads)
 MODEL_NAME_MAPPING = {
@@ -22,65 +24,90 @@ MODEL_NAME_MAPPING = {
     'shakechen/Llama-2-70b-hf': '/root/autodl-tmp/models/shakechen/Llama-2-70b-hf',
 }
 
-# 本地数据集路径
-LOCAL_DATASET_PATHS = {
+# Legacy hardcoded dataset paths (fallback if load_dataset fails)
+_LEGACY_DATASET_PATHS = {
     'wikitext2': '/root/autodl-tmp/datasets/wikitext/wikitext-2-v1/1.0.0/6280e5a53c82b20da4f99f484fa6f0ca9de738ff12f59efb0815fe7d8ae21478',
     'ptb': '/root/autodl-tmp/datasets/xeon09112___ptb_text_only/default-ce1f658bdfd12953/0.0.0/master',
 }
 
+# HF dataset identifiers (matching stat_and_download.py)
+_HF_DATASET_INFO = {
+    'wikitext2': {'repo': 'wikitext', 'config': 'wikitext-2-raw-v1', 'text_key': 'text'},
+    'ptb':       {'repo': 'ptb-text-only', 'config': 'penn_treebank', 'text_key': 'sentence'},
+    'c4':        {'repo': 'allenai/c4', 'config': None, 'text_key': 'text'},
+}
+
+
 def convert_model_name(model_name):
-    """将模型名称转换为本地路径"""
+    """Convert model name to local path if available."""
     if model_name in MODEL_NAME_MAPPING:
         local_path = MODEL_NAME_MAPPING[model_name]
         if os.path.exists(local_path):
-            logging.info(f'使用本地模型: {model_name} -> {local_path}')
+            logging.info(f'Using local model: {model_name} -> {local_path}')
             return local_path
     return model_name
 
-def load_local_dataset(dataset_name, split='train'):
-    """从本地加载数据集"""
-    if dataset_name not in LOCAL_DATASET_PATHS:
-        raise ValueError(f'未知数据集: {dataset_name}')
 
-    base_path = LOCAL_DATASET_PATHS[dataset_name]
+def _load_hf_dataset(dataset_name, split):
+    """Load dataset via HuggingFace datasets library (uses HF_DATASETS_CACHE)."""
+    info = _HF_DATASET_INFO.get(dataset_name)
+    if info is None:
+        raise ValueError(f'Unknown dataset: {dataset_name}')
 
+    kwargs = dict(
+        split=split,
+        cache_dir=DATASETS_CACHE_DIR,
+        trust_remote_code=True,
+    )
+
+    # C4 needs special data_files handling (same as stat_and_download.py)
+    if dataset_name == 'c4':
+        if split == 'validation':
+            kwargs['data_files'] = {
+                'validation': ['en/c4-validation.00000-of-00008.json.gz']
+            }
+        ds = load_dataset(info['repo'], **kwargs)
+    elif info['config']:
+        ds = load_dataset(info['repo'], info['config'], **kwargs)
+    else:
+        ds = load_dataset(info['repo'], **kwargs)
+
+    return ds
+
+
+def _load_legacy_dataset(dataset_name, split):
+    """Fallback: load from legacy hardcoded paths."""
+    if dataset_name not in _LEGACY_DATASET_PATHS:
+        raise ValueError(f'Unknown dataset: {dataset_name}')
+
+    base_path = _LEGACY_DATASET_PATHS[dataset_name]
     if not os.path.exists(base_path):
-        raise FileNotFoundError(f'数据集目录不存在: {base_path}')
+        raise FileNotFoundError(f'Dataset directory not found: {base_path}')
 
-    # 尝试使用 datasets 库加载
     try:
         ds = load_from_disk(base_path)
-        if hasattr(ds, split):
+        if split in ds:
             return ds[split]
-        elif split in ds:
-            return ds[split]
-        else:
-            return ds
+        return ds
     except Exception as e:
-        print(f"load_from_disk 失败: {e}")
+        logging.warning(f"load_from_disk failed: {e}")
 
-    # 列出目录中的所有文件
+    # Try arrow files
     files = os.listdir(base_path)
-    print(f"目录 {base_path} 中的文件: {files}")
-
-    # 使用 Dataset.from_file 直接加载 arrow 文件
     arrow_files = [f for f in files if f.endswith('.arrow') and split in f]
     if arrow_files:
-        file_path = os.path.join(base_path, arrow_files[0])
         try:
-            ds = Dataset.from_file(file_path)
-            return ds
-        except Exception as e:
-            print(f"Dataset.from_file 失败: {e}")
+            return Dataset.from_file(os.path.join(base_path, arrow_files[0]))
+        except Exception:
+            pass
 
-    # 查找匹配 split 的 parquet 文件
+    # Try parquet files
     parquet_files = [f for f in files if f.endswith('.parquet') and split in f]
     if parquet_files:
         import pyarrow.parquet as pq
         all_data = {}
         for pq_file in sorted(parquet_files):
-            file_path = os.path.join(base_path, pq_file)
-            table = pq.read_table(file_path)
+            table = pq.read_table(os.path.join(base_path, pq_file))
             data = table.to_pydict()
             if not all_data:
                 all_data = data
@@ -89,17 +116,39 @@ def load_local_dataset(dataset_name, split='train'):
                     all_data[key].extend(data[key])
         return all_data
 
-    # 查找 json 文件
-    json_files = [f for f in files if f.endswith('.json')]
-    if json_files:
-        data_json = [f for f in json_files if 'dataset_info' not in f and split in f]
-        if not data_json:
-            data_json = [f for f in json_files if 'dataset_info' not in f]
-        if data_json:
-            with open(os.path.join(base_path, data_json[0]), 'r') as f:
-                return json.load(f)
+    # Try json files
+    json_files = [f for f in files if f.endswith('.json') and 'dataset_info' not in f]
+    data_json = [f for f in json_files if split in f] or json_files
+    if data_json:
+        with open(os.path.join(base_path, data_json[0]), 'r') as f:
+            return json.load(f)
 
-    raise FileNotFoundError(f'在 {base_path} 中找不到 {split} 数据集文件')
+    raise FileNotFoundError(f'No {split} data found in {base_path}')
+
+
+def load_local_dataset(dataset_name, split='train'):
+    """Load dataset: try HF cache first, then legacy paths."""
+    # Try HF datasets cache first (datasets downloaded by stat_and_download.py)
+    try:
+        ds = _load_hf_dataset(dataset_name, split)
+        logging.info(f'Loaded {dataset_name}/{split} from HF datasets cache')
+        return ds
+    except Exception as e:
+        logging.info(f'HF cache load failed for {dataset_name}/{split}: {e}')
+
+    # Fallback to legacy hardcoded paths
+    logging.info(f'Trying legacy path for {dataset_name}/{split}...')
+    return _load_legacy_dataset(dataset_name, split)
+
+
+def _get_texts(data, text_key='text'):
+    """Extract text column from various dataset formats."""
+    if hasattr(data, 'column_names'):
+        return data[text_key]
+    elif isinstance(data, dict):
+        return data[text_key]
+    else:
+        return [item[text_key] for item in data]
 
 
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
@@ -111,24 +160,13 @@ def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
     )
 
     if eval_mode:
-        # 使用本地数据集
         data = load_local_dataset('wikitext2', 'test')
-        # 处理不同类型的返回值
-        if hasattr(data, '__getitem__') and hasattr(data, '__len__'):
-            texts = [item['text'] if isinstance(item, dict) else item for item in data['text']] if 'text' in (data.column_names if hasattr(data, 'column_names') else data.keys()) else list(data)
-        else:
-            texts = data['text']
+        texts = _get_texts(data, 'text')
         testenc = tokenizer("\n\n".join(texts), return_tensors='pt')
         return testenc
     else:
         data = load_local_dataset('wikitext2', 'train')
-        # 处理不同类型的返回值
-        if hasattr(data, 'column_names'):
-            texts = data['text']
-        elif isinstance(data, dict):
-            texts = data['text']
-        else:
-            texts = [item['text'] for item in data]
+        texts = _get_texts(data, 'text')
         trainenc = tokenizer("\n\n".join(texts), return_tensors='pt')
         random.seed(seed)
         trainloader = []
@@ -151,10 +189,24 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
     )
 
     if eval_mode:
-        # C4 数据集较大，如果本地没有则报错
-        raise NotImplementedError("C4 数据集未下载，请使用 wikitext2 或 ptb")
+        data = load_local_dataset('c4', 'validation')
+        texts = _get_texts(data, 'text')
+        testenc = tokenizer("\n\n".join(texts), return_tensors='pt')
+        return testenc
     else:
-        raise NotImplementedError("C4 数据集未下载，请使用 wikitext2 或 ptb")
+        data = load_local_dataset('c4', 'validation')
+        texts = _get_texts(data, 'text')
+        trainenc = tokenizer("\n\n".join(texts), return_tensors='pt')
+        random.seed(seed)
+        trainloader = []
+        for _ in range(nsamples):
+            i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+            j = i + seqlen
+            inp = trainenc.input_ids[:, i:j]
+            tar = inp.clone()
+            tar[:, :-1] = -100
+            trainloader.append((inp, tar))
+        return trainloader
 
 
 def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
@@ -166,24 +218,13 @@ def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
     )
 
     if eval_mode:
-        # 使用本地数据集
         data = load_local_dataset('ptb', 'test')
-        if hasattr(data, 'column_names'):
-            sentences = data['sentence']
-        elif isinstance(data, dict):
-            sentences = data['sentence']
-        else:
-            sentences = [item['sentence'] for item in data]
+        sentences = _get_texts(data, 'sentence')
         testenc = tokenizer(" ".join(sentences), return_tensors='pt')
         return testenc
     else:
         data = load_local_dataset('ptb', 'train')
-        if hasattr(data, 'column_names'):
-            sentences = data['sentence']
-        elif isinstance(data, dict):
-            sentences = data['sentence']
-        else:
-            sentences = [item['sentence'] for item in data]
+        sentences = _get_texts(data, 'sentence')
         trainenc = tokenizer(" ".join(sentences), return_tensors='pt')
         random.seed(seed)
         trainloader = []

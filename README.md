@@ -289,6 +289,8 @@ int4_quantization_darkquant/
 |   `-- *.md                              # 其他研究笔记
 |
 |-- scripts/                              # [工具脚本]
+|   |-- run_all_experiments.py            # 一键消融 & 对比实验（自动检测模型/数据集）
+|   |-- stat_and_download.py             # 模型 & 数据集预下载（登录节点用）
 |   |-- plot_loss_butterfly.py            # 损失函数 & Butterfly 可视化实验（R1/R2/R3 分布对比）
 |   |-- validation.py                     # 损失函数对比验证
 |   |-- validation_joint.py              # 联合损失验证
@@ -859,6 +861,51 @@ python scripts/plot_loss_butterfly.py
 - **实验 3**：Butterfly R3 与 Hadamard 对比，含分布图和方差均匀性曲线
 
 输出路径：`/root/autodl-tmp/dartquant_v2_plots/`（可在脚本顶部 `PLOT_DIR` 修改）
+
+---
+
+## 一键消融 & 对比实验
+
+使用 `scripts/run_all_experiments.py` 自动运行所有实验：
+
+**特性**：
+- 自动扫描 `$HF_HOME` 中已缓存的模型（无需手动指定）
+- 自动检测已下载的评估数据集（wikitext2 / ptb / c4）
+- 内置两组实验：
+  - **对比实验**：SWD-Gaussian (nf4) vs SWD-Uniform (int4) vs Whip (int4)
+  - **消融实验**：Butterfly R3/R4 vs Hadamard R3/R4
+- 输出汇总表格 + JSON 结果文件
+
+**基础用法**：
+```bash
+# 运行全部实验（自动检测模型和数据集）
+python scripts/run_all_experiments.py
+
+# 仅运行对比实验
+python scripts/run_all_experiments.py --group comparison
+
+# 仅运行消融实验
+python scripts/run_all_experiments.py --group ablation
+
+# 干跑模式（仅打印命令，不执行）
+python scripts/run_all_experiments.py --dry-run
+
+# 手动指定模型
+python scripts/run_all_experiments.py --models meta-llama/Llama-3.2-1B
+```
+
+**输出示例**：
+```
+  [COMPARISON]
+  Experiment                                    Status     wikitext2        ptb         c4     Time
+  Llama-3.2-1B | whip | int4 | Had             success        8.74       9.12       9.45     120s
+  Llama-3.2-1B | swd_unif | int4 | Had         success        8.51       8.89       9.21     125s
+  Llama-3.2-1B | swd_gauss | nf4 | Had         success        8.63       9.01       9.33     110s
+
+  [ABLATION]
+  Llama-3.2-1B | swd_unif | int4 | Had         success        8.51       8.89       9.21     125s
+  Llama-3.2-1B | swd_unif | int4 | BF          success        8.38       8.75       9.08     155s
+```
 
 ---
 

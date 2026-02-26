@@ -169,6 +169,7 @@ class UnifiedQuantModel:
                  cache_dir: str = None, dtype: str = 'auto'):
         self.model_name = model_name
         self.hf_token = hf_token
+        self.cache_dir = cache_dir
 
         # Load model
         self.model = self._load_model(model_name, hf_token, cache_dir, dtype)
@@ -252,16 +253,22 @@ class UnifiedQuantModel:
     def get_tokenizer(self) -> transformers.PreTrainedTokenizer:
         """Load tokenizer from local cache only. Raises RuntimeError if not found."""
         try:
+            kwargs = {
+                'token': self.hf_token,
+                'use_fast': False,
+                'trust_remote_code': True,
+                'local_files_only': True,
+            }
+            if self.cache_dir:
+                kwargs['cache_dir'] = self.cache_dir
             tokenizer = transformers.AutoTokenizer.from_pretrained(
-                self.model_name,
-                token=self.hf_token,
-                use_fast=False,
-                trust_remote_code=True,
-                local_files_only=True,
+                self.model_name, **kwargs
             )
         except Exception as e:
+            cache_hint = self.cache_dir or "the default HuggingFace cache directory"
             raise RuntimeError(
-                f"Tokenizer for '{self.model_name}' not found in local cache. "
+                f"Tokenizer for '{self.model_name}' not found in local cache "
+                f"({cache_hint}). "
                 f"Please run the download script first. Original error: {e}"
             ) from e
         if tokenizer.pad_token_id is None:

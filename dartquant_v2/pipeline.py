@@ -1120,7 +1120,7 @@ def run_full_pipeline(args):
     # Save rotations
     if args.save_rotations:
         save_data = {
-            'R1': R1,
+            'R1': R1_dict,
             'R2': R2_dict,
             'config': {
                 'model': args.model,

@@ -1,5 +1,6 @@
-# JointQuant Dependencies
+# DartQuant v2 Dependencies
 # Install with: pip install -r requirements.txt
+# NOTE: fast-hadamard-transform 需要从源码安装，见 README.md
 
 # Core Deep Learning
 torch>=2.0.0
@@ -10,6 +11,9 @@ transformers>=4.37.0
 datasets>=2.16.0
 accelerate>=0.26.0
 tokenizers>=0.15.0
+
+# Quantization
+bitsandbytes>=0.39.0
 
 # Scientific Computing
 numpy>=1.24.0

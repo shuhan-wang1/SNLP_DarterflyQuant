@@ -374,14 +374,22 @@ int4_quantization_darkquant/
 ### 1. 安装依赖
 
 ```bash
+# 安装 Python 依赖
 pip install -r requirements.txt
+
+# 安装 fast-hadamard-transform（CUDA 加速的 Hadamard 变换，DartQuant 核心依赖）
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
+cd fast-hadamard-transform
+pip install .
+cd ..
 ```
 
 核心依赖：
 - `torch >= 2.0`
 - `transformers >= 4.30`
 - `bitsandbytes >= 0.39`（NF4 必需）
-- `numpy`, `scipy`
+- `fast-hadamard-transform`（从源码安装，见上方）
+- `numpy`, `scipy`, `datasets`, `accelerate`
 
 ### 2. 基础用法（5 个常见场景）
 
@@ -918,6 +926,12 @@ python dartquant_v2/run_quantize.py \
 ```bash
 # Python >= 3.9
 pip install -r requirements.txt
+
+# 安装 fast-hadamard-transform（需要 CUDA 环境）
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
+cd fast-hadamard-transform
+pip install .
+cd ..
 ```
 
 主要依赖：
@@ -925,9 +939,12 @@ pip install -r requirements.txt
 ```
 torch >= 2.0.0
 transformers >= 4.30.0
+datasets >= 2.16.0
+accelerate >= 0.26.0
 bitsandbytes >= 0.39.0
-numpy >= 1.21.0
-scipy >= 1.7.0
+numpy >= 1.24.0
+scipy >= 1.10.0
+fast-hadamard-transform（从源码安装）
 ```
 
 ---

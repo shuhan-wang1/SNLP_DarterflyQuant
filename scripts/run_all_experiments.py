@@ -117,55 +117,62 @@ def detect_cached_models(cache_dir: str) -> list[str]:
 
 
 def detect_cached_datasets(datasets_cache: str) -> list[str]:
-    """Check which evaluation datasets are available locally.
-
-    For each dataset name (wikitext2, ptb, c4), we try a fast import check
-    via the datasets library fingerprint structure.  Falls back to searching
-    for known directory patterns.
-    """
-    available = []
-
-    # Quick heuristic: look for common directory patterns
-    ds_dir = Path(datasets_cache)
-    if not ds_dir.exists():
-        # Also check the parent hub directory
-        ds_dir = Path(_HF_HOME)
-
+    """Check which PPL evaluation datasets are available locally."""
+    # Marker patterns for each PPL dataset (directory names in the HF cache)
     dataset_markers = {
-        "wikitext2": [
-            "wikitext",
-            "wikitext-2-raw-v1",
-            "wikitext___wikitext-2-raw-v1",
-        ],
-        "ptb": [
-            "ptb-text-only",
-            "ptb_text_only",
-            "xeon09112___ptb_text_only",
-        ],
-        "c4": [
-            "allenai___c4",
-            "c4",
-        ],
+        "wikitext2": ["wikitext", "wikitext-2-raw-v1", "wikitext___wikitext-2-raw-v1"],
+        "ptb":       ["ptb-text-only", "ptb_text_only", "ptb___ptb_text_only",
+                       "ptb-text-only___penn_treebank"],
+        "c4":        ["allenai___c4", "c4", "allenai--c4"],
     }
+    return _scan_cache_for_markers(datasets_cache, dataset_markers)
 
-    for ds_name, markers in dataset_markers.items():
-        for root in [Path(datasets_cache), Path(_HF_HOME), Path(_HF_HOME) / "hub"]:
+
+def detect_cached_benchmarks(datasets_cache: str) -> list[str]:
+    """Check which lm_eval benchmark datasets are available locally."""
+    benchmark_markers = {
+        "hellaswag":     ["Rowan___hellaswag", "hellaswag"],
+        "mmlu":          ["cais___mmlu", "mmlu"],
+        "arc_easy":      ["allenai___ai2_arc", "ai2_arc"],
+        "arc_challenge": ["allenai___ai2_arc", "ai2_arc"],
+        "winogrande":    ["allenai___winogrande", "winogrande"],
+        "gsm8k":         ["openai___gsm8k", "gsm8k"],
+        "piqa":          ["piqa"],
+    }
+    return _scan_cache_for_markers(datasets_cache, benchmark_markers)
+
+
+def _scan_cache_for_markers(datasets_cache: str, markers_map: dict) -> list[str]:
+    """Scan datasets cache directory for known marker directory names."""
+    available = []
+    search_roots = [Path(datasets_cache)]
+    # Also check parent HF_HOME if different
+    if Path(_HF_HOME) != Path(datasets_cache):
+        search_roots.append(Path(_HF_HOME))
+
+    for ds_name, markers in markers_map.items():
+        found = False
+        for root in search_roots:
             if not root.exists():
                 continue
             for marker in markers:
-                # Check direct child directories
                 if (root / marker).is_dir():
-                    available.append(ds_name)
+                    found = True
                     break
-                # Check nested patterns (datasets/wikitext/...)
-                for child in root.iterdir():
-                    if child.is_dir() and marker in child.name:
-                        available.append(ds_name)
-                        break
-                if ds_name in available:
+                # Also check subdirectories
+                try:
+                    for child in root.iterdir():
+                        if child.is_dir() and marker in child.name:
+                            found = True
+                            break
+                except PermissionError:
+                    pass
+                if found:
                     break
-            if ds_name in available:
+            if found:
                 break
+        if found:
+            available.append(ds_name)
 
     return sorted(set(available))
 
@@ -503,7 +510,9 @@ def main():
     print("=" * 70)
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Output root:  {output_root}")
+    print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
+    print(f"  lm_eval:      {args.lm_eval}")
     print(f"  Dry run:      {args.dry_run}")
     print()
 
@@ -524,14 +533,24 @@ def main():
         for m in models:
             log.info(f"  - {m}")
 
-    # ---- Auto-detect datasets ----
+    # ---- Auto-detect PPL datasets ----
     log.info(f"\nScanning for cached datasets in {_DATASETS_CACHE} ...")
     eval_datasets = detect_cached_datasets(_DATASETS_CACHE)
     if not eval_datasets:
-        log.warning("No cached evaluation datasets found, defaulting to wikitext2.")
+        log.warning("No cached PPL evaluation datasets found, defaulting to wikitext2.")
         eval_datasets = ["wikitext2"]
     else:
-        log.info(f"Found cached datasets: {eval_datasets}")
+        log.info(f"Found cached PPL datasets: {eval_datasets}")
+
+    # ---- Auto-detect lm_eval benchmark datasets ----
+    cached_benchmarks = detect_cached_benchmarks(_DATASETS_CACHE)
+    if cached_benchmarks:
+        log.info(f"Found cached lm_eval benchmarks: {cached_benchmarks}")
+        if not args.lm_eval:
+            log.info("  → Auto-enabling --lm_eval (benchmarks available locally)")
+            args.lm_eval = True
+    else:
+        log.info("No lm_eval benchmark datasets found locally.")
 
     # ---- Build experiment list ----
     experiments = []

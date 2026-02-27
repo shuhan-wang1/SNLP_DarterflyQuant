@@ -146,13 +146,18 @@ def _replace_norms(model, umodel: UnifiedQuantModel):
     norm_class_name = umodel.arch.norm_class_name
     hidden_size = umodel.hidden_size
 
-    if norm_class_name == "LlamaRMSNorm":
-        target_class = transformers.models.llama.modeling_llama.LlamaRMSNorm
-    elif norm_class_name == "LayerNorm":
+    if norm_class_name == "LayerNorm":
         target_class = nn.LayerNorm
     else:
-        logging.warning(f"Unknown norm class: {norm_class_name}, skipping replacement")
-        return
+        # Resolve RMSNorm class dynamically by scanning model's modules
+        target_class = None
+        for module in model.modules():
+            if type(module).__name__ == norm_class_name:
+                target_class = type(module)
+                break
+        if target_class is None:
+            logging.warning(f"Unknown norm class: {norm_class_name}, skipping replacement")
+            return
 
     def _replace_recursive(module):
         for name, child in module.named_children():

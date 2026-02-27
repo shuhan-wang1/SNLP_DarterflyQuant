@@ -2,5 +2,6 @@
 
 from dartquant_v2.arch.dense import llama as _llama  # noqa: F401
 from dartquant_v2.arch.dense import opt as _opt      # noqa: F401
+from dartquant_v2.arch.dense import qwen2 as _qwen2  # noqa: F401
 
 __all__ = []

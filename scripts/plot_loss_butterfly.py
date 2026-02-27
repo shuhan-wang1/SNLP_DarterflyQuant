@@ -1008,7 +1008,7 @@ def train_r2_with_history(
     """
     Train per-head R2 rotation for each layer.
 
-    Exactly mirrors dartquant_v2.trainers.train_r2_all_layers:
+    Exactly mirrors dartquant_v2.trainers.train_r2_single_layer:
       - Processes each layer's activations independently
       - R2_Per_Head module with head_dim × head_dim rotation per KV-head group
       - Same optimizer / scheduler defaults
@@ -1026,7 +1026,7 @@ def train_r2_with_history(
     kv_heads = arch_wrapper.kv_heads
     head_dim = arch_wrapper.head_dim
 
-    # ── Organise activations by layer index (mirrors train_r2_all_layers lines 292–299)
+    # ── Organise activations by layer index (mirrors train_r2_single_layer lines 292–299)
     acts_per_layer: dict = {}
     for name, acts in acts_dict.items():
         lid = arch_wrapper.layer_index_from_name(name)
@@ -1040,7 +1040,7 @@ def train_r2_with_history(
         acts   = acts_per_layer[layer_id]
         loader = DataLoader(TensorDataset(acts), batch_size=batch_size, shuffle=True)
 
-        # ── Initialize R2  (mirrors train_r2_all_layers lines 305–308)
+        # ── Initialize R2  (mirrors train_r2_single_layer lines 305–308)
         R2 = R2_Per_Head(hidden, n_heads, kv_heads).to(DEVICE)
         try:
             init_data = _make_random_orthogonal(head_dim, DEVICE).float()
@@ -1076,7 +1076,7 @@ def train_r2_with_history(
                 scheduler.step()
             layer_hist.append(float(np.mean(epoch_losses)))
 
-        # ── Extract rotation (mirrors train_r2_all_layers line 340)
+        # ── Extract rotation (mirrors train_r2_single_layer line 340)
         R2.eval()
         R2_dict[f"model.layers.{layer_id}.self_attn.R2"] = R2.rotate.data.detach().cpu()
         histories[layer_id] = layer_hist
@@ -1822,7 +1822,7 @@ def run_experiment2_r2(model, arch_wrapper: _ArchWrapper,
 
     Collection mirrors pipeline.py Step 6:
       targets = [o_proj] for EVERY layer
-    Training mirrors dartquant_v2.trainers.train_r2_all_layers via
+    Training mirrors dartquant_v2.trainers.train_r2_single_layer via
     train_r2_with_history.
 
     Plots:
@@ -1844,7 +1844,7 @@ def run_experiment2_r2(model, arch_wrapper: _ArchWrapper,
     print(f"  Collected {len(acts_dict)} R2 tensors, total rows: {total_rows}")
     print(f"  Training R2 [{loss_fn_name}] for {arch_wrapper.num_layers} layers ...")
 
-    # ── Train R2 (mirrors train_r2_all_layers) ────────────────────────────────
+    # ── Train R2 (mirrors train_r2_single_layer) ────────────────────────────────
     R2_dict, r2_histories = train_r2_with_history(
         acts_dict, arch_wrapper, loss_fn_name,
         accumulation_steps=2,   # pipeline default

@@ -39,7 +39,7 @@ if _CALIBRATER_PATH not in sys.path:
     sys.path.insert(0, _CALIBRATER_PATH)
 
 from .unified_model import UnifiedQuantModel, _deep_getattr, _deep_setattr
-from .trainers import train_r1, train_r1_all_layers, train_r2_all_layers, train_butterfly
+from .trainers import train_butterfly
 from .nf4_quantizer import apply_nf4_to_model
 
 DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')

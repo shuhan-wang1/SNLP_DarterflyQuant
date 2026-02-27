@@ -54,11 +54,8 @@ log = logging.getLogger(__name__)
 KNOWN_MODELS = [
     "meta-llama/Llama-3.2-1B",
     "meta-llama/Llama-3.2-1B-Instruct",
-    "meta-llama/Llama-3.2-8B",
-    "meta-llama/Llama-3.2-8B-Instruct",
-    "facebook/opt-125m",
-    "facebook/opt-1.3b",
-    "facebook/opt-6.7b",
+    "meta-llama/Llama-3.2-3B",
+    "meta-llama/Llama-3.2-3B-Instruct"
 ]
 
 # Evaluation datasets supported by the pipeline (perplexity)

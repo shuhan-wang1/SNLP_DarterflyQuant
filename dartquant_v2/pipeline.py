@@ -580,8 +580,9 @@ def apply_r2_rotation(model, R2_dict, umodel: UnifiedQuantModel, smooth_scale=No
     num_heads = umodel.num_heads
 
     layers = umodel.get_layers()
+    layers_prefix = umodel.arch.layers_path
     for idx, layer in enumerate(tqdm(layers, desc="Applying R2")):
-        key = f"model.layers.{idx}.self_attn.R2"
+        key = f"{layers_prefix}.{idx}.self_attn.R2"
         if key not in R2_dict:
             continue
 
@@ -1031,24 +1032,32 @@ def run_full_pipeline(args):
     logging.info(f"  Calibration data: {calib_data.shape}")
     logging.info(f"  Step 3 done in {time.time() - _t:.1f}s")
 
-    # ======== Step 4: Train R1 (per-layer) ========
-    R1_dict = {}
+    # ======== Step 4: Train R1 (single global rotation) ========
+    # DartQuant paper (Section 4, Appendix A, Figure 9) defines R1 as a
+    # SINGLE global orthogonal rotation for the entire residual stream.
+    # R1 is absorbed into embeddings, lm_head, and all per-layer weights
+    # to preserve mathematical equivalence.  Using per-layer R1 would
+    # break the residual connections and attention score computation.
+    R1_global = None
     if args.use_r1:
         if args.r1_path:
             logging.info(f"[4/12] Loading R1 from {args.r1_path}...")
             r1_data = torch.load(args.r1_path, map_location='cpu')
-            # Support both new per-layer dict {int: Tensor} and legacy single Tensor
-            if isinstance(r1_data, dict) and all(isinstance(k, int) for k in r1_data):
-                R1_dict = r1_data
-            elif isinstance(r1_data, dict) and 'R1' in r1_data:
-                # Legacy format: broadcast single matrix to all layers
-                R1_single = r1_data['R1']
-                R1_dict = {i: R1_single for i in range(umodel.num_layers)}
-            else:
-                # Legacy format: plain tensor — broadcast to all layers
-                R1_dict = {i: r1_data for i in range(umodel.num_layers)}
+            if isinstance(r1_data, dict) and 'R1' in r1_data:
+                R1_global = r1_data['R1']
+            elif isinstance(r1_data, torch.Tensor):
+                R1_global = r1_data
+            elif isinstance(r1_data, dict):
+                # Legacy per-layer format: use layer 0 as global
+                # (better than nothing, but retraining is recommended)
+                first_key = next(iter(r1_data))
+                R1_global = r1_data[first_key]
+                logging.warning(
+                    "Loaded per-layer R1 dict — using first entry as "
+                    "global R1. Retraining with global R1 is recommended."
+                )
         else:
-            logging.info("[4/12] Collecting activations and training R1 (per-layer)...")
+            logging.info("[4/12] Collecting activations and training R1 (global)...")
             _t4 = time.time()
             model.to(DEV)
 
@@ -1056,21 +1065,16 @@ def run_full_pipeline(args):
             layers_prefix = umodel.arch.layers_path
 
             # Build ALL target names across all layers so we can collect
-            # every layer's activations in a SINGLE forward pass (N_samples
-            # passes instead of N_layers × N_samples — ~22× faster).
-            all_layer_targets = {}   # layer_idx -> [target_name, ...]
+            # every layer's activations in a SINGLE forward pass.
             all_target_names = []
             for layer_idx in range(umodel.num_layers):
-                targets = []
                 if umodel.arch.mlp_up_proj_attr:
-                    targets.append(
+                    all_target_names.append(
                         f"{layers_prefix}.{layer_idx}.{umodel.arch.mlp_up_proj_attr}"
                     )
-                targets.append(
+                all_target_names.append(
                     f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
-                all_layer_targets[layer_idx] = targets
-                all_target_names.extend(targets)
 
             logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
                          f"layers in one pass ({calib_data.shape[0]} samples)...")
@@ -1081,25 +1085,21 @@ def run_full_pipeline(args):
             logging.info(f"  R1 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")
 
-            # Train R1 per-layer (greedy), freeing activations after each
-            for layer_idx in range(umodel.num_layers):
-                layer_act_tensors = [
-                    all_acts[t] for t in all_layer_targets[layer_idx]
-                    if t in all_acts
-                ]
-                if not layer_act_tensors:
-                    logging.warning(
-                        f"  No activations for layer {layer_idx}, skipping R1"
-                    )
-                    continue
+            # Concatenate activations from ALL layers into one tensor
+            # and train a SINGLE global R1 (paper Algorithm 1).
+            all_act_tensors = [
+                a.reshape(-1, umodel.hidden_size)
+                for a in all_acts.values()
+            ]
+            if not all_act_tensors:
+                logging.error("No R1 activations collected!")
+            else:
+                combined = torch.cat(all_act_tensors, dim=0)
+                logging.info(f"  Training single global R1 on "
+                             f"{combined.shape[0]} samples from "
+                             f"{umodel.num_layers} layers...")
 
-                combined = torch.cat(
-                    [a.reshape(-1, umodel.hidden_size)
-                     for a in layer_act_tensors],
-                    dim=0
-                )
-
-                R1_dict[layer_idx] = train_r1_single_layer(
+                R1_global = train_r1_single_layer(
                     acts=combined,
                     hidden_size=umodel.hidden_size,
                     loss_fn_name=args.loss,
@@ -1113,32 +1113,27 @@ def run_full_pipeline(args):
                     accumulation_steps=args.accumulation_steps,
                     train_subset_size=args.train_subset_size,
                     device=DEV,
-                    layer_idx=layer_idx,
+                    layer_idx=0,
                 )
 
-                # Free this layer's activations to limit peak RAM
-                for t in all_layer_targets[layer_idx]:
-                    if t in all_acts:
-                        del all_acts[t]
-                del combined, layer_act_tensors
-                cleanup_memory()
+                del combined, all_act_tensors
 
             del all_acts
-            logging.info(f"  R1 training complete for {len(R1_dict)} layers "
+            logging.info(f"  R1 training complete "
                          f"in {time.time() - _t4:.1f}s")
             model.cpu()
             cleanup_memory()
     else:
         logging.info("[4/12] R1 disabled, skipping...")
 
-    # ======== Step 5: Apply R1 (per-layer) ========
-    if R1_dict:
-        logging.info("[5/12] Applying per-layer R1 rotations to model...")
+    # ======== Step 5: Apply R1 (global) ========
+    if R1_global is not None:
+        logging.info("[5/12] Applying global R1 rotation to model...")
         _t = time.time()
         smooth_scale = None
         if args.smooth:
             smooth_scale = torch.load(args.smooth)
-        apply_r1_rotation_per_layer(model, R1_dict, umodel, smooth_scale)
+        apply_r1_rotation(model, R1_global, umodel, smooth_scale)
         logging.info(f"  Step 5 done in {time.time() - _t:.1f}s")
     else:
         logging.info("[5/12] No R1, skipping rotation...")
@@ -1390,7 +1385,7 @@ def run_full_pipeline(args):
     # Save rotations
     if args.save_rotations:
         save_data = {
-            'R1': R1_dict,
+            'R1': R1_global,
             'R2': R2_dict,
             'config': {
                 'model': args.model,

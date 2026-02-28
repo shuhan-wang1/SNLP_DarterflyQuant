@@ -115,12 +115,17 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
-    # Set up logging
+    # Set up logging — force=True is required because transformers/datasets
+    # call logging.basicConfig() during import, which adds a handler to the
+    # root logger at WARNING level.  Without force=True, our basicConfig()
+    # would be a no-op and all INFO-level messages (including stage markers
+    # like [1/12]) would be silently suppressed.
     log_level = logging.DEBUG if hasattr(args, 'verbose') and args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
+        force=True,
     )
 
     logging.info("=" * 60)

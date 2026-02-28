@@ -882,15 +882,19 @@ def evaluate_model(model, args, umodel: UnifiedQuantModel):
 
     results = {}
     for dataset in args.ppl_eval_dataset:
-        testenc = data_utils.get_loaders(
-            dataset, seed=args.seed, model=args.model,
-            seqlen=model.seqlen,
-            hf_token=args.hf_token,
-            eval_mode=True
-        )
-        ppl = eval_utils.ppl_evaluator(model, testenc, DEV, args)
-        results[dataset] = ppl
-        logging.info(f"  {dataset.upper()} PPL: {ppl:.2f}")
+        try:
+            testenc = data_utils.get_loaders(
+                dataset, seed=args.seed, model=args.model,
+                seqlen=model.seqlen,
+                hf_token=args.hf_token,
+                eval_mode=True
+            )
+            ppl = eval_utils.ppl_evaluator(model, testenc, DEV, args)
+            results[dataset] = ppl
+            logging.info(f"  {dataset.upper()} PPL: {ppl:.2f}")
+        except Exception as e:
+            logging.warning(f"  {dataset.upper()} evaluation failed: {e}")
+            results[dataset] = float('nan')
 
     return results
 

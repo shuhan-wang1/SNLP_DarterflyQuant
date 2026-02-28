@@ -2,6 +2,7 @@ import random
 import os
 import logging
 import json
+import glob as _glob
 
 # Cache directory: read from HF_HOME (set by run_quantize.py), fallback to autodl default
 MODEL_CACHE_DIR = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
@@ -50,7 +51,7 @@ def _load_hf_dataset(dataset_name, split):
     """Load dataset via HuggingFace datasets library (uses HF_DATASETS_CACHE)."""
     info = _HF_DATASET_INFO.get(dataset_name)
     if info is None:
-        raise ValueError(f'Unknown dataset: {dataset_name}')
+        raise ValueError(f'Unknown HF dataset: {dataset_name}')
 
     kwargs = dict(
         split=split,
@@ -64,13 +65,28 @@ def _load_hf_dataset(dataset_name, split):
             kwargs['data_files'] = {
                 'validation': ['en/c4-validation.00000-of-00008.json.gz']
             }
-        ds = load_dataset(info['repo'], **kwargs)
+        loader = lambda **kw: load_dataset(info['repo'], **kw)
     elif info['config']:
-        ds = load_dataset(info['repo'], info['config'], **kwargs)
+        loader = lambda **kw: load_dataset(info['repo'], info['config'], **kw)
     else:
-        ds = load_dataset(info['repo'], **kwargs)
+        loader = lambda **kw: load_dataset(info['repo'], **kw)
 
-    return ds
+    # Try with network first, then force offline mode to use cache only
+    try:
+        return loader(**kwargs)
+    except Exception:
+        pass
+
+    # Retry with HF_DATASETS_OFFLINE to avoid any network calls
+    old_val = os.environ.get('HF_DATASETS_OFFLINE')
+    try:
+        os.environ['HF_DATASETS_OFFLINE'] = '1'
+        return loader(**kwargs)
+    finally:
+        if old_val is None:
+            os.environ.pop('HF_DATASETS_OFFLINE', None)
+        else:
+            os.environ['HF_DATASETS_OFFLINE'] = old_val
 
 
 def _load_legacy_dataset(dataset_name, split):
@@ -124,8 +140,66 @@ def _load_legacy_dataset(dataset_name, split):
     raise FileNotFoundError(f'No {split} data found in {base_path}')
 
 
+def _scan_hf_cache_for_dataset(dataset_name, split):
+    """Last-resort: scan HF datasets cache for arrow files matching the dataset."""
+    info = _HF_DATASET_INFO.get(dataset_name)
+    if info is None:
+        raise ValueError(f'Unknown dataset: {dataset_name}')
+
+    # Build search patterns based on the HF repo name
+    # HF datasets caches under: {cache_dir}/{repo_org}___{repo_name}/{config_hash}/...
+    repo = info['repo'].replace('/', '___')
+    search_dirs = [DATASETS_CACHE_DIR]
+    hf_home = os.environ.get('HF_HOME', '')
+    if hf_home and hf_home != DATASETS_CACHE_DIR:
+        search_dirs.append(hf_home)
+
+    for base in search_dirs:
+        if not os.path.isdir(base):
+            continue
+        # Look for directories matching the repo name
+        for pattern in [f'{repo}*', f'*{dataset_name}*']:
+            for ds_dir in _glob.glob(os.path.join(base, pattern)):
+                if not os.path.isdir(ds_dir):
+                    continue
+                # Try load_from_disk on the directory itself
+                try:
+                    ds = load_from_disk(ds_dir)
+                    if hasattr(ds, 'keys') and split in ds:
+                        logging.info(f'Loaded {dataset_name}/{split} via cache scan: {ds_dir}')
+                        return ds[split]
+                    elif not hasattr(ds, 'keys'):
+                        logging.info(f'Loaded {dataset_name} via cache scan: {ds_dir}')
+                        return ds
+                except Exception:
+                    pass
+                # Walk subdirectories for arrow files
+                for root, dirs, files in os.walk(ds_dir):
+                    arrow_files = [f for f in files if f.endswith('.arrow') and split in f]
+                    if arrow_files:
+                        try:
+                            ds = Dataset.from_file(os.path.join(root, arrow_files[0]))
+                            logging.info(f'Loaded {dataset_name}/{split} from arrow: {root}')
+                            return ds
+                        except Exception:
+                            pass
+                    # Try load_from_disk on subdirectories that look like dataset dirs
+                    if 'dataset_info.json' in files:
+                        try:
+                            ds = load_from_disk(root)
+                            if hasattr(ds, 'keys') and split in ds:
+                                logging.info(f'Loaded {dataset_name}/{split} from subdir: {root}')
+                                return ds[split]
+                        except Exception:
+                            pass
+
+    raise FileNotFoundError(
+        f'Could not find {dataset_name}/{split} in HF cache directories: {search_dirs}'
+    )
+
+
 def load_local_dataset(dataset_name, split='train'):
-    """Load dataset: try HF cache first, then legacy paths."""
+    """Load dataset: try HF cache first, then legacy paths, then cache scan."""
     # Try HF datasets cache first (datasets downloaded by stat_and_download.py)
     try:
         ds = _load_hf_dataset(dataset_name, split)
@@ -135,8 +209,16 @@ def load_local_dataset(dataset_name, split='train'):
         logging.info(f'HF cache load failed for {dataset_name}/{split}: {e}')
 
     # Fallback to legacy hardcoded paths
-    logging.info(f'Trying legacy path for {dataset_name}/{split}...')
-    return _load_legacy_dataset(dataset_name, split)
+    if dataset_name in _LEGACY_DATASET_PATHS:
+        try:
+            logging.info(f'Trying legacy path for {dataset_name}/{split}...')
+            return _load_legacy_dataset(dataset_name, split)
+        except Exception as e:
+            logging.info(f'Legacy load failed for {dataset_name}/{split}: {e}')
+
+    # Last resort: scan the HF cache directory for arrow files
+    logging.info(f'Scanning HF cache for {dataset_name}/{split}...')
+    return _scan_hf_cache_for_dataset(dataset_name, split)
 
 
 def _get_texts(data, text_key='text'):

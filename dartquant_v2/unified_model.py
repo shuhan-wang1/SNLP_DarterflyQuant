@@ -206,8 +206,9 @@ class UnifiedQuantModel:
             }
             if hf_token:
                 kwargs['token'] = hf_token
-            if cache_dir:
-                kwargs['cache_dir'] = cache_dir
+            # Do NOT pass cache_dir — rely on HF_HOME / HF_HUB_CACHE env vars
+            # set by run_quantize.py.  Passing cache_dir overrides HF_HOME and
+            # looks in cache_dir/models--... instead of HF_HOME/hub/models--...
 
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 model_name, **kwargs
@@ -259,8 +260,7 @@ class UnifiedQuantModel:
                 'trust_remote_code': True,
                 'local_files_only': True,
             }
-            if self.cache_dir:
-                kwargs['cache_dir'] = self.cache_dir
+            # Do NOT pass cache_dir — rely on HF_HOME / HF_HUB_CACHE env vars
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 self.model_name, **kwargs
             )

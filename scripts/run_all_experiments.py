@@ -42,6 +42,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 _DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
+_HF_HUB_CACHE = os.environ.get("HF_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
 _DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", "/root/autodl-tmp/datasets")
 
 logging.basicConfig(
@@ -240,6 +241,28 @@ def build_ablation_experiments(
     return experiments
 
 
+def build_baseline_experiments(
+    models: list[str],
+    eval_datasets: list[str],
+) -> list[dict]:
+    """Unquantized FP16 baseline: evaluate the original model without any
+    quantization to establish the PPL/accuracy ceiling for comparison."""
+    experiments = []
+    for model in models:
+        exp = {
+            "name": f"baseline__{_model_short(model)}__fp16",
+            "group": "baseline",
+            "model": model,
+            "loss": "whip",            # placeholder, unused when w/a/kv=16
+            "quantizer_type": "int4",   # pipeline type; bits=16 disables quant
+            "butterfly": False,
+            "eval_datasets": eval_datasets,
+            "baseline": True,           # flag for build_command
+        }
+        experiments.append(exp)
+    return experiments
+
+
 def _model_short(model_name: str) -> str:
     """meta-llama/Llama-3.2-1B → Llama-3.2-1B"""
     return model_name.split("/")[-1]
@@ -266,8 +289,17 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
     if exp["butterfly"]:
         cmd.append("--butterfly")
 
-    # w4a4kv4 defaults
-    cmd.extend(["--w_bits", "4", "--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
+    if exp.get("baseline"):
+        # Unquantized: set all bits to 16 to skip quantization entirely
+        cmd.extend([
+            "--w_bits", "16", "--a_bits", "16", "--k_bits", "16", "--v_bits", "16",
+            "--no_r1",   # skip R1 rotation training (not needed for baseline)
+            "--use_r2", "none",
+            "--no_r3", "--no_r4",
+        ])
+    else:
+        # w4a4kv4 defaults
+        cmd.extend(["--w_bits", "4", "--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
 
     if lm_eval:
         cmd.append("--lm_eval")
@@ -644,7 +676,7 @@ def parse_args():
     )
     parser.add_argument(
         "--group", type=str, default="all",
-        choices=["all", "comparison", "ablation"],
+        choices=["all", "comparison", "ablation", "baseline"],
         help="Which experiment group to run.",
     )
     parser.add_argument(
@@ -740,6 +772,8 @@ def main():
 
     # ---- Build experiment list ----
     experiments = []
+    if args.group in ("all", "baseline"):
+        experiments.extend(build_baseline_experiments(models, eval_datasets))
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(models, eval_datasets))
     if args.group in ("all", "ablation"):

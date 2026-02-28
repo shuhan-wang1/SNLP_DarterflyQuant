@@ -4,8 +4,11 @@ import logging
 import json
 import glob as _glob
 
-# Cache directory: read from HF_HOME (set by run_quantize.py), fallback to autodl default
-MODEL_CACHE_DIR = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
+# Cache directories: HF_HUB_CACHE is the actual hub directory (HF_HOME/hub)
+# where models--org--name/ folders live.  HF_DATASETS_CACHE is for datasets.
+# Both are set by run_quantize.py before any imports.
+_hf_home = os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface')
+MODEL_CACHE_DIR = os.environ.get('HF_HUB_CACHE', os.path.join(_hf_home, 'hub'))
 DATASETS_CACHE_DIR = os.environ.get('HF_DATASETS_CACHE', '/root/autodl-tmp/datasets')
 
 from transformers import AutoTokenizer

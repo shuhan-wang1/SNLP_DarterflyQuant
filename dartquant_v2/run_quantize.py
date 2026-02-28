@@ -44,9 +44,15 @@ import logging
 _DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 
+_HF_HUB_CACHE = os.path.join(_HF_HOME, "hub")
+_HF_DATASETS_CACHE = os.environ.get(
+    "HF_DATASETS_CACHE", "/root/autodl-tmp/datasets"
+)
+
 os.environ.setdefault("HF_HOME",           _HF_HOME)
-os.environ.setdefault("TRANSFORMERS_CACHE", _HF_HOME)
-os.environ.setdefault("HF_DATASETS_CACHE", "/root/autodl-tmp/datasets")
+os.environ.setdefault("HF_HUB_CACHE",      _HF_HUB_CACHE)
+os.environ.setdefault("TRANSFORMERS_CACHE", _HF_HUB_CACHE)
+os.environ.setdefault("HF_DATASETS_CACHE",  _HF_DATASETS_CACHE)
 
 # Block all HuggingFace network calls (transformers + datasets).
 # These env vars are checked by the HF libraries before any network request.

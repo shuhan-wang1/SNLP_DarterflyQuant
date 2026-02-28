@@ -207,11 +207,12 @@ class UnifiedQuantModel:
             }
             if hf_token:
                 kwargs['token'] = hf_token
-            # Pass hub cache dir (HF_HOME/hub) where models--org--name/ folders
-            # actually reside.  The caller may pass cache_dir pointing to HF_HOME
-            # directly, but models are stored one level deeper under hub/.
-            hub_cache = os.environ.get('HF_HUB_CACHE', os.path.join(
-                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'), 'hub'))
+            # Models live at HF_HUB_CACHE/models--org--name/ (set equal to
+            # HF_HOME by run_quantize.py since models are stored directly under
+            # HF_HOME, not under HF_HOME/hub/).
+            hub_cache = os.environ.get(
+                'HF_HUB_CACHE',
+                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'))
             kwargs['cache_dir'] = hub_cache
 
             model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -263,8 +264,9 @@ class UnifiedQuantModel:
                 'trust_remote_code': True,
                 'local_files_only': True,
             }
-            hub_cache = os.environ.get('HF_HUB_CACHE', os.path.join(
-                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'), 'hub'))
+            hub_cache = os.environ.get(
+                'HF_HUB_CACHE',
+                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'))
             kwargs['cache_dir'] = hub_cache
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 self.model_name, **kwargs

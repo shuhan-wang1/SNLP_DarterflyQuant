@@ -44,7 +44,10 @@ import logging
 _DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
 
-_HF_HUB_CACHE = os.path.join(_HF_HOME, "hub")
+# Models are stored directly under HF_HOME (e.g. HF_HOME/models--org--name/),
+# NOT under HF_HOME/hub/.  Set HF_HUB_CACHE = HF_HOME so all HF lookups
+# (transformers cache_dir, data_utils.py, etc.) resolve to the right place.
+_HF_HUB_CACHE = _HF_HOME
 _HF_DATASETS_CACHE = os.environ.get(
     "HF_DATASETS_CACHE", "/root/autodl-tmp/datasets"
 )

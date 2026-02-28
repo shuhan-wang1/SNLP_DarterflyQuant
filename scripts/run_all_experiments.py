@@ -297,6 +297,15 @@ PIPELINE_STAGES = {
 # Regex to detect pipeline stage markers like [1/12], [2/12], etc.
 _STAGE_RE = re.compile(r'\[(\d{1,2})/12\]')
 
+# Regex to strip the logging prefix from subprocess output.
+# Matches both formats:
+#   "2025-01-01 12:00:00 - root - INFO - message"   (run_quantize.py)
+#   "2025-01-01 12:00:00 [INFO] message"             (alternative)
+_LOG_PREFIX_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*'
+    r'(?:- \S+ - \w+ - |\[\w+\]\s*)'
+)
+
 
 def run_experiment(
     cmd: list[str],
@@ -391,10 +400,8 @@ def run_experiment(
                 stage_bar.set_postfix_str(ppl_info[:55])
 
             # ── Display key progress lines to the user ──
-            # Strip logging prefix "2025-01-01 12:00:00 [LEVEL] " for cleaner output
-            _display = line_stripped
-            if '] ' in _display:
-                _display = _display.split('] ', 1)[-1]
+            # Strip logging prefix for cleaner output
+            _display = _LOG_PREFIX_RE.sub('', line_stripped)
 
             _show = False
             if match:
@@ -412,8 +419,16 @@ def run_experiment(
             elif 'PPL:' in line_stripped:
                 # Evaluation results
                 _show = True
-            elif 'ERROR' in line_stripped or 'FAILED' in line_stripped:
-                # Errors
+            elif 'ERROR' in line_stripped or 'Error' in line_stripped:
+                # Errors (Python tracebacks, logging errors)
+                _show = True
+            elif 'FAILED' in line_stripped:
+                _show = True
+            elif 'Traceback' in line_stripped or 'raise ' in line_stripped:
+                # Python traceback start/end
+                _show = True
+            elif 'WARNING' in line_stripped or 'CRITICAL' in line_stripped:
+                # Warnings worth showing
                 _show = True
             elif 'Butterfly' in line_stripped and 'Epoch' in line_stripped:
                 # Butterfly training progress
@@ -431,16 +446,24 @@ def run_experiment(
         # Ensure the bar reaches 12/12 on success
         if current_stage < 12 and proc.returncode == 0:
             stage_bar.update(12 - current_stage)
-            stage_bar.set_postfix_str("done ✓")
+            stage_bar.set_postfix_str("done")
         elif proc.returncode != 0:
-            stage_bar.set_postfix_str("FAILED ✗")
+            stage_bar.set_postfix_str("FAILED")
 
         stage_bar.close()
 
+        # Diagnostic: if no stages were detected, dump output for debugging
+        if current_stage == 0 and output_lines:
+            tqdm.write(f"  [DIAG] No pipeline stages detected in "
+                       f"{len(output_lines)} output lines. "
+                       f"Showing last 15 lines:")
+            for ol in output_lines[-15:]:
+                tqdm.write(f"    {ol}")
+
         if proc.returncode != 0:
-            tqdm.write(f"  ✗ FAILED (exit code {proc.returncode})")
-            tqdm.write(f"  Last 10 lines of output:")
-            for ol in output_lines[-10:]:
+            tqdm.write(f"  FAILED (exit code {proc.returncode})")
+            tqdm.write(f"  Last 15 lines of output:")
+            for ol in output_lines[-15:]:
                 tqdm.write(f"    {ol}")
             return {
                 "name": exp["name"],
@@ -466,7 +489,7 @@ def run_experiment(
             if os.path.isfile(results_file):
                 ppl_results, lm_eval_results = _parse_results_file(results_file)
 
-        tqdm.write(f"  ✓ SUCCESS ({elapsed:.0f}s)")
+        tqdm.write(f"  OK ({elapsed:.0f}s)")
         for ds, ppl in ppl_results.items():
             tqdm.write(f"    {ds} PPL: {ppl:.2f}")
         for task, acc in lm_eval_results.items():

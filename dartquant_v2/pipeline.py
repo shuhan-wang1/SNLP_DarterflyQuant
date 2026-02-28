@@ -959,7 +959,7 @@ def run_full_pipeline(args):
     _pipeline_start = time.time()
 
     # ======== Step 1: Load Model ========
-    logging.info("\n[1/12] Loading model...")
+    logging.info("[1/12] Loading model...")
     _t = time.time()
     umodel = UnifiedQuantModel(
         args.model, args.hf_token, args.cache_dir
@@ -974,13 +974,13 @@ def run_full_pipeline(args):
     logging.info(f"  Step 1 done in {time.time() - _t:.1f}s")
 
     # ======== Step 2: Fuse LayerNorms ========
-    logging.info("\n[2/12] Fusing LayerNorms...")
+    logging.info("[2/12] Fusing LayerNorms...")
     _t = time.time()
     fuse_layer_norms(umodel)
     logging.info(f"  Step 2 done in {time.time() - _t:.1f}s")
 
     # ======== Step 3: Load Calibration Data ========
-    logging.info("\n[3/12] Loading calibration data...")
+    logging.info("[3/12] Loading calibration data...")
     _t = time.time()
     try:
         import data_utils
@@ -1006,7 +1006,7 @@ def run_full_pipeline(args):
     R1_dict = {}
     if args.use_r1:
         if args.r1_path:
-            logging.info(f"\n[4/12] Loading R1 from {args.r1_path}...")
+            logging.info(f"[4/12] Loading R1 from {args.r1_path}...")
             r1_data = torch.load(args.r1_path, map_location='cpu')
             # Support both new per-layer dict {int: Tensor} and legacy single Tensor
             if isinstance(r1_data, dict) and all(isinstance(k, int) for k in r1_data):
@@ -1019,7 +1019,7 @@ def run_full_pipeline(args):
                 # Legacy format: plain tensor — broadcast to all layers
                 R1_dict = {i: r1_data for i in range(umodel.num_layers)}
         else:
-            logging.info("\n[4/12] Collecting activations and training R1 (per-layer)...")
+            logging.info("[4/12] Collecting activations and training R1 (per-layer)...")
             _t4 = time.time()
             model.to(DEV)
 
@@ -1100,11 +1100,11 @@ def run_full_pipeline(args):
             model.cpu()
             cleanup_memory()
     else:
-        logging.info("\n[4/12] R1 disabled, skipping...")
+        logging.info("[4/12] R1 disabled, skipping...")
 
     # ======== Step 5: Apply R1 (per-layer) ========
     if R1_dict:
-        logging.info("\n[5/12] Applying per-layer R1 rotations to model...")
+        logging.info("[5/12] Applying per-layer R1 rotations to model...")
         _t = time.time()
         smooth_scale = None
         if args.smooth:
@@ -1112,16 +1112,16 @@ def run_full_pipeline(args):
         apply_r1_rotation_per_layer(model, R1_dict, umodel, smooth_scale)
         logging.info(f"  Step 5 done in {time.time() - _t:.1f}s")
     else:
-        logging.info("\n[5/12] No R1, skipping rotation...")
+        logging.info("[5/12] No R1, skipping rotation...")
 
     # ======== Step 6: Train R2 ========
     R2_dict = {}
     if args.use_r2 != 'none':
         if args.r2_path:
-            logging.info(f"\n[6/12] Loading R2 from {args.r2_path}...")
+            logging.info(f"[6/12] Loading R2 from {args.r2_path}...")
             R2_dict = torch.load(args.r2_path, map_location='cpu')
         else:
-            logging.info("\n[6/12] Collecting activations and training R2...")
+            logging.info("[6/12] Collecting activations and training R2...")
             _t6 = time.time()
             model.to(DEV)
 
@@ -1188,23 +1188,23 @@ def run_full_pipeline(args):
             model.cpu()
             cleanup_memory()
     else:
-        logging.info("\n[6/12] R2 disabled, skipping...")
+        logging.info("[6/12] R2 disabled, skipping...")
 
     # ======== Step 7: Apply R2 ========
     if R2_dict:
-        logging.info("\n[7/12] Applying R2 to model...")
+        logging.info("[7/12] Applying R2 to model...")
         _t = time.time()
         apply_r2_rotation(model, R2_dict, umodel)
         logging.info(f"  Step 7 done in {time.time() - _t:.1f}s")
     else:
-        logging.info("\n[7/12] No R2, skipping...")
+        logging.info("[7/12] No R2, skipping...")
 
     # ======== Step 8: Handle R3/R4 ========
     butterfly_r3 = None
     butterfly_r4 = None
 
     if args.butterfly:
-        logging.info("\n[8/12] Training Butterfly R3/R4...")
+        logging.info("[8/12] Training Butterfly R3/R4...")
         _t8 = time.time()
         model.to(DEV)
 
@@ -1278,7 +1278,7 @@ def run_full_pipeline(args):
             apply_r4_butterfly(model, butterfly_r4, umodel)
         logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
     else:
-        logging.info("\n[8/12] Using Hadamard for R3/R4...")
+        logging.info("[8/12] Using Hadamard for R3/R4...")
         _t8 = time.time()
         # Apply R4 Hadamard offline (bake into down_proj weights)
         if args.use_r4:
@@ -1286,7 +1286,7 @@ def run_full_pipeline(args):
         logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
 
     # ======== Step 9: Setup Quantization Wrappers ========
-    logging.info("\n[9/12] Setting up quantization wrappers...")
+    logging.info("[9/12] Setting up quantization wrappers...")
     _t = time.time()
     if args.quantizer_type == 'int4':
         setup_quantization_wrappers(model, args, umodel)
@@ -1302,7 +1302,7 @@ def run_full_pipeline(args):
     logging.info(f"  Step 9 done in {time.time() - _t:.1f}s")
 
     # ======== Step 10: Weight Quantization ========
-    logging.info(f"\n[10/12] Running {args.quantizer_type.upper()} weight quantization...")
+    logging.info(f"[10/12] Running {args.quantizer_type.upper()} weight quantization...")
     _t = time.time()
     if args.quantizer_type == 'int4':
         model.to(DEV)
@@ -1310,7 +1310,7 @@ def run_full_pipeline(args):
     logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========
-    logging.info("\n[11/12] Moving model to device...")
+    logging.info("[11/12] Moving model to device...")
     _t = time.time()
     if args.distribute:
         try:
@@ -1328,15 +1328,15 @@ def run_full_pipeline(args):
     _t = time.time()
 
     if args.ppl_eval:
-        logging.info("\n[12/12] Evaluating perplexity...")
+        logging.info("[12/12] Evaluating perplexity...")
         ppl_results = evaluate_model(model, args, umodel)
 
     if args.lm_eval:
-        logging.info("\n[12/12] Running lm_eval zero-shot benchmarks...")
+        logging.info("[12/12] Running lm_eval zero-shot benchmarks...")
         lm_eval_results = evaluate_model_lm_eval(model, args, umodel)
 
     if not args.ppl_eval and not args.lm_eval:
-        logging.info("\n[12/12] Evaluation disabled.")
+        logging.info("[12/12] Evaluation disabled.")
 
     logging.info(f"  Step 12 done in {time.time() - _t:.1f}s")
     logging.info(f"  Total pipeline time: {time.time() - _pipeline_start:.1f}s")

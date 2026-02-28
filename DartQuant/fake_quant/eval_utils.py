@@ -69,6 +69,9 @@ def evaluator(model, testenc, dev, args):
             cache['attention_mask'] = kwargs['attention_mask']
             if llama_type:
                 cache['position_ids'] = kwargs['position_ids']
+            # transformers >= 4.44: RoPE computed at model level, passed as kwarg
+            if 'position_embeddings' in kwargs:
+                cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
     layers[0] = Catcher(layers[0])
 
@@ -95,6 +98,8 @@ def evaluator(model, testenc, dev, args):
     torch.cuda.empty_cache()
     outs = [0] * nbatches
     attention_mask = cache['attention_mask']
+    # transformers >= 4.44: position_embeddings required by LlamaAttention
+    position_embeddings = cache.get('position_embeddings', None)
 
     for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
         layer = layers[i].to(dev)
@@ -112,9 +117,13 @@ def evaluator(model, testenc, dev, args):
             if opt_type:
                 outs[j] = layer(inps[j], attention_mask=attention_mask[0].repeat(bsz, 1, 1, 1))[0]
             elif llama_type:
-                outs[j] = layer(
-                    inps[j], attention_mask=attention_mask[0].repeat(
-                        bsz, 1, 1, 1), position_ids=position_ids)[0]
+                layer_kwargs = dict(
+                    attention_mask=attention_mask[0].repeat(bsz, 1, 1, 1),
+                    position_ids=position_ids,
+                )
+                if position_embeddings is not None:
+                    layer_kwargs['position_embeddings'] = position_embeddings
+                outs[j] = layer(inps[j], **layer_kwargs)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

@@ -226,7 +226,10 @@ def create_parser() -> argparse.ArgumentParser:
     kv_group = parser.add_argument_group('KV-Cache Quantization')
     kv_group.add_argument('--k_bits', type=int, default=4,
                           help='K-cache quantization bits')
-    kv_group.add_argument('--k_groupsize', type=int, default=128)
+    kv_group.add_argument('--k_groupsize', type=int, default=-1,
+                          help='K-cache group size (-1 per-token; official uses '
+                               'head_dim which is model-dependent, e.g. 128 for '
+                               'Llama-2-7B but 64 for Llama-3.2-1B)')
     kv_group.add_argument('--k_asym', action='store_true', default=True)
     kv_group.add_argument('--no_k_asym', action='store_false', dest='k_asym')
     kv_group.add_argument('--k_clip_ratio', type=float, default=1.0)

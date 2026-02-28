@@ -197,6 +197,32 @@ class _RMSN(nn.Module):
         return x.to(input_dtype)
 
 
+def _untie_word_embeddings(umodel: UnifiedQuantModel):
+    """Break weight tying between embedding and lm_head if present.
+
+    Models like Llama-3.2-1B have tie_word_embeddings=True, meaning
+    embed_tokens.weight and lm_head.weight are the SAME tensor.  Both
+    fuse_layer_norms and apply_r1_rotation modify these weights sequentially,
+    which causes double-application when they share the same tensor.
+
+    This must be called BEFORE any weight modifications.
+    """
+    embeddings = umodel.get_embeddings()
+    lm_head = umodel.get_lm_head()
+
+    for emb in embeddings:
+        if emb.weight.data_ptr() == lm_head.weight.data_ptr():
+            logging.info(
+                "Weight tying detected (embed_tokens and lm_head share the "
+                "same tensor). Creating independent copy for lm_head."
+            )
+            lm_head.weight = nn.Parameter(lm_head.weight.clone())
+            # Disable the config flag so the model doesn't re-tie them
+            if hasattr(umodel.model.config, 'tie_word_embeddings'):
+                umodel.model.config.tie_word_embeddings = False
+            return  # Only one head, so we're done
+
+
 def fuse_layer_norms(umodel: UnifiedQuantModel):
     """Fuse LayerNorm weights into adjacent linear layers.
 
@@ -304,8 +330,11 @@ def collect_activations(model, calibration_data, target_names, device):
             inp = calibration_data[i:i+1].to(device)
             try:
                 model(inp)
-            except Exception:
-                pass  # Some models may error on certain inputs
+            except Exception as e:
+                if i == 0:
+                    logging.warning(
+                        f"Forward pass failed on calibration sample {i}: {e}"
+                    )
 
     for h in hooks:
         h.remove()
@@ -1006,6 +1035,7 @@ def run_full_pipeline(args):
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")
     _t = time.time()
+    _untie_word_embeddings(umodel)
     fuse_layer_norms(umodel)
     logging.info(f"  Step 2 done in {time.time() - _t:.1f}s")
 

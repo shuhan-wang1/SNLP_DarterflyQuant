@@ -7,6 +7,7 @@ regardless of the underlying architecture (Llama, OPT, etc.).
 New model architectures can be registered via register_arch().
 """
 
+import os
 import operator
 import logging
 from dataclasses import dataclass, field
@@ -206,18 +207,20 @@ class UnifiedQuantModel:
             }
             if hf_token:
                 kwargs['token'] = hf_token
-            # Do NOT pass cache_dir — rely on HF_HOME / HF_HUB_CACHE env vars
-            # set by run_quantize.py.  Passing cache_dir overrides HF_HOME and
-            # looks in cache_dir/models--... instead of HF_HOME/hub/models--...
+            # Pass hub cache dir (HF_HOME/hub) where models--org--name/ folders
+            # actually reside.  The caller may pass cache_dir pointing to HF_HOME
+            # directly, but models are stored one level deeper under hub/.
+            hub_cache = os.environ.get('HF_HUB_CACHE', os.path.join(
+                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'), 'hub'))
+            kwargs['cache_dir'] = hub_cache
 
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 model_name, **kwargs
             )
             logging.info(f"Loaded model from local cache: {model_name}")
         except Exception as e:
-            cache_hint = cache_dir or "the default HuggingFace cache directory"
             raise RuntimeError(
-                f"Model '{model_name}' not found in local cache ({cache_hint}). "
+                f"Model '{model_name}' not found in local cache ({hub_cache}). "
                 f"Please run the download script first. Original error: {e}"
             ) from e
         finally:
@@ -260,15 +263,16 @@ class UnifiedQuantModel:
                 'trust_remote_code': True,
                 'local_files_only': True,
             }
-            # Do NOT pass cache_dir — rely on HF_HOME / HF_HUB_CACHE env vars
+            hub_cache = os.environ.get('HF_HUB_CACHE', os.path.join(
+                os.environ.get('HF_HOME', '/root/autodl-tmp/huggingface'), 'hub'))
+            kwargs['cache_dir'] = hub_cache
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 self.model_name, **kwargs
             )
         except Exception as e:
-            cache_hint = self.cache_dir or "the default HuggingFace cache directory"
             raise RuntimeError(
                 f"Tokenizer for '{self.model_name}' not found in local cache "
-                f"({cache_hint}). "
+                f"({hub_cache}). "
                 f"Please run the download script first. Original error: {e}"
             ) from e
         if tokenizer.pad_token_id is None:

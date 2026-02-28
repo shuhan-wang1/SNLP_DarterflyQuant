@@ -827,7 +827,7 @@ def configure_activation_quantization(model, args, umodel: UnifiedQuantModel):
         if 'lm_head' in name:
             layer_input_bits = 16
 
-        if getattr(args, 'o_per_head', False) and 'o_proj' in name:
+        if args.o_per_head and 'o_proj' in name:
             layer_groupsize = umodel.hidden_size // umodel.num_heads
 
         if 'down_proj' in name or 'fc2' in name:
@@ -1027,8 +1027,6 @@ def _ensure_dartquant_compat_args(args):
         'eval_dataset': 'wikitext2',
         # DartQuant calibrater: alternative arg names
         'a_bits_down_proj': None,
-        # Per-head quantization for o_proj (official DartQuant default: False)
-        'o_per_head': False,
     }
     for key, default in _DEFAULTS.items():
         if not hasattr(args, key):

@@ -42,7 +42,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 _DEFAULT_HF_HOME = "/root/autodl-tmp/huggingface"
 _HF_HOME = os.environ.get("HF_HOME", _DEFAULT_HF_HOME)
-_HF_HUB_CACHE = os.environ.get("HF_HUB_CACHE", os.path.join(_HF_HOME, "hub"))
+_HF_HUB_CACHE = os.environ.get("HF_HUB_CACHE", _HF_HOME)
 _DATASETS_CACHE = os.environ.get("HF_DATASETS_CACHE", "/root/autodl-tmp/datasets")
 
 logging.basicConfig(

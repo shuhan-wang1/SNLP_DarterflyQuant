@@ -1034,7 +1034,21 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     task_names = args.lm_eval_tasks
     logging.info(f"  lm_eval tasks: {task_names}")
 
-    raw_results = lm_eval.simple_evaluate(hflm, tasks=task_names)['results']
+    # Temporarily lift offline flags so the datasets library can resolve
+    # dataset identifiers from its local cache.  With HF_DATASETS_OFFLINE=1
+    # the library refuses to even look up cached data because the name-
+    # resolution step is blocked before the cache check.  If data is already
+    # cached (downloaded by scripts/stat_and_download.py) nothing will be
+    # downloaded; the library just needs the flag unset to proceed.
+    _saved_env = {}
+    for key in ("HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        _saved_env[key] = os.environ.pop(key, None)
+    try:
+        raw_results = lm_eval.simple_evaluate(hflm, tasks=task_names)['results']
+    finally:
+        for key, val in _saved_env.items():
+            if val is not None:
+                os.environ[key] = val
 
     # Extract accuracy (prefer acc_norm over acc)
     metrics = {}

@@ -27,12 +27,15 @@ Usage:
 import os
 import sys
 import json
+import re
 import argparse
 import subprocess
 import time
 import logging
 from pathlib import Path
 from datetime import datetime
+
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Cache directory resolution (same logic as run_quantize.py)
@@ -275,39 +278,175 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
     return cmd
 
 
-def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
-    """Execute a single experiment and return the result summary."""
-    log.info("-" * 70)
-    log.info(f"Experiment:  {exp['name']}")
-    log.info(f"  Model:     {exp['model']}")
-    log.info(f"  Loss:      {exp['loss']}")
-    log.info(f"  Quantizer: {exp['quantizer_type']}")
-    log.info(f"  Butterfly: {exp['butterfly']}")
-    log.info(f"  Command:   {' '.join(cmd)}")
-    log.info("-" * 70)
+# Pipeline stage labels corresponding to [X/12] markers in pipeline.py
+PIPELINE_STAGES = {
+    1:  "Load model",
+    2:  "Fuse LayerNorms",
+    3:  "Load calibration data",
+    4:  "Train R1 (per-layer)",
+    5:  "Apply R1 rotation",
+    6:  "Train R2 (per-layer)",
+    7:  "Apply R2 rotation",
+    8:  "Handle R3/R4",
+    9:  "Setup quant wrappers",
+    10: "Weight quantization",
+    11: "Move to device",
+    12: "Evaluate",
+}
+
+# Regex to detect pipeline stage markers like [1/12], [2/12], etc.
+_STAGE_RE = re.compile(r'\[(\d{1,2})/12\]')
+
+
+def run_experiment(
+    cmd: list[str],
+    exp: dict,
+    dry_run: bool = False,
+    exp_idx: int = 0,
+    total_exps: int = 1,
+) -> dict:
+    """Execute a single experiment with real-time progress tracking.
+
+    Streams subprocess output line-by-line, detecting pipeline stage
+    markers ([X/12]) to update a tqdm progress bar showing the current
+    quantization stage.
+    """
+    model_short = _model_short(exp['model'])
+    exp_label = (
+        f"{model_short} | {exp['loss']} | {exp['quantizer_type']}"
+        f"{' | BF' if exp['butterfly'] else ' | Had'}"
+    )
+
+    tqdm.write("")
+    tqdm.write("─" * 70)
+    tqdm.write(f"  Experiment [{exp_idx}/{total_exps}]: {exp['name']}")
+    tqdm.write(f"  Config:     {exp_label}")
+    tqdm.write(f"  Command:    {' '.join(cmd)}")
+    tqdm.write("─" * 70)
 
     if dry_run:
-        log.info("  [DRY RUN] Skipping execution.")
+        tqdm.write("  [DRY RUN] Skipping execution.")
         return {"name": exp["name"], "status": "dry_run", "ppl": {}, "lm_eval": {}}
 
     start = time.time()
+    output_lines = []  # Capture all output for error reporting
+
+    # Inner progress bar for pipeline stages (12 total)
+    stage_bar = tqdm(
+        total=12,
+        desc=f"  ↳ Pipeline",
+        bar_format=(
+            "  {l_bar}{bar}| stage {n_fmt}/{total_fmt} "
+            "[{elapsed}<{remaining}] {postfix}"
+        ),
+        leave=True,
+        position=1,
+        ncols=90,
+    )
+    stage_bar.set_postfix_str("starting...")
+    current_stage = 0
+
     try:
-        result = subprocess.run(
+        # Merge stdout + stderr into a single stream so we can parse
+        # logging output (which goes to stderr) for stage markers.
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=7200,  # 2 hour timeout per experiment
+            bufsize=1,  # line-buffered
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
+
+        # Read merged output line-by-line for real-time stage tracking
+        for line in iter(proc.stdout.readline, ''):
+            line_stripped = line.rstrip()
+            output_lines.append(line_stripped)
+
+            # Detect pipeline stage markers like [1/12], [10/12], etc.
+            match = _STAGE_RE.search(line_stripped)
+            if match:
+                new_stage = int(match.group(1))
+                if new_stage > current_stage:
+                    # Advance the bar to the new stage
+                    stage_bar.update(new_stage - current_stage)
+                    current_stage = new_stage
+                    stage_desc = PIPELINE_STAGES.get(new_stage, "")
+                    stage_bar.set_postfix_str(stage_desc)
+
+            # Detect per-layer R1/R2 training progress
+            # e.g. "Layer 3/22 R1 epoch 5/10 loss=0.123"
+            elif 'Layer' in line_stripped and ('R1' in line_stripped or 'R2' in line_stripped):
+                layer_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
+                stage_bar.set_postfix_str(layer_info[:55])
+
+            # Detect Butterfly training progress
+            elif 'Butterfly' in line_stripped or 'butterfly' in line_stripped:
+                bf_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
+                stage_bar.set_postfix_str(bf_info[:55])
+
+            # Detect PPL evaluation results
+            elif 'PPL' in line_stripped.upper() and ':' in line_stripped:
+                ppl_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
+                stage_bar.set_postfix_str(ppl_info[:55])
+
+            # ── Display key progress lines to the user ──
+            # Strip logging prefix "2025-01-01 12:00:00 [LEVEL] " for cleaner output
+            _display = line_stripped
+            if '] ' in _display:
+                _display = _display.split('] ', 1)[-1]
+
+            _show = False
+            if match:
+                # Stage transition
+                _show = True
+            elif 'done in' in line_stripped or 'Total pipeline' in line_stripped:
+                # Timing info
+                _show = True
+            elif 'Training R1 layer' in line_stripped or 'Training R2 layer' in line_stripped:
+                # Layer-level training start
+                _show = True
+            elif 'training complete' in line_stripped.lower():
+                # Training completion
+                _show = True
+            elif 'PPL:' in line_stripped:
+                # Evaluation results
+                _show = True
+            elif 'ERROR' in line_stripped or 'FAILED' in line_stripped:
+                # Errors
+                _show = True
+            elif 'Butterfly' in line_stripped and 'Epoch' in line_stripped:
+                # Butterfly training progress
+                _show = True
+            elif 'activation collection' in line_stripped.lower():
+                # Activation collection progress
+                _show = True
+
+            if _show:
+                tqdm.write(f"    {_display}")
+
+        proc.wait(timeout=7200)
         elapsed = time.time() - start
 
-        if result.returncode != 0:
-            log.error(f"  FAILED (exit code {result.returncode})")
-            log.error(f"  stderr: {result.stderr[-500:]}")
+        # Ensure the bar reaches 12/12 on success
+        if current_stage < 12 and proc.returncode == 0:
+            stage_bar.update(12 - current_stage)
+            stage_bar.set_postfix_str("done ✓")
+        elif proc.returncode != 0:
+            stage_bar.set_postfix_str("FAILED ✗")
+
+        stage_bar.close()
+
+        if proc.returncode != 0:
+            tqdm.write(f"  ✗ FAILED (exit code {proc.returncode})")
+            tqdm.write(f"  Last 10 lines of output:")
+            for ol in output_lines[-10:]:
+                tqdm.write(f"    {ol}")
             return {
                 "name": exp["name"],
                 "status": "failed",
-                "returncode": result.returncode,
-                "stderr": result.stderr[-1000:],
+                "returncode": proc.returncode,
+                "stderr": '\n'.join(output_lines[-20:]),
                 "elapsed_s": elapsed,
                 "ppl": {},
                 "lm_eval": {},
@@ -327,11 +466,11 @@ def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
             if os.path.isfile(results_file):
                 ppl_results, lm_eval_results = _parse_results_file(results_file)
 
-        log.info(f"  SUCCESS ({elapsed:.0f}s)")
+        tqdm.write(f"  ✓ SUCCESS ({elapsed:.0f}s)")
         for ds, ppl in ppl_results.items():
-            log.info(f"    {ds} PPL: {ppl:.2f}")
+            tqdm.write(f"    {ds} PPL: {ppl:.2f}")
         for task, acc in lm_eval_results.items():
-            log.info(f"    {task}: {acc:.2f}%")
+            tqdm.write(f"    {task}: {acc:.2f}%")
 
         return {
             "name": exp["name"],
@@ -342,11 +481,29 @@ def run_experiment(cmd: list[str], exp: dict, dry_run: bool = False) -> dict:
         }
 
     except subprocess.TimeoutExpired:
-        log.error("  TIMEOUT (>2h)")
-        return {"name": exp["name"], "status": "timeout", "ppl": {}, "lm_eval": {}}
+        proc.kill()
+        proc.wait()
+        elapsed = time.time() - start
+        stage_bar.set_postfix_str("TIMEOUT ✗")
+        stage_bar.close()
+        tqdm.write("  ✗ TIMEOUT (>2h)")
+        return {
+            "name": exp["name"], "status": "timeout",
+            "elapsed_s": elapsed, "ppl": {}, "lm_eval": {},
+        }
     except Exception as e:
-        log.error(f"  ERROR: {e}")
-        return {"name": exp["name"], "status": "error", "error": str(e), "ppl": {}, "lm_eval": {}}
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+        stage_bar.set_postfix_str("ERROR ✗")
+        stage_bar.close()
+        tqdm.write(f"  ✗ ERROR: {e}")
+        return {
+            "name": exp["name"], "status": "error",
+            "error": str(e), "ppl": {}, "lm_eval": {},
+        }
 
 
 def _parse_results_file(path: str) -> tuple[dict, dict]:
@@ -570,15 +727,46 @@ def main():
     if args.hf_token:
         extra_args.extend(["--hf_token", args.hf_token])
 
-    # ---- Run experiments sequentially ----
+    # ---- Run experiments sequentially with progress tracking ----
     Path(output_root).mkdir(parents=True, exist_ok=True)
     all_results = []
+    total_exps = len(experiments)
 
-    for i, exp in enumerate(experiments, 1):
-        log.info(f"\n[{i}/{len(experiments)}] Starting: {exp['name']}")
+    # Outer progress bar: overall experiment progress
+    exp_bar = tqdm(
+        experiments,
+        desc="Overall progress",
+        unit="exp",
+        bar_format=(
+            "\n{l_bar}{bar}| {n_fmt}/{total_fmt} experiments "
+            "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+        ),
+        position=0,
+        leave=True,
+        ncols=90,
+    )
+
+    for i, exp in enumerate(exp_bar, 1):
+        exp_bar.set_postfix_str(
+            f"{_model_short(exp['model'])} | {exp['loss']} | {exp['quantizer_type']}"
+        )
         cmd = build_command(exp, output_root, extra_args, lm_eval=args.lm_eval)
-        result = run_experiment(cmd, exp, dry_run=args.dry_run)
+        result = run_experiment(
+            cmd, exp,
+            dry_run=args.dry_run,
+            exp_idx=i,
+            total_exps=total_exps,
+        )
         all_results.append(result)
+
+        # Show running tally in the outer bar
+        successes = sum(1 for r in all_results if r["status"] == "success")
+        failures = sum(1 for r in all_results if r["status"] == "failed")
+        exp_bar.set_postfix_str(
+            f"done={successes}✓ fail={failures}✗"
+        )
+
+    exp_bar.close()
 
     # ---- Summary ----
     print_summary(all_results, experiments)

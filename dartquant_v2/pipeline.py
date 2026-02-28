@@ -20,6 +20,7 @@ import os
 import sys
 import gc
 import math
+import time
 import logging
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,100 @@ DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu
 # Disable TF32 for numerical precision
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+
+
+# ---------------------------------------------------------------------------
+# Hadamard CUDA kernel compatibility check & monkey-patch
+# ---------------------------------------------------------------------------
+def _check_and_patch_hadamard():
+    """Test the fast_hadamard_transform CUDA kernel; monkey-patch if it fails.
+
+    The `fast_hadamard_transform` package ships pre-compiled CUDA kernels that
+    may not match the GPU's compute capability.  If the kernel is unusable we
+    replace `hadamard_utils.matmul_hadU_cuda` (used in both `apply_exact_had_to_linear`
+    and the runtime `ActQuantWrapper.forward`) with a pure-PyTorch fallback
+    so the entire pipeline can still run — just a bit slower.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        import fast_hadamard_transform  # noqa: F401
+        # Quick smoke test on the current GPU
+        _test = torch.randn(1, 64, device='cuda', dtype=torch.float32)
+        fast_hadamard_transform.hadamard_transform(_test, 1.0 / 8.0)
+        logging.info("fast_hadamard_transform CUDA kernel OK.")
+        return  # kernel works fine
+    except ImportError:
+        logging.info("fast_hadamard_transform not installed – will use PyTorch fallback.")
+    except RuntimeError as e:
+        logging.warning(
+            f"fast_hadamard_transform CUDA kernel unusable ({e}). "
+            "Monkey-patching with pure-PyTorch fallback."
+        )
+
+    # ---- Build the fallback & patch ----
+    try:
+        import hadamard_utils as _had_mod
+    except ImportError:
+        return  # DartQuant path not available, nothing to patch
+
+    _original_matmul_hadU = _had_mod.matmul_hadU  # pure-PyTorch version
+
+    def _matmul_hadU_cuda_fallback(X, hadK, K):
+        """Drop-in replacement for matmul_hadU_cuda using PyTorch ops."""
+        n = X.shape[-1]
+        inp = X.clone().view(-1, n, 1)
+        out = inp.clone()
+        while inp.shape[1] > K:
+            inp = inp.view(inp.shape[0], inp.shape[1] // 2, 2, inp.shape[2])
+            out = out.view(inp.shape)
+            out[:, :, 0, :] = inp[:, :, 0, :] + inp[:, :, 1, :]
+            out[:, :, 1, :] = inp[:, :, 0, :] - inp[:, :, 1, :]
+            out = out.view(inp.shape[0], inp.shape[1], -1)
+            inp, out = out, inp
+        del out
+        if K > 1:
+            inp = hadK.view(1, K, K).to(inp) @ inp
+        return inp.view(X.shape) / torch.tensor(n).sqrt()
+
+    # Monkey-patch the module-level CUDA function so all callers
+    # (apply_exact_had_to_linear, ActQuantWrapper.forward, etc.) use the fallback.
+    _had_mod.matmul_hadU_cuda = _matmul_hadU_cuda_fallback
+    logging.info("Patched hadamard_utils.matmul_hadU_cuda → PyTorch fallback.")
+
+    # Also patch fast_hadamard_transform.hadamard_transform for direct callers
+    # (e.g. quant_utils.py line 270 calls it directly)
+    try:
+        import fast_hadamard_transform as _fht_mod
+
+        def _hadamard_transform_fallback(x, scale=1.0):
+            """Pure-PyTorch replacement for fast_hadamard_transform.hadamard_transform."""
+            shape = x.shape
+            n = shape[-1]
+            x = x.contiguous().view(-1, n)
+            inp = x.unsqueeze(-1)
+            out = inp.clone()
+            k = 1
+            while k < n:
+                inp = inp.view(inp.shape[0], n // (2 * k), 2, k)
+                out = out.view(inp.shape)
+                out[:, :, 0, :] = inp[:, :, 0, :] + inp[:, :, 1, :]
+                out[:, :, 1, :] = inp[:, :, 0, :] - inp[:, :, 1, :]
+                out = out.view(inp.shape[0], -1, k)
+                inp, out = out, inp
+                k *= 2
+            del out
+            return (inp.view(shape) * scale)
+
+        _fht_mod.hadamard_transform = _hadamard_transform_fallback
+        logging.info("Patched fast_hadamard_transform.hadamard_transform → PyTorch fallback.")
+    except ImportError:
+        pass
+
+
+# Run the check at import time so the patch is in place before any pipeline code
+_check_and_patch_hadamard()
 
 
 def cleanup_memory():
@@ -204,7 +299,8 @@ def collect_activations(model, calibration_data, target_names, device):
 
     model.eval()
     with torch.no_grad():
-        for i in range(calibration_data.shape[0]):
+        for i in tqdm(range(calibration_data.shape[0]),
+                      desc="  Calibration forward passes", leave=False):
             inp = calibration_data[i:i+1].to(device)
             try:
                 model(inp)
@@ -543,6 +639,9 @@ def apply_r4_hadamard(model, umodel: UnifiedQuantModel):
     """Apply R4 Hadamard to down-proj weights (offline baking).
 
     Reference: DartQuant/fake_quant/rotation_utils.py:rotate_mlp_output (line 193)
+
+    The CUDA kernel compatibility is handled globally by _check_and_patch_hadamard()
+    which monkey-patches the CUDA functions at import time if needed.
     """
     try:
         from hadamard_utils import apply_exact_had_to_linear
@@ -857,8 +956,11 @@ def run_full_pipeline(args):
     logging.info(f"  W{args.w_bits}A{args.a_bits}KV{args.k_bits}")
     logging.info("=" * 70)
 
+    _pipeline_start = time.time()
+
     # ======== Step 1: Load Model ========
     logging.info("\n[1/12] Loading model...")
+    _t = time.time()
     umodel = UnifiedQuantModel(
         args.model, args.hf_token, args.cache_dir
     )
@@ -869,13 +971,17 @@ def run_full_pipeline(args):
     logging.info(f"  Architecture: {model.config.__class__.__name__}")
     logging.info(f"  Hidden: {umodel.hidden_size}, Layers: {umodel.num_layers}, "
                  f"Heads: {umodel.num_heads}/{umodel.kv_heads}")
+    logging.info(f"  Step 1 done in {time.time() - _t:.1f}s")
 
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("\n[2/12] Fusing LayerNorms...")
+    _t = time.time()
     fuse_layer_norms(umodel)
+    logging.info(f"  Step 2 done in {time.time() - _t:.1f}s")
 
     # ======== Step 3: Load Calibration Data ========
     logging.info("\n[3/12] Loading calibration data...")
+    _t = time.time()
     try:
         import data_utils
         trainloader = data_utils.get_loaders(
@@ -894,6 +1000,7 @@ def run_full_pipeline(args):
             0, model.config.vocab_size, (args.nsamples, args.seqlen)
         )
     logging.info(f"  Calibration data: {calib_data.shape}")
+    logging.info(f"  Step 3 done in {time.time() - _t:.1f}s")
 
     # ======== Step 4: Train R1 (per-layer) ========
     R1_dict = {}
@@ -913,38 +1020,58 @@ def run_full_pipeline(args):
                 R1_dict = {i: r1_data for i in range(umodel.num_layers)}
         else:
             logging.info("\n[4/12] Collecting activations and training R1 (per-layer)...")
+            _t4 = time.time()
             model.to(DEV)
 
-            # Collect + train one layer at a time to avoid storing all
-            # activations in RAM at once (~22 GB for a 22-layer model).
             from .trainers import train_r1_single_layer
             layers_prefix = umodel.arch.layers_path
 
+            # Build ALL target names across all layers so we can collect
+            # every layer's activations in a SINGLE forward pass (N_samples
+            # passes instead of N_layers × N_samples — ~22× faster).
+            all_layer_targets = {}   # layer_idx -> [target_name, ...]
+            all_target_names = []
             for layer_idx in range(umodel.num_layers):
-                # Build targets for this layer only
-                layer_targets = []
+                targets = []
                 if umodel.arch.mlp_up_proj_attr:
-                    layer_targets.append(
+                    targets.append(
                         f"{layers_prefix}.{layer_idx}.{umodel.arch.mlp_up_proj_attr}"
                     )
-                layer_targets.append(
+                targets.append(
                     f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
+                all_layer_targets[layer_idx] = targets
+                all_target_names.extend(targets)
 
-                # Collect activations for this layer only
-                layer_acts = collect_activations(
-                    model, calib_data, layer_targets, DEV
-                )
+            logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
+                         f"layers in one pass ({calib_data.shape[0]} samples)...")
+            _t_collect = time.time()
+            all_acts = collect_activations(
+                model, calib_data, all_target_names, DEV
+            )
+            logging.info(f"  R1 activation collection done in "
+                         f"{time.time() - _t_collect:.1f}s")
 
-                # Concatenate the targets for this layer
-                all_acts = torch.cat(
-                    [a.reshape(-1, umodel.hidden_size) for a in layer_acts.values()],
+            # Train R1 per-layer (greedy), freeing activations after each
+            for layer_idx in range(umodel.num_layers):
+                layer_act_tensors = [
+                    all_acts[t] for t in all_layer_targets[layer_idx]
+                    if t in all_acts
+                ]
+                if not layer_act_tensors:
+                    logging.warning(
+                        f"  No activations for layer {layer_idx}, skipping R1"
+                    )
+                    continue
+
+                combined = torch.cat(
+                    [a.reshape(-1, umodel.hidden_size)
+                     for a in layer_act_tensors],
                     dim=0
                 )
 
-                # Train R1 for this layer on GPU
                 R1_dict[layer_idx] = train_r1_single_layer(
-                    acts=all_acts,
+                    acts=combined,
                     hidden_size=umodel.hidden_size,
                     loss_fn_name=args.loss,
                     lr=args.lr,
@@ -960,10 +1087,16 @@ def run_full_pipeline(args):
                     layer_idx=layer_idx,
                 )
 
-                del layer_acts, all_acts
+                # Free this layer's activations to limit peak RAM
+                for t in all_layer_targets[layer_idx]:
+                    if t in all_acts:
+                        del all_acts[t]
+                del combined, layer_act_tensors
                 cleanup_memory()
 
-            logging.info(f"  R1 training complete for {len(R1_dict)} layers.")
+            del all_acts
+            logging.info(f"  R1 training complete for {len(R1_dict)} layers "
+                         f"in {time.time() - _t4:.1f}s")
             model.cpu()
             cleanup_memory()
     else:
@@ -972,10 +1105,12 @@ def run_full_pipeline(args):
     # ======== Step 5: Apply R1 (per-layer) ========
     if R1_dict:
         logging.info("\n[5/12] Applying per-layer R1 rotations to model...")
+        _t = time.time()
         smooth_scale = None
         if args.smooth:
             smooth_scale = torch.load(args.smooth)
         apply_r1_rotation_per_layer(model, R1_dict, umodel, smooth_scale)
+        logging.info(f"  Step 5 done in {time.time() - _t:.1f}s")
     else:
         logging.info("\n[5/12] No R1, skipping rotation...")
 
@@ -987,24 +1122,39 @@ def run_full_pipeline(args):
             R2_dict = torch.load(args.r2_path, map_location='cpu')
         else:
             logging.info("\n[6/12] Collecting activations and training R2...")
+            _t6 = time.time()
             model.to(DEV)
 
             from .trainers import train_r2_single_layer
             layers_prefix = umodel.arch.layers_path
 
+            # Build ALL R2 targets (o_proj for each layer) and collect
+            # in a single forward pass — same optimisation as R1.
+            all_r2_targets = {}
+            all_r2_target_names = []
             for layer_idx in range(umodel.num_layers):
-                r2_target = [
-                    f"{layers_prefix}.{layer_idx}.{umodel.arch.o_proj_attr}"
-                ]
+                target = (f"{layers_prefix}.{layer_idx}."
+                          f"{umodel.arch.o_proj_attr}")
+                all_r2_targets[layer_idx] = target
+                all_r2_target_names.append(target)
 
-                layer_acts = collect_activations(
-                    model, calib_data, r2_target, DEV
-                )
+            logging.info(f"  Collecting R2 activations for all "
+                         f"{umodel.num_layers} layers in one pass...")
+            _t_collect = time.time()
+            all_acts = collect_activations(
+                model, calib_data, all_r2_target_names, DEV
+            )
+            logging.info(f"  R2 activation collection done in "
+                         f"{time.time() - _t_collect:.1f}s")
 
-                # Get the single target's activations
-                acts = list(layer_acts.values())[0] if layer_acts else None
+            # Train R2 per-layer (greedy), freeing activations after each
+            for layer_idx in range(umodel.num_layers):
+                target = all_r2_targets[layer_idx]
+                acts = all_acts.get(target)
                 if acts is None:
-                    logging.warning(f"  No R2 activations for layer {layer_idx}")
+                    logging.warning(
+                        f"  No R2 activations for layer {layer_idx}"
+                    )
                     continue
 
                 key, rotation = train_r2_single_layer(
@@ -1026,10 +1176,15 @@ def run_full_pipeline(args):
                 )
                 R2_dict[key] = rotation
 
-                del layer_acts, acts
+                # Free this layer's activations
+                if target in all_acts:
+                    del all_acts[target]
+                del acts
                 cleanup_memory()
 
-            logging.info(f"  R2 training complete for {len(R2_dict)} layers.")
+            del all_acts
+            logging.info(f"  R2 training complete for {len(R2_dict)} layers "
+                         f"in {time.time() - _t6:.1f}s")
             model.cpu()
             cleanup_memory()
     else:
@@ -1038,7 +1193,9 @@ def run_full_pipeline(args):
     # ======== Step 7: Apply R2 ========
     if R2_dict:
         logging.info("\n[7/12] Applying R2 to model...")
+        _t = time.time()
         apply_r2_rotation(model, R2_dict, umodel)
+        logging.info(f"  Step 7 done in {time.time() - _t:.1f}s")
     else:
         logging.info("\n[7/12] No R2, skipping...")
 
@@ -1048,6 +1205,7 @@ def run_full_pipeline(args):
 
     if args.butterfly:
         logging.info("\n[8/12] Training Butterfly R3/R4...")
+        _t8 = time.time()
         model.to(DEV)
 
         # Auto-select KL divergence loss for R3/R4 based on quantizer type.
@@ -1118,14 +1276,18 @@ def run_full_pipeline(args):
         # Apply Butterfly R4 offline (bake into weights)
         if butterfly_r4 is not None:
             apply_r4_butterfly(model, butterfly_r4, umodel)
+        logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
     else:
         logging.info("\n[8/12] Using Hadamard for R3/R4...")
+        _t8 = time.time()
         # Apply R4 Hadamard offline (bake into down_proj weights)
         if args.use_r4:
             apply_r4_hadamard(model, umodel)
+        logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
 
     # ======== Step 9: Setup Quantization Wrappers ========
     logging.info("\n[9/12] Setting up quantization wrappers...")
+    _t = time.time()
     if args.quantizer_type == 'int4':
         setup_quantization_wrappers(model, args, umodel)
 
@@ -1137,15 +1299,19 @@ def run_full_pipeline(args):
                 setup_butterfly_r4_online(model, butterfly_r4, umodel)
     else:
         logging.info("  NF4 mode: skipping activation quantization wrappers")
+    logging.info(f"  Step 9 done in {time.time() - _t:.1f}s")
 
     # ======== Step 10: Weight Quantization ========
     logging.info(f"\n[10/12] Running {args.quantizer_type.upper()} weight quantization...")
+    _t = time.time()
     if args.quantizer_type == 'int4':
         model.to(DEV)
     run_weight_quantization(model, args, umodel, tokenizer)
+    logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========
     logging.info("\n[11/12] Moving model to device...")
+    _t = time.time()
     if args.distribute:
         try:
             from utils import distribute_model
@@ -1154,10 +1320,12 @@ def run_full_pipeline(args):
             model.to(DEV)
     else:
         model.to(DEV)
+    logging.info(f"  Step 11 done in {time.time() - _t:.1f}s")
 
     # ======== Step 12: Evaluate ========
     ppl_results = {}
     lm_eval_results = {}
+    _t = time.time()
 
     if args.ppl_eval:
         logging.info("\n[12/12] Evaluating perplexity...")
@@ -1169,6 +1337,9 @@ def run_full_pipeline(args):
 
     if not args.ppl_eval and not args.lm_eval:
         logging.info("\n[12/12] Evaluation disabled.")
+
+    logging.info(f"  Step 12 done in {time.time() - _t:.1f}s")
+    logging.info(f"  Total pipeline time: {time.time() - _pipeline_start:.1f}s")
 
     results = ppl_results  # backward compat for return value
 

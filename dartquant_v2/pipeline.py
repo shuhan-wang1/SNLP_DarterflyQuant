@@ -937,12 +937,37 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
 # Main Pipeline
 # ============================================================================
 
+def _ensure_dartquant_compat_args(args):
+    """Ensure args namespace has all attributes DartQuant legacy code expects.
+
+    DartQuant's gptq_utils.py, eval_utils.py, etc. access args attributes that
+    may not be defined in our args.py. Rather than chasing each AttributeError
+    one by one, we proactively set sensible defaults for all known DartQuant
+    attributes here. This prevents 'Namespace has no attribute ...' crashes.
+    """
+    _DEFAULTS = {
+        # gptq_utils.py: separate weight bits for down_proj layers
+        'w_bits_down_proj': None,
+        # eval_utils.evaluator(): layer I/O capture (debug feature)
+        'capture_layer_io': False,
+        'layer_idx': 0,
+        # eval_utils.evaluator(): dataset name for logging
+        'eval_dataset': 'wikitext2',
+        # DartQuant calibrater: alternative arg names
+        'a_bits_down_proj': None,
+    }
+    for key, default in _DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
+
+
 def run_full_pipeline(args):
     """Execute the complete DartQuant v2 quantization pipeline.
 
     Args:
         args: Parsed arguments from args.py:create_parser()
     """
+    _ensure_dartquant_compat_args(args)
     transformers.set_seed(args.seed)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1077,7 +1102,7 @@ def run_full_pipeline(args):
                     lr=args.lr,
                     momentum=args.momentum,
                     epochs=args.r1_epochs,
-                    batch_size=args.batch_size,
+                    batch_size=args.r1_batch_size,
                     cos_lr=args.cos_lr,
                     optim=args.optim,
                     init_mode=args.rotate_mode,

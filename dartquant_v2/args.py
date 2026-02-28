@@ -148,7 +148,14 @@ def create_parser() -> argparse.ArgumentParser:
              '200 steps. With 128 activation samples and batch_size=64, '
              '100 epochs yields ~200 steps.')
     train_group.add_argument('--batch_size', type=int, default=64,
-                             help='Training batch size')
+                             help='Training batch size (used by R2 and Butterfly)')
+    train_group.add_argument(
+        '--r1_batch_size', type=int, default=2048,
+        help='R1 training batch size. Defaults to 2048 because R1 '
+             'trains a full hidden_size×hidden_size rotation matrix '
+             'with an O(n³) QR decomposition per batch iteration. '
+             'Larger batches amortize the QR cost over more samples '
+             '(2048 → 32× fewer QR calls vs batch_size=64).')
     train_group.add_argument('--cos_lr', action='store_true', default=False,
                              help='Use cosine annealing LR scheduler')
     train_group.add_argument('--optim', type=str, default='sgd',
@@ -187,6 +194,9 @@ def create_parser() -> argparse.ArgumentParser:
                           help='GPTQ damping percentage')
     wq_group.add_argument('--act_order', action='store_true', default=False,
                           help='Activation order in GPTQ')
+    wq_group.add_argument('--w_bits_down_proj', type=int, default=None,
+                          help='Separate weight bits for down_proj layers '
+                               '(None = use same as --w_bits)')
 
     # ==== Activation Quantization ====
     aq_group = parser.add_argument_group('Activation Quantization')

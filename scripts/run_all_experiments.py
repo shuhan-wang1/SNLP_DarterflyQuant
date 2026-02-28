@@ -65,7 +65,7 @@ KNOWN_MODELS = [
 EVAL_DATASETS = ["wikitext2", "ptb", "c4"]
 
 # Default lm_eval zero-shot tasks
-LM_EVAL_TASKS = ["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "mmlu"]
+LM_EVAL_TASKS = ["hellaswag", "arc_easy", "arc_challenge", "winogrande", "mmlu"]
 
 # Calibration datasets
 CAL_DATASETS = ["wikitext2", "ptb", "c4"]
@@ -137,7 +137,6 @@ def detect_cached_benchmarks(datasets_cache: str) -> list[str]:
         "arc_challenge": ["allenai___ai2_arc", "ai2_arc"],
         "winogrande":    ["allenai___winogrande", "winogrande"],
         "gsm8k":         ["openai___gsm8k", "gsm8k"],
-        "piqa":          ["piqa"],
     }
     return _scan_cache_for_markers(datasets_cache, benchmark_markers)
 

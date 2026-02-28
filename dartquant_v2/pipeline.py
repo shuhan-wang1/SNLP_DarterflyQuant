@@ -708,10 +708,14 @@ def apply_r4_butterfly(model, butterfly_r4, umodel: UnifiedQuantModel):
 # Quantization Wrappers Setup (from existing DartQuant)
 # ============================================================================
 
-def setup_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
-    """Add activation quantization wrappers and configure per-layer settings.
+def add_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
+    """Add ActQuantWrapper + configure Hadamard/K-cache (Phase 1).
 
-    Adapted from DartQuant/fake_quant/main_for_test.py lines 69-211
+    This must run BEFORE weight quantization (GPTQ/RTN) so the wrappers
+    are in the model graph, but activation quantization bits are NOT yet
+    configured — GPTQ needs full-precision activations for its Hessian.
+
+    Adapted from DartQuant/fake_quant/main_for_test.py lines 69-84.
     """
     try:
         import quant_utils
@@ -745,41 +749,6 @@ def setup_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
                 qlayers[name].had_dim = umodel.head_dim
                 qlayers[name].fp32_had = args.fp32_had
 
-    # Configure per-layer activation quantization bits
-    if args.a_bits < 16 or args.v_bits < 16:
-        qlayers = quant_utils.find_qlayers(
-            model, layers=[quant_utils.ActQuantWrapper]
-        )
-
-        for name in qlayers:
-            layer_input_bits = args.a_bits
-            layer_groupsize = args.a_groupsize
-            layer_a_sym = not args.a_asym
-            layer_a_clip = args.a_clip_ratio
-            residual = args.a_residual
-
-            if 'v_proj' in name and args.v_bits < 16:
-                qlayers[name].out_quantizer.configure(
-                    bits=args.v_bits,
-                    groupsize=args.v_groupsize,
-                    sym=not args.v_asym,
-                    clip_ratio=args.v_clip_ratio
-                )
-
-            if 'lm_head' in name:
-                layer_input_bits = 16
-
-            if 'down_proj' in name or 'fc2' in name:
-                pass  # Use default groupsize
-
-            qlayers[name].quantizer.configure(
-                bits=layer_input_bits,
-                groupsize=layer_groupsize,
-                sym=layer_a_sym,
-                clip_ratio=layer_a_clip,
-                residual=residual
-            )
-
     # Configure K-cache quantization with R3
     if args.k_bits < 16 and umodel.has_rope:
         try:
@@ -806,6 +775,75 @@ def setup_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
                 config=model.config,
                 **k_quant_config
             )
+
+    logging.info("  Quantization wrappers added (activation bits NOT yet configured).")
+
+
+def configure_activation_quantization(model, args, umodel: UnifiedQuantModel):
+    """Configure per-layer activation quantization bits (Phase 2).
+
+    This must run AFTER weight quantization (GPTQ/RTN) so that GPTQ
+    computes its Hessian using full-precision activations.
+
+    Adapted from DartQuant/fake_quant/main_for_test.py lines 151-191.
+    """
+    if args.a_bits >= 16 and args.v_bits >= 16:
+        logging.info("  Activation quantization not needed (a_bits/v_bits >= 16)")
+        return
+
+    try:
+        import quant_utils
+        import utils as dartquant_utils
+    except ImportError:
+        logging.error("Cannot import quant_utils for activation quantization")
+        raise
+
+    qlayers = quant_utils.find_qlayers(
+        model, layers=[quant_utils.ActQuantWrapper]
+    )
+
+    # Compute down_proj groupsize (matches official DartQuant logic)
+    down_proj_groupsize = -1
+    if args.a_groupsize > 0 and "llama" in args.model.lower():
+        down_proj_groupsize = dartquant_utils.llama_down_proj_groupsize(
+            model, args.a_groupsize
+        )
+
+    for name in qlayers:
+        layer_input_bits = args.a_bits
+        layer_groupsize = args.a_groupsize
+        layer_a_sym = not args.a_asym
+        layer_a_clip = args.a_clip_ratio
+        residual = args.a_residual
+
+        if 'v_proj' in name and args.v_bits < 16:
+            qlayers[name].out_quantizer.configure(
+                bits=args.v_bits,
+                groupsize=args.v_groupsize,
+                sym=not args.v_asym,
+                clip_ratio=args.v_clip_ratio
+            )
+
+        if 'lm_head' in name:
+            layer_input_bits = 16
+
+        if getattr(args, 'o_per_head', False) and 'o_proj' in name:
+            layer_groupsize = umodel.hidden_size // umodel.num_heads
+
+        if 'down_proj' in name or 'fc2' in name:
+            if getattr(args, 'a_bits_down_proj', None) is not None:
+                layer_input_bits = args.a_bits_down_proj
+            layer_groupsize = down_proj_groupsize
+
+        qlayers[name].quantizer.configure(
+            bits=layer_input_bits,
+            groupsize=layer_groupsize,
+            sym=layer_a_sym,
+            clip_ratio=layer_a_clip,
+            residual=residual
+        )
+
+    logging.info(f"  Activation quantization configured: A{args.a_bits} V{args.v_bits}")
 
 
 def setup_butterfly_r3_online(model, butterfly_r3, umodel: UnifiedQuantModel):
@@ -989,6 +1027,8 @@ def _ensure_dartquant_compat_args(args):
         'eval_dataset': 'wikitext2',
         # DartQuant calibrater: alternative arg names
         'a_bits_down_proj': None,
+        # Per-head quantization for o_proj (official DartQuant default: False)
+        'o_per_head': False,
     }
     for key, default in _DEFAULTS.items():
         if not hasattr(args, key):
@@ -1339,11 +1379,16 @@ def run_full_pipeline(args):
             apply_r4_hadamard(model, umodel)
         logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
 
-    # ======== Step 9: Setup Quantization Wrappers ========
-    logging.info("[9/12] Setting up quantization wrappers...")
+    # ======== Step 9: Add Quantization Wrappers (Phase 1) ========
+    # CRITICAL: Only add wrappers + Hadamard/K-cache config here.
+    # Activation quantization bits must NOT be configured until AFTER
+    # weight quantization — GPTQ needs full-precision activations for
+    # its Hessian computation.  The official DartQuant code
+    # (main_for_test.py) follows this exact ordering.
+    logging.info("[9/12] Adding quantization wrappers (Phase 1: wrappers + Hadamard)...")
     _t = time.time()
     if args.quantizer_type == 'int4':
-        setup_quantization_wrappers(model, args, umodel)
+        add_quantization_wrappers(model, args, umodel)
 
         # Setup butterfly online components
         if args.butterfly:
@@ -1361,6 +1406,10 @@ def run_full_pipeline(args):
     if args.quantizer_type == 'int4':
         model.to(DEV)
     run_weight_quantization(model, args, umodel, tokenizer)
+
+    # Configure activation quantization AFTER weight quantization (Phase 2)
+    if args.quantizer_type == 'int4':
+        configure_activation_quantization(model, args, umodel)
     logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========

@@ -196,7 +196,8 @@ def train_r1_single_layer(
     if isinstance(device, str):
         device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
-    acts = acts.float().cpu()
+    # Keep data on GPU to avoid 20K+ CPU→GPU transfers per layer
+    acts = acts.float().to(device)
     dataset = TensorDataset(acts)
 
     R1 = R1_QR(hidden_size).to(device)
@@ -218,7 +219,7 @@ def train_r1_single_layer(
         dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
 
         for batch_idx, (batch_samples,) in enumerate(dataloader):
-            batch_samples = batch_samples.to(device).float().reshape(-1, hidden_size)
+            batch_samples = batch_samples.reshape(-1, hidden_size)
             outputs = R1(batch_samples)
             loss = loss_fn(outputs) / accumulation_steps
             loss.backward()
@@ -279,7 +280,8 @@ def train_r2_single_layer(
             np.nan_to_num(acts, nan=0.0, posinf=65504, neginf=-65504),
             dtype=torch.float32
         )
-    acts = acts.float()
+    # Keep data on GPU to avoid repeated CPU→GPU transfers
+    acts = acts.float().to(device)
     dataset = TensorDataset(acts)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -297,7 +299,7 @@ def train_r2_single_layer(
     for epoch in range(epochs):
         loss_log = []
         for batch_idx, (batch_samples,) in enumerate(dataloader):
-            batch_samples = batch_samples.to(device).float()
+            batch_samples = batch_samples
             outputs = R2(batch_samples)
             loss = loss_fn(outputs) / accumulation_steps
             loss.backward()

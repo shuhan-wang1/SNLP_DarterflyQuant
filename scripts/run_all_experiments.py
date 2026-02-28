@@ -384,9 +384,13 @@ def run_experiment(
                     stage_bar.set_postfix_str(stage_desc)
 
             # Detect per-layer R1/R2 training progress
-            # e.g. "Layer 3/22 R1 epoch 5/10 loss=0.123"
-            elif 'Layer' in line_stripped and ('R1' in line_stripped or 'R2' in line_stripped):
-                layer_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
+            # Format from trainers.py: "R1 L0 Epoch [1/10], Loss: 0.123"
+            # or "Training R1 layer 0 (whip, 131072 samples)"
+            elif ('R1' in line_stripped or 'R2' in line_stripped) and (
+                'Epoch' in line_stripped or 'Layer' in line_stripped
+                or 'Training R' in line_stripped or 'final Loss' in line_stripped
+            ):
+                layer_info = _LOG_PREFIX_RE.sub('', line_stripped).strip()
                 stage_bar.set_postfix_str(layer_info[:55])
 
             # Detect Butterfly training progress
@@ -429,6 +433,12 @@ def run_experiment(
                 _show = True
             elif 'WARNING' in line_stripped or 'CRITICAL' in line_stripped:
                 # Warnings worth showing
+                _show = True
+            elif 'Epoch' in line_stripped and ('R1' in line_stripped or 'R2' in line_stripped):
+                # R1/R2 per-epoch training progress
+                _show = True
+            elif 'final Loss' in line_stripped:
+                # R2 final loss
                 _show = True
             elif 'Butterfly' in line_stripped and 'Epoch' in line_stripped:
                 # Butterfly training progress

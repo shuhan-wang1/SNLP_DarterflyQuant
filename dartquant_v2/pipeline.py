@@ -190,7 +190,7 @@ class _RMSN(nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
-        if x.dtype == torch.float16:
+        if x.dtype != torch.float32:
             x = x.to(torch.float32)
         variance = x.pow(2).sum(-1, keepdim=True) / self.mean_dim
         x = x * torch.rsqrt(variance + self.eps)
@@ -708,14 +708,49 @@ def apply_r4_butterfly(model, butterfly_r4, umodel: UnifiedQuantModel):
 # Quantization Wrappers Setup (from existing DartQuant)
 # ============================================================================
 
+def _auto_configure_quant_params(args, umodel: UnifiedQuantModel):
+    """Auto-configure model-dependent quantization parameters.
+
+    The official DartQuant shell script hardcodes values (e.g. groupsize=128)
+    that only work for Llama-2-7B (head_dim=128).  This function adapts them
+    to the actual model architecture so the pipeline works out of the box.
+    """
+    head_dim = umodel.head_dim
+
+    # k_groupsize: QKRotationWrapper asserts it must be -1 or head_dim.
+    # Auto-set to head_dim when a positive value doesn't match.
+    if args.k_groupsize > 0 and args.k_groupsize != head_dim:
+        logging.info(f"  Auto-adjusting k_groupsize {args.k_groupsize} → "
+                     f"{head_dim} (must equal head_dim)")
+        args.k_groupsize = head_dim
+    elif args.k_groupsize == -1:
+        # Per-token is valid; optionally upgrade to head_dim for better quality
+        logging.info(f"  k_groupsize=-1 (per-token); auto-upgrading to "
+                     f"head_dim={head_dim} for per-head K-cache quantization")
+        args.k_groupsize = head_dim
+
+    # v_groupsize: ensure it divides the KV projection dimension.
+    kv_dim = umodel.kv_heads * head_dim
+    if args.v_groupsize > 0 and kv_dim % args.v_groupsize != 0:
+        logging.info(f"  Auto-adjusting v_groupsize {args.v_groupsize} → "
+                     f"{head_dim} (must divide kv_dim={kv_dim})")
+        args.v_groupsize = head_dim
+    elif args.v_groupsize == -1:
+        args.v_groupsize = head_dim
+        logging.info(f"  v_groupsize auto-set to head_dim={head_dim}")
+
+    logging.info(f"  Model-adaptive params: head_dim={head_dim}, "
+                 f"k_groupsize={args.k_groupsize}, "
+                 f"v_groupsize={args.v_groupsize}, "
+                 f"w_groupsize={args.w_groupsize}")
+
+
 def add_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
-    """Add ActQuantWrapper + configure Hadamard/K-cache (Phase 1).
+    """Add ActQuantWrapper + configure Hadamard (Phase 1, pre-GPTQ).
 
-    This must run BEFORE weight quantization (GPTQ/RTN) so the wrappers
-    are in the model graph, but activation quantization bits are NOT yet
-    configured — GPTQ needs full-precision activations for its Hessian.
-
-    Adapted from DartQuant/fake_quant/main_for_test.py lines 69-84.
+    Only adds wrappers and Hadamard settings.  Activation bits AND K-cache
+    quantization are configured AFTER GPTQ — matching the official DartQuant
+    ordering (main_for_test.py lines 69-84 before GPTQ, 151-210 after).
     """
     try:
         import quant_utils
@@ -749,34 +784,47 @@ def add_quantization_wrappers(model, args, umodel: UnifiedQuantModel):
                 qlayers[name].had_dim = umodel.head_dim
                 qlayers[name].fp32_had = args.fp32_had
 
-    # Configure K-cache quantization with R3
-    if args.k_bits < 16 and umodel.has_rope:
-        try:
-            import rotation_utils as rot_utils
-            import model_utils
-        except ImportError:
-            logging.warning("Cannot set up K-cache quantization (missing imports)")
-            return
-
-        k_quant_config = {
-            'k_bits': args.k_bits,
-            'k_groupsize': args.k_groupsize,
-            'k_sym': not args.k_asym,
-            'k_clip_ratio': args.k_clip_ratio,
-            'use_r3': args.use_r3 and not args.butterfly,
-        }
-
-        layers = umodel.get_layers()
-        for layer in layers:
-            self_attn = umodel.get_self_attn(layer)
-            rot_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
-                self_attn,
-                umodel.rope_function_name,
-                config=model.config,
-                **k_quant_config
-            )
-
     logging.info("  Quantization wrappers added (activation bits NOT yet configured).")
+
+
+def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
+    """Configure K-cache quantization with R3 (Phase 3, post-GPTQ).
+
+    In the official DartQuant code (main_for_test.py lines 193-210) K-cache
+    quantization is set up AFTER weight quantization and activation config.
+    """
+    if args.k_bits >= 16:
+        return
+    if not umodel.has_rope:
+        logging.warning("  K-cache quantization requires RoPE; skipping")
+        return
+
+    try:
+        import rotation_utils as rot_utils
+        import model_utils
+    except ImportError:
+        logging.warning("Cannot set up K-cache quantization (missing imports)")
+        return
+
+    k_quant_config = {
+        'k_bits': args.k_bits,
+        'k_groupsize': args.k_groupsize,
+        'k_sym': not args.k_asym,
+        'k_clip_ratio': args.k_clip_ratio,
+        'use_r3': args.use_r3 and not args.butterfly,
+    }
+
+    layers = umodel.get_layers()
+    for layer in layers:
+        self_attn = umodel.get_self_attn(layer)
+        rot_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+            self_attn,
+            umodel.rope_function_name,
+            config=model.config,
+            **k_quant_config
+        )
+    logging.info(f"  K-cache quantization configured: K{args.k_bits} "
+                 f"groupsize={args.k_groupsize}")
 
 
 def configure_activation_quantization(model, args, umodel: UnifiedQuantModel):
@@ -1067,8 +1115,12 @@ def run_full_pipeline(args):
 
     logging.info(f"  Architecture: {model.config.__class__.__name__}")
     logging.info(f"  Hidden: {umodel.hidden_size}, Layers: {umodel.num_layers}, "
-                 f"Heads: {umodel.num_heads}/{umodel.kv_heads}")
+                 f"Heads: {umodel.num_heads}/{umodel.kv_heads}, "
+                 f"head_dim={umodel.head_dim}")
     logging.info(f"  Step 1 done in {time.time() - _t:.1f}s")
+
+    # Auto-configure model-dependent quantization parameters
+    _auto_configure_quant_params(args, umodel)
 
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")
@@ -1377,12 +1429,13 @@ def run_full_pipeline(args):
             apply_r4_hadamard(model, umodel)
         logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
 
-    # ======== Step 9: Add Quantization Wrappers (Phase 1) ========
-    # CRITICAL: Only add wrappers + Hadamard/K-cache config here.
-    # Activation quantization bits must NOT be configured until AFTER
-    # weight quantization — GPTQ needs full-precision activations for
-    # its Hessian computation.  The official DartQuant code
-    # (main_for_test.py) follows this exact ordering.
+    # ======== Step 9: Add Quantization Wrappers (Phase 1: pre-GPTQ) ========
+    # CRITICAL ordering from official DartQuant (main_for_test.py):
+    #   Phase 1 (lines 69-84):  add_actquant + Hadamard config
+    #   GPTQ    (lines 91-115): weight quantization
+    #   Phase 2 (lines 151-191): activation quantization bits
+    #   Phase 3 (lines 193-210): K-cache quantization
+    # K-cache and activation bits must NOT be active during GPTQ.
     logging.info("[9/12] Adding quantization wrappers (Phase 1: wrappers + Hadamard)...")
     _t = time.time()
     if args.quantizer_type == 'int4':
@@ -1405,9 +1458,13 @@ def run_full_pipeline(args):
         model.to(DEV)
     run_weight_quantization(model, args, umodel, tokenizer)
 
-    # Configure activation quantization AFTER weight quantization (Phase 2)
+    # Phase 2: activation quantization bits (AFTER weight quantization)
     if args.quantizer_type == 'int4':
         configure_activation_quantization(model, args, umodel)
+
+    # Phase 3: K-cache quantization (AFTER weight quantization)
+    if args.quantizer_type == 'int4':
+        configure_kcache_quantization(model, args, umodel)
     logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========

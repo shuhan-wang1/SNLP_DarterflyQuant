@@ -1377,21 +1377,25 @@ def run_full_pipeline(args):
                     f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
 
-            # Memory-aware row limit: cap each hook to fit within 4 GB of
-            # combined CPU RAM.  collect_activations randomly subsamples
-            # each hook independently (torch.randperm inside), so diversity
-            # across all layers is preserved without a post-hoc shuffle.
+            # Memory-aware row limit: the hook fires once per sample, so
+            # total rows per target = nsamples × min(seqlen, max_rows).
+            # Budget the combined tensor at ≤ 4 GB:
+            #   4 GB = num_targets × nsamples × max_rows × hidden × 4
             _num_r1_targets = len(all_target_names)
+            _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
             _max_total_rows = (4 * 1024 ** 3) // _row_bytes  # 4 GB budget
-            _max_r1_rows_per_hook = max(256, _max_total_rows // _num_r1_targets)
-            _max_r1_rows_per_hook = min(_max_r1_rows_per_hook,
-                                        args.nsamples * args.seqlen)
+            _max_r1_rows_per_hook = max(
+                64, _max_total_rows // (_num_r1_targets * _nsamples)
+            )
+            _est_gb = (_num_r1_targets * _nsamples *
+                       min(_max_r1_rows_per_hook, args.seqlen) *
+                       _row_bytes / (1024 ** 3))
 
             logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
-                         f"layers in one pass ({calib_data.shape[0]} samples, "
-                         f"max {_max_r1_rows_per_hook} rows/hook → "
-                         f"~{_num_r1_targets * _max_r1_rows_per_hook * _row_bytes / 1024**3:.1f} GB)...")
+                         f"layers in one pass ({_nsamples} samples, "
+                         f"max {_max_r1_rows_per_hook} rows/hook-call → "
+                         f"~{_est_gb:.1f} GB)...")
             _t_collect = time.time()
             all_acts = collect_activations(
                 model, calib_data, all_target_names, DEV,

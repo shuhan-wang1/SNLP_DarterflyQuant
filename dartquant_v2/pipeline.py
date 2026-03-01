@@ -1377,11 +1377,25 @@ def run_full_pipeline(args):
                     f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
 
+            # Memory-aware row limit: cap each hook to fit within 4 GB of
+            # combined CPU RAM.  collect_activations randomly subsamples
+            # each hook independently (torch.randperm inside), so diversity
+            # across all layers is preserved without a post-hoc shuffle.
+            _num_r1_targets = len(all_target_names)
+            _row_bytes = umodel.hidden_size * 4          # float32
+            _max_total_rows = (4 * 1024 ** 3) // _row_bytes  # 4 GB budget
+            _max_r1_rows_per_hook = max(256, _max_total_rows // _num_r1_targets)
+            _max_r1_rows_per_hook = min(_max_r1_rows_per_hook,
+                                        args.nsamples * args.seqlen)
+
             logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
-                         f"layers in one pass ({calib_data.shape[0]} samples)...")
+                         f"layers in one pass ({calib_data.shape[0]} samples, "
+                         f"max {_max_r1_rows_per_hook} rows/hook → "
+                         f"~{_num_r1_targets * _max_r1_rows_per_hook * _row_bytes / 1024**3:.1f} GB)...")
             _t_collect = time.time()
             all_acts = collect_activations(
-                model, calib_data, all_target_names, DEV
+                model, calib_data, all_target_names, DEV,
+                max_rows_per_hook=_max_r1_rows_per_hook,
             )
             logging.info(f"  R1 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")
@@ -1392,31 +1406,38 @@ def run_full_pipeline(args):
 
             # Concatenate activations from ALL layers into one tensor
             # and train a SINGLE global R1 (paper Algorithm 1).
+            # No shuffle needed: collect_activations already randomly
+            # subsamples each hook, so every layer contributes proportionally.
+            # The DataLoader in train_r1_single_layer uses np.random.choice
+            # to draw a fresh random subset each call.
             all_act_tensors = [
                 a.reshape(-1, umodel.hidden_size)
                 for a in all_acts.values()
             ]
+            del all_acts
             if not all_act_tensors:
                 logging.error("No R1 activations collected!")
             else:
                 combined = torch.cat(all_act_tensors, dim=0)
-                del all_act_tensors  # free memory before shuffle
+                del all_act_tensors
 
-                # Shuffle to interleave layers.  The concatenation above
-                # orders rows by layer (layer0 first, then layer1, ...),
-                # but the official DartQuant's per-file dataset naturally
-                # interleaves layers (files are named sample_k_layer_idx_*).
-                # With train_subset_size < 1.0, only a fraction of rows is
-                # used; without shuffling, the subset would be biased
-                # toward early layers, starving later layers of training
-                # signal and producing a poor R1 rotation.
-                perm = torch.randperm(combined.shape[0])
-                combined = combined[perm]
-                del perm
+                # Auto-adjust batch size so we get ≥ 6 gradient steps per
+                # epoch even when the combined dataset is much smaller than
+                # the default r1_batch_size (131072).
+                _approx_subset_rows = max(1, int(combined.shape[0] * args.train_subset_size))
+                _r1_batch_size = args.r1_batch_size
+                if _approx_subset_rows < _r1_batch_size * 6:
+                    _r1_batch_size = max(64, _approx_subset_rows // 6)
+                    logging.info(
+                        f"  Auto-adjusted r1_batch_size: {args.r1_batch_size} → "
+                        f"{_r1_batch_size} (subset ≈ {_approx_subset_rows} rows, "
+                        f"targeting ≥6 batches/epoch)"
+                    )
 
                 logging.info(f"  Training single global R1 on "
-                             f"{combined.shape[0]} samples from "
-                             f"{umodel.num_layers} layers...")
+                             f"{combined.shape[0]} rows from "
+                             f"{umodel.num_layers} layers "
+                             f"(subset {args.train_subset_size:.0%} per epoch)...")
 
                 R1_global = train_r1_single_layer(
                     acts=combined,
@@ -1425,7 +1446,7 @@ def run_full_pipeline(args):
                     lr=args.lr,
                     momentum=args.momentum,
                     epochs=args.r1_epochs,
-                    batch_size=args.r1_batch_size,
+                    batch_size=_r1_batch_size,
                     cos_lr=args.cos_lr,
                     optim=args.optim,
                     init_mode=args.rotate_mode,
@@ -1436,8 +1457,6 @@ def run_full_pipeline(args):
                 )
 
                 del combined
-
-            del all_acts
             logging.info(f"  R1 training complete "
                          f"in {time.time() - _t4:.1f}s")
             cleanup_memory()

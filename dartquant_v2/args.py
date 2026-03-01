@@ -265,7 +265,7 @@ def create_parser() -> argparse.ArgumentParser:
     eval_group.add_argument('--no_lm_eval', action='store_false', dest='lm_eval')
     eval_group.add_argument(
         '--lm_eval_tasks', type=str, nargs='+',
-        default=['hellaswag', 'arc_easy', 'arc_challenge',
+        default=['hellaswag', 'arc_challenge',
                  'winogrande', 'mmlu'],
         help='lm_eval zero-shot tasks')
     eval_group.add_argument('--lm_eval_batch_size', type=int, default=32,

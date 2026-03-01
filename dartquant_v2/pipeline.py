@@ -1245,13 +1245,20 @@ def run_full_pipeline(args):
     # Auto-configure model-dependent quantization parameters
     _auto_configure_quant_params(args, umodel)
 
-    # SWD losses typically need more epochs to converge than whip/kl.
-    # Automatically raise r1_epochs to 20 when the user hasn't overridden it.
-    if args.loss in ('swd_unif', 'swd_gauss') and args.r1_epochs < 20:
-        logging.info(
-            f"  [auto] r1_epochs raised to 20 for loss={args.loss} "
-            f"(was {args.r1_epochs})")
-        args.r1_epochs = 20
+    # SWD losses need more epochs to converge than whip/kl.
+    # Raise R1, R2, and butterfly (R3/R4) epochs to at least 20.
+    if args.loss in ('swd_unif', 'swd_gauss'):
+        for attr, label in (
+            ('r1_epochs',        'R1'),
+            ('r2_epochs',        'R2'),
+            ('butterfly_epochs', 'R3/R4'),
+        ):
+            cur = getattr(args, attr)
+            if cur < 20:
+                logging.info(
+                    f"  [auto] {attr} raised to 20 for loss={args.loss} "
+                    f"(was {cur})")
+                setattr(args, attr, 20)
 
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")

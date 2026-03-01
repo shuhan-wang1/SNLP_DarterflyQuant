@@ -289,7 +289,8 @@ def _replace_norms(model, umodel: UnifiedQuantModel):
 # Activation Collection
 # ============================================================================
 
-def collect_activations(model, calibration_data, target_names, device):
+def collect_activations(model, calibration_data, target_names, device,
+                        max_rows_per_hook=None):
     """Collect input activations at specified module paths.
 
     Args:
@@ -297,6 +298,11 @@ def collect_activations(model, calibration_data, target_names, device):
         calibration_data: Input ids tensor (nsamples, seqlen)
         target_names: List of module paths like "model.layers.0.mlp.up_proj"
         device: Device for computation
+        max_rows_per_hook: If set, randomly subsample each hook output to at
+            most this many rows.  None (default) keeps all rows, matching
+            the official DartQuant which saves full (seqlen, hidden_size)
+            activations per sample.  Set to e.g. 512 to reduce CPU memory
+            usage on machines with < 128 GB RAM.
 
     Returns:
         Dict mapping target_name to activation tensor
@@ -309,8 +315,8 @@ def collect_activations(model, calibration_data, target_names, device):
             tensor = inp[0] if isinstance(inp, tuple) else inp
             if isinstance(tensor, torch.Tensor):
                 flat = tensor.detach().float().cpu().reshape(-1, tensor.shape[-1])
-                if flat.shape[0] > 512:
-                    indices = torch.randperm(flat.shape[0])[:512]
+                if max_rows_per_hook and flat.shape[0] > max_rows_per_hook:
+                    indices = torch.randperm(flat.shape[0])[:max_rows_per_hook]
                     flat = flat[indices]
                 activations[name].append(flat)
         return hook
@@ -1380,6 +1386,10 @@ def run_full_pipeline(args):
             logging.info(f"  R1 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")
 
+            # Free GPU for training — model not needed during R1 optimisation
+            model.cpu()
+            cleanup_memory()
+
             # Concatenate activations from ALL layers into one tensor
             # and train a SINGLE global R1 (paper Algorithm 1).
             all_act_tensors = [
@@ -1416,7 +1426,6 @@ def run_full_pipeline(args):
             del all_acts
             logging.info(f"  R1 training complete "
                          f"in {time.time() - _t4:.1f}s")
-            model.cpu()
             cleanup_memory()
     else:
         logging.info("[4/12] R1 disabled, skipping...")
@@ -1466,6 +1475,10 @@ def run_full_pipeline(args):
             logging.info(f"  R2 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")
 
+            # Free GPU for training — model not needed during R2 optimisation
+            model.cpu()
+            cleanup_memory()
+
             # Train R2 per-layer (greedy), freeing activations after each
             for layer_idx in range(umodel.num_layers):
                 target = all_r2_targets[layer_idx]
@@ -1476,6 +1489,13 @@ def run_full_pipeline(args):
                     )
                     continue
 
+                # Match official R2 batching: bsz=128 (nsamples) so entire
+                # dataset fits in ONE batch.  With accumulation_steps=2 and
+                # only 1 batch/epoch, (0+1)%2≠0 → no optimizer.step() fires.
+                # This means R2 stays at the Hadamard initialisation — which
+                # is exactly what the official DartQuant calibrater produces.
+                r2_batch_size = acts.shape[0]  # all rows in one batch
+
                 key, rotation = train_r2_single_layer(
                     acts=acts,
                     hidden_size=umodel.hidden_size,
@@ -1485,7 +1505,7 @@ def run_full_pipeline(args):
                     lr=args.lr,
                     momentum=args.momentum,
                     epochs=args.r2_epochs,
-                    batch_size=args.batch_size * 2,
+                    batch_size=r2_batch_size,
                     cos_lr=args.cos_lr,
                     optim=args.optim,
                     accumulation_steps=max(args.accumulation_steps, 2),
@@ -1504,7 +1524,6 @@ def run_full_pipeline(args):
             del all_acts
             logging.info(f"  R2 training complete for {len(R2_dict)} layers "
                          f"in {time.time() - _t6:.1f}s")
-            model.cpu()
             cleanup_memory()
     else:
         logging.info("[6/12] R2 disabled, skipping...")

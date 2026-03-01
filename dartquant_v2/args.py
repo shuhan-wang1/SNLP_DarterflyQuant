@@ -150,12 +150,13 @@ def create_parser() -> argparse.ArgumentParser:
     train_group.add_argument('--batch_size', type=int, default=64,
                              help='Training batch size (used by R2 and Butterfly)')
     train_group.add_argument(
-        '--r1_batch_size', type=int, default=2048,
-        help='R1 training batch size. Defaults to 2048 because R1 '
-             'trains a full hidden_size×hidden_size rotation matrix '
-             'with an O(n³) QR decomposition per batch iteration. '
-             'Larger batches amortize the QR cost over more samples '
-             '(2048 → 32× fewer QR calls vs batch_size=64).')
+        '--r1_batch_size', type=int, default=131072,
+        help='R1 training batch size (in activation rows). '
+             'Default 131072 matches the official DartQuant calibrater '
+             '(bsz=64 files × 2048 tokens/file = 131072 rows). '
+             'Each gradient step does one O(n³) QR on the rotation '
+             'matrix and an O(batch×n²) matmul, so large batches '
+             'amortize the QR cost and give smoother gradients.')
     train_group.add_argument('--cos_lr', action='store_true', default=False,
                              help='Use cosine annealing LR scheduler')
     train_group.add_argument('--optim', type=str, default='sgd',
@@ -180,7 +181,7 @@ def create_parser() -> argparse.ArgumentParser:
              'training for the L_recon term.')
 
     # ==== Weight Quantization (for INT4) ====
-    # Defaults match official DartQuant script (dart_gptq_wxaykvz_test.sh)
+    # Defaults match official DartQuant test script (dart_gptq_wxaykvz_test.sh)
     wq_group = parser.add_argument_group('Weight Quantization (INT4)')
     wq_group.add_argument('--w_bits', type=int, default=4,
                           help='Weight quantization bits')
@@ -205,7 +206,7 @@ def create_parser() -> argparse.ArgumentParser:
                                '(None = use same as --w_bits)')
 
     # ==== Activation Quantization ====
-    # Defaults match official DartQuant script (dart_gptq_wxaykvz_test.sh)
+    # Defaults match official DartQuant test script (dart_gptq_wxaykvz_test.sh)
     aq_group = parser.add_argument_group('Activation Quantization')
     aq_group.add_argument('--a_bits', type=int, default=4,
                           help='Activation quantization bits')
@@ -225,21 +226,22 @@ def create_parser() -> argparse.ArgumentParser:
                           help='Disable per-head quantization for o_proj')
 
     # ==== KV-Cache Quantization ====
-    # Defaults match official DartQuant script (dart_gptq_wxaykvz_test.sh)
+    # Defaults match official DartQuant test script (dart_gptq_wxaykvz_test.sh)
     kv_group = parser.add_argument_group('KV-Cache Quantization')
     kv_group.add_argument('--k_bits', type=int, default=4,
                           help='K-cache quantization bits')
-    kv_group.add_argument('--k_groupsize', type=int, default=-1,
-                          help='K-cache group size (-1 per-token; official uses '
-                               'head_dim which is model-dependent, e.g. 128 for '
-                               'Llama-2-7B but 64 for Llama-3.2-1B)')
-    kv_group.add_argument('--k_asym', action='store_true', default=True)
+    kv_group.add_argument('--k_groupsize', type=int, default=128,
+                          help='K-cache group size')
+    kv_group.add_argument('--k_asym', action='store_true', default=True,
+                          help='Asymmetric K-cache quantization')
     kv_group.add_argument('--no_k_asym', action='store_false', dest='k_asym')
     kv_group.add_argument('--k_clip_ratio', type=float, default=1.0)
     kv_group.add_argument('--v_bits', type=int, default=4,
                           help='V-cache quantization bits')
-    kv_group.add_argument('--v_groupsize', type=int, default=128)
-    kv_group.add_argument('--v_asym', action='store_true', default=True)
+    kv_group.add_argument('--v_groupsize', type=int, default=128,
+                          help='V-cache group size')
+    kv_group.add_argument('--v_asym', action='store_true', default=True,
+                          help='Asymmetric V-cache quantization')
     kv_group.add_argument('--no_v_asym', action='store_false', dest='v_asym')
     kv_group.add_argument('--v_clip_ratio', type=float, default=1.0)
 

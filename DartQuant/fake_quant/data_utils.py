@@ -272,17 +272,34 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
     )
 
     if eval_mode:
+        # Match official DartQuant-main/fake_quant/data_utils.py exactly:
+        # - Use only first 1100 validation samples
+        # - Join with space (not double-newline)
+        # - Truncate to 256 * seqlen tokens
+        # - Wrap in TokenizerWrapper (eval_utils.ppl_evaluator expects .input_ids)
         data = load_local_dataset('c4', 'validation')
         texts = _get_texts(data, 'text')
-        testenc = tokenizer("\n\n".join(texts), return_tensors='pt')
-        return testenc
+        valenc = tokenizer(' '.join(texts[:1100]), return_tensors='pt')
+        valenc = valenc.input_ids[:, :(256 * seqlen)]
+
+        class TokenizerWrapper:
+            def __init__(self, input_ids):
+                self.input_ids = input_ids
+        valenc = TokenizerWrapper(valenc)
+        return valenc
     else:
+        # For calibration: use validation split with individual text sampling,
+        # matching the official approach of sampling texts >= seqlen.
         data = load_local_dataset('c4', 'validation')
         texts = _get_texts(data, 'text')
-        trainenc = tokenizer("\n\n".join(texts), return_tensors='pt')
         random.seed(seed)
         trainloader = []
         for _ in range(nsamples):
+            while True:
+                i = random.randint(0, len(texts) - 1)
+                trainenc = tokenizer(texts[i], return_tensors='pt')
+                if trainenc.input_ids.shape[1] >= seqlen:
+                    break
             i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
             j = i + seqlen
             inp = trainenc.input_ids[:, i:j]

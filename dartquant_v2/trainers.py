@@ -196,8 +196,10 @@ def train_r1_single_layer(
     if isinstance(device, str):
         device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
-    # Keep data on GPU to avoid 20K+ CPU→GPU transfers per layer
-    acts = acts.float().to(device)
+    # Keep data on CPU — stream batches to GPU via DataLoader.
+    # This allows handling datasets much larger than GPU memory
+    # (matching the official disk-based DataLoader approach).
+    acts = acts.float()  # CPU
     dataset = TensorDataset(acts)
 
     R1 = R1_QR(hidden_size).to(device)
@@ -209,17 +211,18 @@ def train_r1_single_layer(
 
     R1.train()
     logging.info(f"  Training R1 layer {layer_idx} ({loss_fn_name}, "
-                 f"{len(acts)} samples)")
+                 f"{len(acts)} samples, batch_size={batch_size})")
 
     for epoch in range(epochs):
         loss_log = []
         num_samples = max(1, int(len(dataset) * train_subset_size))
         indices = np.random.choice(len(dataset), size=num_samples, replace=False)
         sampler = RandomSampler(torch.utils.data.Subset(dataset, indices))
-        dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
+        dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size,
+                                pin_memory=True, num_workers=0)
 
         for batch_idx, (batch_samples,) in enumerate(dataloader):
-            batch_samples = batch_samples.reshape(-1, hidden_size)
+            batch_samples = batch_samples.to(device).reshape(-1, hidden_size)
             outputs = R1(batch_samples)
             loss = loss_fn(outputs) / accumulation_steps
             loss.backward()
@@ -280,10 +283,11 @@ def train_r2_single_layer(
             np.nan_to_num(acts, nan=0.0, posinf=65504, neginf=-65504),
             dtype=torch.float32
         )
-    # Keep data on GPU to avoid repeated CPU→GPU transfers
-    acts = acts.float().to(device)
+    # Keep data on CPU — stream batches to GPU via DataLoader.
+    acts = acts.float()  # CPU
     dataset = TensorDataset(acts)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            pin_memory=True, num_workers=0)
 
     R2 = R2_Per_Head(hidden_size, num_heads, kv_heads).to(device)
     R2.matrix.data = _get_multi_head_init(
@@ -294,12 +298,15 @@ def train_r2_single_layer(
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None
 
     R2.train()
-    logging.info(f"  Training R2 layer {layer_idx}...")
+    n_batches = (len(dataset) + batch_size - 1) // batch_size
+    logging.info(f"  Training R2 layer {layer_idx} "
+                 f"({len(acts)} rows, batch_size={batch_size}, "
+                 f"{n_batches} batches/epoch, accum={accumulation_steps})...")
 
     for epoch in range(epochs):
         loss_log = []
         for batch_idx, (batch_samples,) in enumerate(dataloader):
-            batch_samples = batch_samples
+            batch_samples = batch_samples.to(device)
             outputs = R2(batch_samples)
             loss = loss_fn(outputs) / accumulation_steps
             loss.backward()

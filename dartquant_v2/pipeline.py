@@ -1039,11 +1039,12 @@ def evaluate_model(model, args, umodel: UnifiedQuantModel):
 # ---------------------------------------------------------------------------
 
 # Map lm_eval short names → full HF repo paths used by stat_and_download.py
+# NOTE: lm_eval's "mmlu" task uses "hails/mmlu_no_train" which is NOT the
+# same as "cais/mmlu" we downloaded — so mmlu is excluded from defaults.
 _LM_EVAL_DATASET_REMAP = {
     "hellaswag":    "Rowan/hellaswag",
     "ai2_arc":      "allenai/ai2_arc",
     "winogrande":   "allenai/winogrande",
-    "mmlu":         "cais/mmlu",
     "gsm8k":        "openai/gsm8k",
 }
 
@@ -1126,11 +1127,30 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     task_names = args.lm_eval_tasks
     logging.info(f"  lm_eval tasks: {task_names}")
 
+    # Run each task individually so a single dataset failure doesn't
+    # destroy all results.  Patch offline/cache once for the whole block.
     restore = _patch_offline_and_cache()
+    raw_results = {}
+    failed_tasks = []
     try:
-        raw_results = lm_eval.simple_evaluate(hflm, tasks=task_names)['results']
+        for task in task_names:
+            try:
+                logging.info(f"  lm_eval: running {task} ...")
+                res = lm_eval.simple_evaluate(
+                    hflm, tasks=[task])['results']
+                raw_results.update(res)
+            except Exception as e:
+                logging.warning(
+                    f"  lm_eval: task '{task}' FAILED — skipping. "
+                    f"Error: {e}")
+                failed_tasks.append(task)
     finally:
         _restore_offline_and_cache(restore)
+
+    if failed_tasks:
+        logging.warning(
+            f"  lm_eval: {len(failed_tasks)} task(s) skipped: "
+            f"{failed_tasks}")
 
     # Extract accuracy (prefer acc_norm over acc)
     metrics = {}
@@ -1587,7 +1607,11 @@ def run_full_pipeline(args):
 
     if args.lm_eval:
         logging.info("[12/12] Running lm_eval zero-shot benchmarks...")
-        lm_eval_results = evaluate_model_lm_eval(model, args, umodel)
+        try:
+            lm_eval_results = evaluate_model_lm_eval(model, args, umodel)
+        except Exception as e:
+            logging.error(f"  lm_eval crashed — skipping. Error: {e}")
+            lm_eval_results = {}
 
     if not args.ppl_eval and not args.lm_eval:
         logging.info("[12/12] Evaluation disabled.")

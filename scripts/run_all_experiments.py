@@ -66,7 +66,7 @@ KNOWN_MODELS = [
 EVAL_DATASETS = ["wikitext2", "ptb", "c4"]
 
 # Default lm_eval zero-shot tasks
-LM_EVAL_TASKS = ["hellaswag", "arc_challenge", "winogrande", "mmlu"]
+LM_EVAL_TASKS = ["hellaswag", "arc_challenge", "winogrande"]
 
 # Calibration datasets
 CAL_DATASETS = ["wikitext2", "ptb", "c4"]
@@ -133,7 +133,6 @@ def detect_cached_benchmarks(datasets_cache: str) -> list[str]:
     """Check which lm_eval benchmark datasets are available locally."""
     benchmark_markers = {
         "hellaswag":     ["Rowan___hellaswag", "hellaswag"],
-        "mmlu":          ["cais___mmlu", "mmlu"],
         "arc_challenge": ["allenai___ai2_arc", "ai2_arc"],
         "winogrande":    ["allenai___winogrande", "winogrande"],
         "gsm8k":         ["openai___gsm8k", "gsm8k"],

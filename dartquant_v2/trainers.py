@@ -210,16 +210,25 @@ def train_r1_single_layer(
                  if cos_lr else None)
 
     R1.train()
+
+    # Subsample once before training (matching official DartQuant r1_base_qr.py).
+    # The SAME random subset is used for all epochs; RandomSampler shuffles
+    # the order within this subset each epoch.
+    train_data = dataset
+    if train_subset_size < 1.0:
+        num_samples = max(1, int(len(dataset) * train_subset_size))
+        indices = np.random.choice(len(dataset), size=num_samples, replace=False)
+        train_data = torch.utils.data.Subset(dataset, indices.tolist())
+
     logging.info(f"  Training R1 layer {layer_idx} ({loss_fn_name}, "
-                 f"{len(acts)} samples, batch_size={batch_size})")
+                 f"{len(train_data)} samples, batch_size={batch_size})")
+
+    sampler = RandomSampler(train_data)
+    dataloader = DataLoader(train_data, sampler=sampler, batch_size=batch_size,
+                            pin_memory=True, num_workers=0)
 
     for epoch in range(epochs):
         loss_log = []
-        num_samples = max(1, int(len(dataset) * train_subset_size))
-        indices = np.random.choice(len(dataset), size=num_samples, replace=False)
-        sampler = RandomSampler(torch.utils.data.Subset(dataset, indices))
-        dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size,
-                                pin_memory=True, num_workers=0)
 
         for batch_idx, (batch_samples,) in enumerate(dataloader):
             batch_samples = batch_samples.to(device).reshape(-1, hidden_size)

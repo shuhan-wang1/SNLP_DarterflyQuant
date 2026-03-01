@@ -1400,6 +1400,20 @@ def run_full_pipeline(args):
                 logging.error("No R1 activations collected!")
             else:
                 combined = torch.cat(all_act_tensors, dim=0)
+                del all_act_tensors  # free memory before shuffle
+
+                # Shuffle to interleave layers.  The concatenation above
+                # orders rows by layer (layer0 first, then layer1, ...),
+                # but the official DartQuant's per-file dataset naturally
+                # interleaves layers (files are named sample_k_layer_idx_*).
+                # With train_subset_size < 1.0, only a fraction of rows is
+                # used; without shuffling, the subset would be biased
+                # toward early layers, starving later layers of training
+                # signal and producing a poor R1 rotation.
+                perm = torch.randperm(combined.shape[0])
+                combined = combined[perm]
+                del perm
+
                 logging.info(f"  Training single global R1 on "
                              f"{combined.shape[0]} samples from "
                              f"{umodel.num_layers} layers...")
@@ -1421,7 +1435,7 @@ def run_full_pipeline(args):
                     layer_idx=0,
                 )
 
-                del combined, all_act_tensors
+                del combined
 
             del all_acts
             logging.info(f"  R1 training complete "

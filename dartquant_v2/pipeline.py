@@ -1133,16 +1133,23 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     raw_results = {}
     failed_tasks = []
     try:
-        for task in task_names:
+        pbar = tqdm(task_names, desc="lm_eval", unit="task")
+        for task in pbar:
+            pbar.set_description(f"lm_eval [{task}]")
             try:
-                logging.info(f"  lm_eval: running {task} ...")
                 res = lm_eval.simple_evaluate(
                     hflm, tasks=[task])['results']
                 raw_results.update(res)
+                # Show latest accuracy in the bar suffix
+                for t, r in res.items():
+                    acc = r.get('acc_norm,none', r.get('acc,none'))
+                    if acc is not None:
+                        pbar.set_postfix({t: f"{acc*100:.1f}%"})
             except Exception as e:
                 logging.warning(
                     f"  lm_eval: task '{task}' FAILED — skipping. "
                     f"Error: {e}")
+                pbar.set_postfix({task: "FAILED"})
                 failed_tasks.append(task)
     finally:
         _restore_offline_and_cache(restore)
@@ -1237,6 +1244,14 @@ def run_full_pipeline(args):
 
     # Auto-configure model-dependent quantization parameters
     _auto_configure_quant_params(args, umodel)
+
+    # SWD losses typically need more epochs to converge than whip/kl.
+    # Automatically raise r1_epochs to 20 when the user hasn't overridden it.
+    if args.loss in ('swd_unif', 'swd_gauss') and args.r1_epochs < 20:
+        logging.info(
+            f"  [auto] r1_epochs raised to 20 for loss={args.loss} "
+            f"(was {args.r1_epochs})")
+        args.r1_epochs = 20
 
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")

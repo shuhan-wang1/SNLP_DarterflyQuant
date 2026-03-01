@@ -1015,6 +1015,98 @@ def evaluate_model(model, args, umodel: UnifiedQuantModel):
     return results
 
 
+# ---------------------------------------------------------------------------
+# lm_eval offline dataset helpers
+# ---------------------------------------------------------------------------
+# lm_eval internally calls  datasets.load_dataset(<task_dataset_path>, ...)
+# Two problems prevent this from working in an offline environment:
+#
+#   1. The `datasets` library reads HF_DATASETS_OFFLINE at **import time**
+#      into a module-level constant (datasets.config.HF_DATASETS_OFFLINE).
+#      Changing os.environ at runtime has NO effect.
+#
+#   2. lm_eval task YAMLs may use short identifiers (e.g. "hellaswag") that
+#      differ from the full repo paths used when downloading datasets via
+#      stat_and_download.py (e.g. "Rowan/hellaswag").  The cache key is
+#      derived from the repo path ("Rowan___hellaswag"), so a lookup for
+#      "hellaswag" will never find it.
+#
+# The fix below:
+#   a) Patches datasets.config / huggingface_hub.constants at the Python
+#      object level to disable offline mode.
+#   b) Monkey-patches datasets.load_dataset to remap short identifiers to
+#      the full repo paths that match our cache, and injects cache_dir.
+# ---------------------------------------------------------------------------
+
+# Map lm_eval short names → full HF repo paths used by stat_and_download.py
+_LM_EVAL_DATASET_REMAP = {
+    "hellaswag":    "Rowan/hellaswag",
+    "ai2_arc":      "allenai/ai2_arc",
+    "winogrande":   "allenai/winogrande",
+    "mmlu":         "cais/mmlu",
+    "gsm8k":        "openai/gsm8k",
+}
+
+
+def _patch_offline_and_cache():
+    """Disable HF offline flags at module level and return restore info."""
+    import datasets, datasets.config
+
+    restore = {}
+
+    # -- datasets library --------------------------------------------------
+    restore["ds_offline"] = datasets.config.HF_DATASETS_OFFLINE
+    datasets.config.HF_DATASETS_OFFLINE = False
+
+    # -- huggingface_hub ---------------------------------------------------
+    try:
+        import huggingface_hub.constants as _hfhc
+        restore["hub_offline"] = _hfhc.HF_HUB_OFFLINE
+        _hfhc.HF_HUB_OFFLINE = False
+    except Exception:
+        pass
+
+    # -- env vars (for any late sub-imports) --------------------------------
+    for key in ("HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE"):
+        restore[f"env_{key}"] = os.environ.pop(key, None)
+
+    # -- monkey-patch load_dataset -----------------------------------------
+    _orig_load = datasets.load_dataset
+    restore["orig_load"] = _orig_load
+
+    _ds_cache = os.environ.get(
+        "HF_DATASETS_CACHE", "/root/autodl-tmp/datasets")
+
+    def _patched_load(path, *args, **kwargs):
+        path = _LM_EVAL_DATASET_REMAP.get(path, path)
+        kwargs.setdefault("cache_dir", _ds_cache)
+        return _orig_load(path, *args, **kwargs)
+
+    datasets.load_dataset = _patched_load
+
+    return restore
+
+
+def _restore_offline_and_cache(restore):
+    """Undo changes made by _patch_offline_and_cache."""
+    import datasets, datasets.config
+
+    datasets.config.HF_DATASETS_OFFLINE = restore.get("ds_offline", True)
+    datasets.load_dataset = restore.get("orig_load", datasets.load_dataset)
+
+    try:
+        import huggingface_hub.constants as _hfhc
+        if "hub_offline" in restore:
+            _hfhc.HF_HUB_OFFLINE = restore["hub_offline"]
+    except Exception:
+        pass
+
+    for key in ("HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE"):
+        val = restore.get(f"env_{key}")
+        if val is not None:
+            os.environ[key] = val
+
+
 def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     """Run zero-shot benchmarks via lm-evaluation-harness."""
     try:
@@ -1034,21 +1126,11 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     task_names = args.lm_eval_tasks
     logging.info(f"  lm_eval tasks: {task_names}")
 
-    # Temporarily lift offline flags so the datasets library can resolve
-    # dataset identifiers from its local cache.  With HF_DATASETS_OFFLINE=1
-    # the library refuses to even look up cached data because the name-
-    # resolution step is blocked before the cache check.  If data is already
-    # cached (downloaded by scripts/stat_and_download.py) nothing will be
-    # downloaded; the library just needs the flag unset to proceed.
-    _saved_env = {}
-    for key in ("HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"):
-        _saved_env[key] = os.environ.pop(key, None)
+    restore = _patch_offline_and_cache()
     try:
         raw_results = lm_eval.simple_evaluate(hflm, tasks=task_names)['results']
     finally:
-        for key, val in _saved_env.items():
-            if val is not None:
-                os.environ[key] = val
+        _restore_offline_and_cache(restore)
 
     # Extract accuracy (prefer acc_norm over acc)
     metrics = {}

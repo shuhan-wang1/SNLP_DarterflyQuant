@@ -190,7 +190,7 @@ class _RMSN(nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
-        if x.dtype != torch.float32:
+        if x.dtype == torch.float16:
             x = x.to(torch.float32)
         variance = x.pow(2).sum(-1, keepdim=True) / self.mean_dim
         x = x * torch.rsqrt(variance + self.eps)
@@ -1245,20 +1245,57 @@ def run_full_pipeline(args):
     # Auto-configure model-dependent quantization parameters
     _auto_configure_quant_params(args, umodel)
 
-    # SWD losses need more epochs to converge than whip/kl.
-    # Raise R1, R2, and butterfly (R3/R4) epochs to at least 20.
-    if args.loss in ('swd_unif', 'swd_gauss'):
-        for attr, label in (
-            ('r1_epochs',        'R1'),
-            ('r2_epochs',        'R2'),
-            ('butterfly_epochs', 'R3/R4'),
-        ):
+    # ---- SWD / distribution-matching loss auto-tuning ----
+    # SWD losses (swd_unif, swd_gauss) have fundamentally different
+    # optimization dynamics compared to the original Whip loss:
+    #   1. SWD involves SORTING samples, so larger batches give more
+    #      stable rank orderings and cleaner gradients.
+    #   2. Distribution matching converges slower than exponential
+    #      repulsion — needs more epochs.
+    #   3. Cosine annealing prevents overshooting the delicate
+    #      distributional target in the final phase.
+    #   4. Adam's adaptive LR handles the per-dimension gradient
+    #      scale differences inherent in SWD.
+    # KL losses (kl_unif, kl_gauss) share similar characteristics.
+    _DIST_LOSSES = ('swd_unif', 'swd_gauss', 'kl_unif', 'kl_gauss',
+                     'bin_kl_unif', 'bin_kl_nf4')
+    if args.loss in _DIST_LOSSES:
+        # More epochs: R1 needs ≥30 to converge, R2 needs ≥10
+        _epoch_floors = {
+            'r1_epochs': 30,
+            'r2_epochs': 10,
+            'butterfly_epochs': 100,
+        }
+        for attr, floor in _epoch_floors.items():
             cur = getattr(args, attr)
-            if cur < 20:
+            if cur < floor:
                 logging.info(
-                    f"  [auto] {attr} raised to 20 for loss={args.loss} "
+                    f"  [auto] {attr} raised to {floor} for loss={args.loss} "
                     f"(was {cur})")
-                setattr(args, attr, 20)
+                setattr(args, attr, floor)
+
+        # Enable cosine LR — critical for fine convergence
+        if not args.cos_lr:
+            logging.info(
+                f"  [auto] cos_lr enabled for loss={args.loss}")
+            args.cos_lr = True
+
+        # Use Adam optimizer — adaptive LR handles per-dim scale
+        # differences in SWD/KL gradients
+        if args.optim == 'sgd':
+            logging.info(
+                f"  [auto] optimizer changed to adam for loss={args.loss} "
+                f"(was sgd)")
+            args.optim = 'adam'
+
+        # SWD sorting and bin_kl soft-histograms benefit from larger
+        # R1 batch sizes (more stable rank orderings / bin occupancies)
+        if args.loss in ('swd_unif', 'swd_gauss', 'bin_kl_unif',
+                         'bin_kl_nf4') and args.r1_batch_size < 256:
+            logging.info(
+                f"  [auto] r1_batch_size raised to 256 for {args.loss} "
+                f"(was {args.r1_batch_size})")
+            args.r1_batch_size = 256
 
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")

@@ -22,6 +22,9 @@ Usage:
 
   # Dry run (print commands without executing)
   python scripts/run_all_experiments.py --dry-run
+
+  # Skip unquantized FP16 baselines (saves time when PPL ceiling is already known)
+  python scripts/run_all_experiments.py --no-baseline
 """
 
 import os
@@ -36,6 +39,17 @@ from pathlib import Path
 from datetime import datetime
 
 from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Project root resolution — computed from this file's location so that all
+# subprocess calls and path lookups work correctly regardless of which
+# directory the user invokes this script from.
+# ---------------------------------------------------------------------------
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))   # .../scripts/
+_PROJECT_ROOT = os.path.dirname(_SCRIPTS_DIR)                # project root
+_RUN_QUANTIZE = os.path.join(
+    _PROJECT_ROOT, "dartquant_v2", "run_quantize.py"
+)
 
 # ---------------------------------------------------------------------------
 # Cache directory resolution (same logic as run_quantize.py)
@@ -272,11 +286,15 @@ def _model_short(model_name: str) -> str:
 
 def build_command(exp: dict, output_root: str, extra_args: list[str],
                   lm_eval: bool = False) -> list[str]:
-    """Build the CLI command for a single experiment."""
+    """Build the CLI command for a single experiment.
+
+    Uses an absolute path to run_quantize.py so the command is correct
+    regardless of the calling process's working directory.
+    """
     output_dir = os.path.join(output_root, exp["name"])
     cmd = [
         sys.executable,
-        "dartquant_v2/run_quantize.py",
+        _RUN_QUANTIZE,          # absolute path — immune to cwd differences
         "--model", exp["model"],
         "--loss", exp["loss"],
         "--quantizer_type", exp["quantizer_type"],
@@ -288,16 +306,32 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
         cmd.append("--butterfly")
 
     if exp.get("baseline"):
-        # Unquantized: set all bits to 16 to skip quantization entirely
+        # Unquantized FP16: all bits=16 disables quantization entirely.
+        # Rotations are also disabled — the model is evaluated as-is after
+        # LayerNorm fusion (which is mathematically equivalent to the
+        # original model in FP16/BF16).
         cmd.extend([
             "--w_bits", "16", "--a_bits", "16", "--k_bits", "16", "--v_bits", "16",
-            "--no_r1",   # skip R1 rotation training (not needed for baseline)
+            "--no_r1",       # skip R1 rotation training
             "--use_r2", "none",
             "--no_r3", "--no_r4",
         ])
     else:
-        # w4a4kv4 defaults
-        cmd.extend(["--w_bits", "4", "--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
+        # Weight quantization: always W4 for the comparison/ablation groups.
+        cmd.extend(["--w_bits", "4"])
+
+        # Activation + KV-cache quantization:
+        #   NF4 is weight-only quantization (the pipeline skips ActQuantWrapper
+        #   and KV-cache wrappers for non-int4 modes), so passing a_bits/k_bits/
+        #   v_bits=4 would be silently ignored. Pass 16 explicitly to make the
+        #   run's configuration self-documenting and aligned with what the
+        #   pipeline actually does for NF4.
+        #
+        #   INT4: standard W4A4KV4 as per the official DartQuant configuration.
+        if exp.get("quantizer_type") == "nf4":
+            cmd.extend(["--a_bits", "16", "--k_bits", "16", "--v_bits", "16"])
+        else:
+            cmd.extend(["--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
 
     if lm_eval:
         cmd.append("--lm_eval")
@@ -387,12 +421,16 @@ def run_experiment(
     try:
         # Merge stdout + stderr into a single stream so we can parse
         # logging output (which goes to stderr) for stage markers.
+        # cwd=_PROJECT_ROOT ensures relative imports inside run_quantize.py
+        # (e.g. DartQuant/fake_quant) resolve correctly regardless of where
+        # the user invoked this script from.
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,  # line-buffered
+            cwd=_PROJECT_ROOT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
 
@@ -710,6 +748,12 @@ def parse_args():
         "--lm_eval", action="store_true", default=False,
         help="Also run lm_eval zero-shot benchmarks (MMLU, ARC, etc.).",
     )
+    parser.add_argument(
+        "--no-baseline", dest="no_baseline", action="store_true", default=False,
+        help="Skip the unquantized FP16 baseline evaluations. "
+             "Useful when the baseline PPL is already known or when you "
+             "only want to measure the quantized models.",
+    )
 
     return parser.parse_args()
 
@@ -729,6 +773,7 @@ def main():
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
     print(f"  lm_eval:      {args.lm_eval}")
+    print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
     print()
 
@@ -770,8 +815,10 @@ def main():
 
     # ---- Build experiment list ----
     experiments = []
-    if args.group in ("all", "baseline"):
+    if args.group in ("all", "baseline") and not args.no_baseline:
         experiments.extend(build_baseline_experiments(models, eval_datasets))
+    elif args.group in ("all", "baseline") and args.no_baseline:
+        log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(models, eval_datasets))
     if args.group in ("all", "ablation"):

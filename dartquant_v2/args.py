@@ -163,8 +163,11 @@ def create_parser() -> argparse.ArgumentParser:
                              help='Optimizer')
     train_group.add_argument('--accumulation_steps', type=int, default=1,
                              help='Gradient accumulation steps')
-    train_group.add_argument('--train_subset_size', type=float, default=1.0,
-                             help='Fraction of calibration data per epoch')
+    train_group.add_argument('--train_subset_size', type=float, default=0.1,
+                             help='Fraction of calibration data per epoch. '
+                                  'Official DartQuant uses 0.1 (10%%) — each '
+                                  'epoch sees a different random subset, which '
+                                  'acts as stochastic regularisation for QR-Orth.')
     train_group.add_argument(
         '--lambda_recon', type=float, default=0.1,
         help='Weight for the quantization reconstruction loss L_recon in '

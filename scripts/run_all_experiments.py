@@ -196,8 +196,7 @@ def _scan_cache_for_markers(datasets_cache: str, markers_map: dict) -> list[str]
 def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
-    skip_whip: bool = False,
-    whip_only: bool = False,
+    only_losses: list[str] | None = None,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -211,12 +210,9 @@ def build_comparison_experiments(
         {"loss": "swd_unif",  "quantizer_type": "int4", "tag": "swd_unif_int4"},
         {"loss": "swd_gauss", "quantizer_type": "nf4",  "tag": "swd_gauss_nf4"},
     ]
-    if whip_only:
-        configs = [c for c in all_configs if c["loss"] == "whip"]
-        log.info("Running whip experiments only (--whip-only set).")
-    elif skip_whip:
-        configs = [c for c in all_configs if c["loss"] != "whip"]
-        log.info("Skipping whip experiments (--skip-whip set).")
+    if only_losses:
+        configs = [c for c in all_configs if c["loss"] in only_losses]
+        log.info(f"Running only: {only_losses}")
     else:
         configs = all_configs
 
@@ -764,18 +760,15 @@ def parse_args():
              "Useful when the baseline PPL is already known or when you "
              "only want to measure the quantized models.",
     )
-    whip_group = parser.add_mutually_exclusive_group()
-    whip_group.add_argument(
-        "--skip-whip", dest="skip_whip", action="store_true", default=False,
-        help="Skip the whip loss experiments in the comparison group. "
-             "Useful when whip results are already known and you only "
-             "want to re-run SWD/KL loss experiments.",
-    )
-    whip_group.add_argument(
-        "--whip-only", dest="whip_only", action="store_true", default=False,
-        help="Run ONLY the whip loss experiments in the comparison group. "
-             "This is the complement of --skip-whip: it runs exactly the "
-             "experiments that --skip-whip would skip.",
+    parser.add_argument(
+        "--only", dest="only_losses", type=str, nargs="+", default=None,
+        metavar="LOSS",
+        help="Run only the specified loss(es) in the comparison group. "
+             "E.g.: --only whip          (whip only)\n"
+             "       --only swd_unif      (SWD-Uniform only)\n"
+             "       --only swd_gauss     (SWD-Gaussian only)\n"
+             "       --only whip swd_unif (whip + SWD-Uniform)\n"
+             "Valid losses: whip, swd_unif, swd_gauss",
     )
 
     return parser.parse_args()
@@ -844,8 +837,7 @@ def main():
         log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(
-            models, eval_datasets,
-            skip_whip=args.skip_whip, whip_only=args.whip_only))
+            models, eval_datasets, only_losses=args.only_losses))
     if args.group in ("all", "ablation"):
         experiments.extend(build_ablation_experiments(models, eval_datasets))
 

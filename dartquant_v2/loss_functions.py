@@ -17,7 +17,6 @@ Recommended pairings:
 
 import math
 import torch
-import torch.nn.functional as F
 
 
 # ============================================================================
@@ -38,18 +37,29 @@ def calc_whip_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
-    """Sliced Wasserstein Distance to Uniform[-b_j, b_j] per dimension.
+    """Sliced Wasserstein Distance to Uniform[-b, b] with GLOBAL scale.
 
-    For each feature dimension j independently:
-        L_j = (1/B) * sum_i (x_sorted[i,j] - t[i,j])^2
-        where t[i,j] = linspace(-b_j, b_j, B),  b_j = sqrt(3) * RMS(x[:,j])
+    Each feature dimension is sorted independently, then compared against
+    Uniform[-b, b] quantile targets where b = sqrt(3) * RMS_global.
 
-    b_j is computed per-dimension so every dimension is independently pushed
-    toward its own uniform target, enforcing variance uniformity across dims.
+    CRITICAL: b is computed from the GLOBAL RMS (all B×D values pooled),
+    NOT per-dimension RMS.  A single global b ensures every dimension
+    shares the same target range, preventing the rotation from
+    concentrating variance into a few dimensions — which would create
+    devastating outliers for INT4 quantization.
 
-    Reduction: sum over D (feature dims), mean over B (batch).  This matches
-    the Whip loss convention and keeps per-element gradients at O(1/B),
-    independent of D — so the same learning rate works across all model sizes.
+    (Per-dimension b_j allows dimensions to have wildly different scales;
+    diagnostic experiments showed this causes absmax to jump from ~5.6
+    (Hadamard init) to ~32.5, and cross-dim RMS σ from 0.11 to 0.44.)
+
+    Note: the reference document (Section 3.1) actually describes global
+    flattening of all B×D values into one vector with one sort, but
+    per-dimension sort with global b achieves the same effect (all dims
+    constrained to the same scale) while being more memory-efficient.
+
+    Reduction: sum over D (feature dims), mean over B (batch).  This
+    matches the Whip loss convention and keeps per-element gradients at
+    O(1/B), independent of D.
 
     Pairs naturally with INT4 uniform quantizer.
 
@@ -62,11 +72,10 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
     x_sorted, _ = torch.sort(x, dim=0)  # (B, D) — each column sorted independently
 
     with torch.no_grad():
-        rms = torch.sqrt((x ** 2).mean(dim=0))          # (D,) — per-dim RMS
-        b = math.sqrt(3) * rms                           # (D,)
-        # linspace(-1, 1, B) broadcast-scaled by b per dim
+        rms = torch.sqrt((x ** 2).mean())                # scalar — GLOBAL RMS
+        b = math.sqrt(3) * rms                            # scalar — same for ALL dims
         t = torch.linspace(0, 1, steps=B, device=outputs.device)   # (B,)
-        target = b.unsqueeze(0) * (2 * t.unsqueeze(1) - 1)         # (B, D)
+        target = b * (2 * t.unsqueeze(1) - 1)             # (B, D) — uniform scale
 
     # sum over D (features), mean over B (batch) — matches Whip convention
     loss = (x_sorted - target).pow(2).sum(dim=-1).mean()
@@ -74,20 +83,20 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
-    """Gaussian SWD Loss - matches each dimension independently to N(0, sigma_j^2).
+    """Gaussian SWD Loss — matches all dimensions to N(0, σ²) with GLOBAL scale.
 
-    For each feature dimension j independently:
-        L_j = (1/B) * sum_i (x_sorted[i,j] - q[i,j])^2
-        where q[i,j] = Phi^{-1}((i - 0.5)/B) * sigma_j
-              sigma_j = sqrt(mean(x[:,j]^2))
-              Phi^{-1} is the inverse CDF of the standard normal
+    Each feature dimension is sorted independently, then compared against
+    N(0, σ²) quantile targets where σ = global RMS.
 
-    Per-dimension sigma_j so each column is independently driven toward a
-    Gaussian shape, enforcing uniformity of distribution shape across dims.
+    CRITICAL: σ is computed from the GLOBAL RMS (all B×D values pooled),
+    NOT per-dimension RMS.  A single global σ ensures every dimension
+    shares the same target scale, preventing the rotation from
+    concentrating variance into a few dimensions (same pathology as
+    the per-dimension b_j issue in swd_unif — see that docstring).
 
-    Reduction: sum over D (feature dims), mean over B (batch).  This matches
-    the Whip loss convention and keeps per-element gradients at O(1/B),
-    independent of D — so the same learning rate works across all model sizes.
+    Reduction: sum over D (feature dims), mean over B (batch).  This
+    matches the Whip loss convention and keeps per-element gradients at
+    O(1/B), independent of D.
 
     Pairs naturally with NF4 (Normal Float 4-bit) quantizer which assumes
     Gaussian-distributed inputs.
@@ -101,11 +110,11 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
     x_sorted, _ = torch.sort(x, dim=0)  # (B, D) — each column sorted independently
 
     with torch.no_grad():
-        sigma_hat = torch.sqrt((x ** 2).mean(dim=0))    # (D,) — per-dim RMS
+        sigma_hat = torch.sqrt((x ** 2).mean())          # scalar — GLOBAL RMS
         probs = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
         probs = probs.clamp(1e-6, 1 - 1e-6)             # (B,)
         std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) standard normal
-        quantiles = std_quantiles.unsqueeze(1) * sigma_hat.unsqueeze(0)  # (B, D)
+        quantiles = std_quantiles.unsqueeze(1) * sigma_hat  # (B, D) — same scale for all dims
 
     # sum over D (features), mean over B (batch) — matches Whip convention
     loss = (x_sorted - quantiles).pow(2).sum(dim=-1).mean()
@@ -190,14 +199,17 @@ def calc_kl_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
 def calc_bin_kl_unif_loss(outputs: torch.Tensor,
                           num_levels: int = 15,
                           temperature: float = 50.0) -> torch.Tensor:
-    """Discrete-bin KL divergence to Uniform over INT4 quantizer levels, per dimension.
+    """Discrete-bin KL divergence to Uniform over INT4 quantizer levels.
 
-    For each feature dimension j independently, computes KL(P_bins_j || Uniform)
-    where bins are INT4 levels scaled by b_j = sqrt(3) * RMS(x[:,j]).
+    Computes KL(P_bins || Uniform) where bins are INT4 levels scaled by
+    b = sqrt(3) * RMS_global.
 
-    Uses a differentiable soft-histogram via sigmoid.  Per-dimension b_j ensures
-    each column is compared against its own properly-scaled quantiser grid, so
-    all D dimensions are independently driven toward uniform bin occupancy.
+    CRITICAL: b is computed from the GLOBAL RMS (all B×D values pooled),
+    NOT per-dimension RMS.  A single global b ensures every dimension
+    shares the same quantiser grid, preventing variance concentration
+    into a few dimensions (same fix as swd_unif — see that docstring).
+
+    Uses a differentiable soft-histogram via sigmoid.
 
     Args:
         outputs:     Rotated activations, shape (*, D)
@@ -210,23 +222,22 @@ def calc_bin_kl_unif_loss(outputs: torch.Tensor,
     x = outputs.reshape(-1, D).float()   # (B, D)
 
     with torch.no_grad():
-        rms = torch.sqrt((x ** 2).mean(dim=0)).clamp(min=1e-8)  # (D,)
-        b = math.sqrt(3) * rms                                    # (D,)
-        # Vectorised edge construction for all dims simultaneously
-        # base levels in [-1, 1]; scale per dim
+        rms = torch.sqrt((x ** 2).mean()).clamp(min=1e-8)         # scalar — GLOBAL RMS
+        b = math.sqrt(3) * rms                                     # scalar
+        # Vectorised edge construction — same grid for all dims
         base_levels = torch.linspace(-1.0, 1.0, steps=num_levels,
                                      device=x.device)             # (num_levels,)
-        levels = base_levels.unsqueeze(1) * b.unsqueeze(0)        # (num_levels, D)
-        midpoints = (levels[:-1] + levels[1:]) / 2.0              # (num_levels-1, D)
-        step = levels[1] - levels[0]                               # (D,)
-        neg_sentinel = (levels[0] - step).unsqueeze(0)            # (1, D)
-        pos_sentinel = (levels[-1] + step).unsqueeze(0)           # (1, D)
-        edges = torch.cat([neg_sentinel, midpoints, pos_sentinel], dim=0)  # (num_levels+1, D)
+        levels = base_levels * b                                   # (num_levels,) — scalar b
+        midpoints = (levels[:-1] + levels[1:]) / 2.0              # (num_levels-1,)
+        step = levels[1] - levels[0]                               # scalar
+        neg_sentinel = (levels[0] - step).unsqueeze(0)            # (1,)
+        pos_sentinel = (levels[-1] + step).unsqueeze(0)           # (1,)
+        edges = torch.cat([neg_sentinel, midpoints, pos_sentinel], dim=0)  # (num_levels+1,)
 
-    # Soft histogram: x is (B, D), edges is (num_levels+1, D)
-    # sigs[k, i, j] = sigmoid(T * (x[i,j] - edges[k,j]))
+    # Soft histogram: x is (B, D), edges is (num_levels+1,)
+    # sigs[k, i, j] = sigmoid(T * (x[i,j] - edges[k]))
     sigs = torch.sigmoid(
-        temperature * (x.unsqueeze(0) - edges.unsqueeze(1))       # (num_levels+1, B, D)
+        temperature * (x.unsqueeze(0) - edges.view(-1, 1, 1))    # (num_levels+1, B, D)
     )
     bin_probs = (sigs[:-1] - sigs[1:]).mean(dim=1)                # (num_levels, D)
 

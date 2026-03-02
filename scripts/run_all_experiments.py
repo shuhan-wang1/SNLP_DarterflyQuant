@@ -197,6 +197,7 @@ def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
     skip_whip: bool = False,
+    whip_only: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -210,7 +211,10 @@ def build_comparison_experiments(
         {"loss": "swd_unif",  "quantizer_type": "int4", "tag": "swd_unif_int4"},
         {"loss": "swd_gauss", "quantizer_type": "nf4",  "tag": "swd_gauss_nf4"},
     ]
-    if skip_whip:
+    if whip_only:
+        configs = [c for c in all_configs if c["loss"] == "whip"]
+        log.info("Running whip experiments only (--whip-only set).")
+    elif skip_whip:
         configs = [c for c in all_configs if c["loss"] != "whip"]
         log.info("Skipping whip experiments (--skip-whip set).")
     else:
@@ -760,11 +764,18 @@ def parse_args():
              "Useful when the baseline PPL is already known or when you "
              "only want to measure the quantized models.",
     )
-    parser.add_argument(
+    whip_group = parser.add_mutually_exclusive_group()
+    whip_group.add_argument(
         "--skip-whip", dest="skip_whip", action="store_true", default=False,
         help="Skip the whip loss experiments in the comparison group. "
              "Useful when whip results are already known and you only "
              "want to re-run SWD/KL loss experiments.",
+    )
+    whip_group.add_argument(
+        "--whip-only", dest="whip_only", action="store_true", default=False,
+        help="Run ONLY the whip loss experiments in the comparison group. "
+             "This is the complement of --skip-whip: it runs exactly the "
+             "experiments that --skip-whip would skip.",
     )
 
     return parser.parse_args()
@@ -833,7 +844,8 @@ def main():
         log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(
-            models, eval_datasets, skip_whip=args.skip_whip))
+            models, eval_datasets,
+            skip_whip=args.skip_whip, whip_only=args.whip_only))
     if args.group in ("all", "ablation"):
         experiments.extend(build_ablation_experiments(models, eval_datasets))
 

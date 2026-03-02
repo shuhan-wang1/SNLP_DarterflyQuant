@@ -83,23 +83,36 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
-    """Gaussian SWD Loss — matches all dimensions to N(0, σ²) with GLOBAL scale.
+    """Gaussian SWD Loss — per-dim normalisation + N(0,1) shape matching.
 
-    Each feature dimension is sorted independently, then compared against
-    N(0, σ²) quantile targets where σ = global RMS.
+    Each feature dimension is normalised to unit variance (no_grad), then
+    sorted and compared against standard N(0,1) quantiles.
 
-    CRITICAL: σ is computed from the GLOBAL RMS (all B×D values pooled),
-    NOT per-dimension RMS.  A single global σ ensures every dimension
-    shares the same target scale, preventing the rotation from
-    concentrating variance into a few dimensions (same pathology as
-    the per-dimension b_j issue in swd_unif — see that docstring).
+    WHY NOT global sigma (like swd_unif uses global b)?
+    Gaussian quantiles have heavy tails (±4.5σ).  If any dimension's RMS
+    differs from the global RMS, the tail residuals explode, causing
+    loss ~ 10⁶.  Uniform targets are bounded (±b), so global b works for
+    swd_unif but NOT here.
 
-    Reduction: sum over D (feature dims), mean over B (batch).  This
-    matches the Whip loss convention and keeps per-element gradients at
-    O(1/B), independent of D.
+    WHY NOT per-dim sigma (the original code)?
+    Per-dim sigma_j lets the rotation concentrate variance into a few
+    dimensions — each dim matches N(0, sigma_j²) regardless of sigma_j's
+    magnitude, so the loss is blind to cross-dim variance uniformity.
+    This is the same "cheating" pathology that broke swd_unif.
 
-    Pairs naturally with NF4 (Normal Float 4-bit) quantizer which assumes
-    Gaussian-distributed inputs.
+    THE FIX: divide each dimension by its own RMS (no_grad) to get unit-
+    variance, then match against N(0,1).  Gradients still flow through x
+    (only the normalisation constant is detached).  Because the scale is
+    factored out, the rotation CANNOT reduce loss by concentrating
+    variance — it can only reduce loss by improving per-dim Gaussianity,
+    which is exactly what NF4 quantization needs.
+
+    (This mirrors calc_bin_kl_nf4_loss, which already normalises per-dim
+    by absmax before matching against the fixed NF4 codebook.)
+
+    Reduction: sum over D (feature dims), mean over B (batch).
+
+    Pairs naturally with NF4 (Normal Float 4-bit) quantizer.
 
     Reference: docs/report_2_en.md Definition 17
     """
@@ -107,17 +120,22 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
     x = outputs.reshape(-1, D).float()   # (B, D)
     B = x.shape[0]
 
-    x_sorted, _ = torch.sort(x, dim=0)  # (B, D) — each column sorted independently
+    # Per-dim normalisation to unit variance (no_grad on the scale factor).
+    # Gradients still flow through x: ∂loss/∂x[i,j] = (1/rms_j) · ∂loss/∂z[i,j]
+    with torch.no_grad():
+        dim_rms = torch.sqrt((x ** 2).mean(dim=0)).clamp(min=1e-8)  # (D,)
+    x_norm = x / dim_rms.unsqueeze(0)     # (B, D) — unit variance per dim
+
+    x_sorted, _ = torch.sort(x_norm, dim=0)  # (B, D) — sort normalised values
 
     with torch.no_grad():
-        sigma_hat = torch.sqrt((x ** 2).mean())          # scalar — GLOBAL RMS
         probs = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
         probs = probs.clamp(1e-6, 1 - 1e-6)             # (B,)
-        std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) standard normal
-        quantiles = std_quantiles.unsqueeze(1) * sigma_hat  # (B, D) — same scale for all dims
+        std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) — N(0,1) quantiles
+        target = std_quantiles.unsqueeze(1)               # (B, 1) broadcast to (B, D)
 
     # sum over D (features), mean over B (batch) — matches Whip convention
-    loss = (x_sorted - quantiles).pow(2).sum(dim=-1).mean()
+    loss = (x_sorted - target).pow(2).sum(dim=-1).mean()
     return loss
 
 

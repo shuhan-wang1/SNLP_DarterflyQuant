@@ -196,6 +196,7 @@ def _scan_cache_for_markers(datasets_cache: str, markers_map: dict) -> list[str]
 def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
+    skip_whip: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -204,11 +205,16 @@ def build_comparison_experiments(
     - swd_gauss + nf4:  Sliced Wasserstein Distance to Gaussian
     """
     experiments = []
-    configs = [
+    all_configs = [
         {"loss": "whip",      "quantizer_type": "int4", "tag": "whip_int4"},
         {"loss": "swd_unif",  "quantizer_type": "int4", "tag": "swd_unif_int4"},
         {"loss": "swd_gauss", "quantizer_type": "nf4",  "tag": "swd_gauss_nf4"},
     ]
+    if skip_whip:
+        configs = [c for c in all_configs if c["loss"] != "whip"]
+        log.info("Skipping whip experiments (--skip-whip set).")
+    else:
+        configs = all_configs
 
     for model in models:
         for cfg in configs:
@@ -754,6 +760,12 @@ def parse_args():
              "Useful when the baseline PPL is already known or when you "
              "only want to measure the quantized models.",
     )
+    parser.add_argument(
+        "--skip-whip", dest="skip_whip", action="store_true", default=False,
+        help="Skip the whip loss experiments in the comparison group. "
+             "Useful when whip results are already known and you only "
+             "want to re-run SWD/KL loss experiments.",
+    )
 
     return parser.parse_args()
 
@@ -820,7 +832,8 @@ def main():
     elif args.group in ("all", "baseline") and args.no_baseline:
         log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "comparison"):
-        experiments.extend(build_comparison_experiments(models, eval_datasets))
+        experiments.extend(build_comparison_experiments(
+            models, eval_datasets, skip_whip=args.skip_whip))
     if args.group in ("all", "ablation"):
         experiments.extend(build_ablation_experiments(models, eval_datasets))
 

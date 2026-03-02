@@ -47,6 +47,10 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
     b_j is computed per-dimension so every dimension is independently pushed
     toward its own uniform target, enforcing variance uniformity across dims.
 
+    Reduction: sum over D (feature dims), mean over B (batch).  This matches
+    the Whip loss convention and keeps per-element gradients at O(1/B),
+    independent of D — so the same learning rate works across all model sizes.
+
     Pairs naturally with INT4 uniform quantizer.
 
     Reference: docs/SNLP_report_1_v1_en.md Section 3.1
@@ -64,7 +68,8 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
         t = torch.linspace(0, 1, steps=B, device=outputs.device)   # (B,)
         target = b.unsqueeze(0) * (2 * t.unsqueeze(1) - 1)         # (B, D)
 
-    loss = F.mse_loss(x_sorted, target)   # mean over B*D == mean of per-dim MSEs
+    # sum over D (features), mean over B (batch) — matches Whip convention
+    loss = (x_sorted - target).pow(2).sum(dim=-1).mean()
     return loss
 
 
@@ -79,6 +84,10 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
 
     Per-dimension sigma_j so each column is independently driven toward a
     Gaussian shape, enforcing uniformity of distribution shape across dims.
+
+    Reduction: sum over D (feature dims), mean over B (batch).  This matches
+    the Whip loss convention and keeps per-element gradients at O(1/B),
+    independent of D — so the same learning rate works across all model sizes.
 
     Pairs naturally with NF4 (Normal Float 4-bit) quantizer which assumes
     Gaussian-distributed inputs.
@@ -98,7 +107,8 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
         std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) standard normal
         quantiles = std_quantiles.unsqueeze(1) * sigma_hat.unsqueeze(0)  # (B, D)
 
-    loss = F.mse_loss(x_sorted, quantiles)   # mean over B*D == mean of per-dim MSEs
+    # sum over D (features), mean over B (batch) — matches Whip convention
+    loss = (x_sorted - quantiles).pow(2).sum(dim=-1).mean()
     return loss
 
 

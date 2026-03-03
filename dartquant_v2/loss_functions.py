@@ -83,24 +83,28 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 
 def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
-    """Gaussian SWD Loss — per-dim sigma, shape-only matching.
+    """Gaussian SWD Loss — global sigma, shape + scale matching.
 
     Each feature dimension is sorted independently and compared against
-    N(0, sigma_j²) quantile targets where sigma_j = RMS of dim j.
+    N(0, σ²) quantile targets where σ = global RMS (pooled over all B×D).
 
-    WHY per-dim sigma (not global sigma like swd_unif)?
-      Gaussian quantile tails reach ±4.5σ — much wider than Uniform's
-      ±√3·σ ≈ ±1.7σ.  With global sigma, any dim whose RMS differs from
-      the global value produces huge tail residuals → loss ≈ 10⁶.
-      Uniform targets are bounded, so global b works for swd_unif; for
-      Gaussian it does not.
+    WHY global sigma (not per-dim)?
+      Per-dim sigma makes the loss nearly rotation-invariant in high
+      dimensions.  By the Central Limit Theorem, each dimension of the
+      rotated output y_d = Σ_j R[d,j]·x_j is approximately Gaussian
+      regardless of R when D is large.  Per-dim sigma normalises away
+      scale differences, so the loss only measures shape — which is
+      already near-Gaussian for every rotation.  Result: flat loss
+      landscape, no useful gradient, and Adam noise amplification
+      drifts the rotation away from a good initialisation.
 
-    WHY is per-dim sigma OK here but not for swd_unif?
-      NF4 quantization normalises each block by its own absmax before
-      mapping to the NF4 codebook.  Cross-dim RMS uniformity, which is
-      crucial for INT4 (where one absmax covers the whole group), matters
-      far less for NF4.  What matters is that each dim's SHAPE is
-      Gaussian — and per-dim sigma focuses the loss purely on shape.
+      Global sigma adds a cross-dim variance equalisation signal:
+      dimensions whose RMS differs from the global value contribute
+      large residuals, giving the optimiser a clear direction to
+      reduce the loss.  This is the same approach swd_unif uses.
+
+    Standard-normal quantiles are clamped to [-4, 4] to prevent extreme
+    tail residuals when batch size is very large (B > 10k).
 
     Reduction: sum over D (feature dims), mean over B (batch).
 
@@ -115,11 +119,12 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
     x_sorted, _ = torch.sort(x, dim=0)  # (B, D) — each column sorted independently
 
     with torch.no_grad():
-        sigma_hat = torch.sqrt((x ** 2).mean(dim=0)).clamp(min=1e-8)  # (D,) per-dim RMS
+        sigma_hat = torch.sqrt((x ** 2).mean()).clamp(min=1e-8)  # scalar — GLOBAL RMS
         probs = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
         probs = probs.clamp(1e-6, 1 - 1e-6)             # (B,)
         std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) standard normal
-        quantiles = std_quantiles.unsqueeze(1) * sigma_hat.unsqueeze(0)  # (B, D)
+        std_quantiles = std_quantiles.clamp(-4.0, 4.0)   # prevent extreme tails
+        quantiles = std_quantiles.unsqueeze(1) * sigma_hat  # (B, D) — broadcast scalar
 
     # sum over D (features), mean over B (batch) — matches Whip convention
     loss = (x_sorted - quantiles).pow(2).sum(dim=-1).mean()

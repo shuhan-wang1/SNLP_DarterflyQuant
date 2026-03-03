@@ -415,6 +415,7 @@ def train_butterfly(
     weight_matrices: torch.Tensor = None,
     weight_quantizer_type: str = 'none',
     k_factor_mode: str = 'latent',
+    butterfly_init: str = 'identity',
 ) -> nn.Module:
     """Train a Butterfly Givens rotation.
 
@@ -469,6 +470,10 @@ def train_butterfly(
             'latent' (default) - unconstrained matrix + QR decomposition
                 (OR-Orth, same as R1/R2).
             'cayley' - Cayley transform with skew-symmetric param.
+        butterfly_init: Initialization strategy for butterfly angles.
+            'identity' (default, recommended by ButterflyQuant paper) -
+                all angles=0, enabling gradual rotation learning.
+            'hadamard' - warm-start by fitting to a random Hadamard matrix.
 
     Returns:
         Trained ButterflyRotation or ButterflyFactored module
@@ -523,8 +528,13 @@ def train_butterfly(
     else:
         butterfly = ButterflyFactored(dim, k_factor_mode=k_factor_mode).to(device)
 
-    # Warm-start from random Hadamard (mirrors DartQuant's original R3/R4 baseline)
-    _init_butterfly_from_hadamard(butterfly, dim, device)
+    # ButterflyQuant paper (Section 4.4): identity init (θ=0) outperforms
+    # Hadamard init by 6.3% and random init by 13.4%.  Identity enables
+    # "gradual rotation learning through small incremental adjustments."
+    if butterfly_init == 'hadamard':
+        _init_butterfly_from_hadamard(butterfly, dim, device)
+    else:
+        logging.info(f"  Butterfly {label} using identity initialization (θ=0)")
 
     optimizer = _create_optimizer(butterfly.parameters(), optim, lr, momentum)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None

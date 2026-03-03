@@ -24,8 +24,11 @@ class ButterflyRotation(nn.Module):
 
     Structure: K = log2(d) layers of butterfly Givens rotations.
     Each layer l pairs dimensions (i, i + 2^l) and applies independent
-    Givens rotations G(theta) = [[cos(theta), sin(theta)],
-                                  [-sin(theta), cos(theta)]].
+    Givens rotations G(theta) = [[cos(theta), -sin(theta)],
+                                  [sin(theta),  cos(theta)]].
+
+    This matches the standard rotation convention used in ButterflyQuant
+    (Eq 7): counter-clockwise rotation by angle theta.
 
     Args:
         dim: Dimension of the rotation matrix. Must be a power of 2.
@@ -104,9 +107,11 @@ class ButterflyRotation(nn.Module):
         xi = x[:, i_idx]  # (batch, dim//2)
         xj = x[:, j_idx]  # (batch, dim//2)
 
-        # Givens rotation: [cos, sin; -sin, cos] @ [xi; xj]
-        new_xi = cos_t * xi + sin_t * xj
-        new_xj = -sin_t * xi + cos_t * xj
+        # Givens rotation (ButterflyQuant Eq 7):
+        #   [cos θ, -sin θ] @ [xi]
+        #   [sin θ,  cos θ]   [xj]
+        new_xi = cos_t * xi - sin_t * xj
+        new_xj = sin_t * xi + cos_t * xj
 
         result = x.clone()
         result[:, i_idx] = new_xi
@@ -138,7 +143,8 @@ class ButterflyRotation(nn.Module):
     def _apply_layer_inverse(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Apply the transpose of one butterfly layer.
 
-        G(theta)^T = [[cos, -sin], [sin, cos]] (negate the off-diagonal sin terms).
+        G(theta)^T = [[cos, sin], [-sin, cos]] (negate the off-diagonal terms
+        relative to the forward Givens rotation).
         """
         thetas = self.angles[layer_idx]  # (dim//2,)
         cos_t = torch.cos(thetas)
@@ -150,9 +156,11 @@ class ButterflyRotation(nn.Module):
         xi = x[:, i_idx]
         xj = x[:, j_idx]
 
-        # Transposed Givens: [cos, -sin; sin, cos] @ [xi; xj]
-        new_xi = cos_t * xi - sin_t * xj
-        new_xj = sin_t * xi + cos_t * xj
+        # Transposed Givens (G^T):
+        #   [ cos θ, sin θ] @ [xi]
+        #   [-sin θ, cos θ]   [xj]
+        new_xi = cos_t * xi + sin_t * xj
+        new_xj = -sin_t * xi + cos_t * xj
 
         result = x.clone()
         result[:, i_idx] = new_xi
@@ -318,21 +326,20 @@ class ButterflyFactored(nn.Module):
 
         # Apply learnable K-factor to the K dimension
         # x: (batch, K, m) -> Q_K @ x over K dim
+        # This is equivalent to the Kronecker product (Q_K ⊗ B_m) @ vec(x).
+        # Both Q_K and B_m are orthogonal, so the composite is orthogonal
+        # by construction — no normalization needed (ButterflyQuant Eq 14).
         Q_K = self._get_Q().to(x.dtype)
         x = torch.einsum('ij,bjk->bik', Q_K, x)
-
-        # Normalize
-        x = x / math.sqrt(self.total_dim)
 
         return x.reshape(orig_shape)
 
     def inverse_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply R^T (inverse rotation) to input tensor.
 
-        Reverses the three steps of forward():
-          1. Undo normalization (multiply by sqrt(total_dim))
-          2. Apply Q_K^T to the K dimension (orthogonal)
-          3. Apply butterfly.inverse_forward to the m dimension
+        Reverses the two steps of forward():
+          1. Apply Q_K^T to the K dimension (orthogonal inverse)
+          2. Apply butterfly.inverse_forward to the m dimension
         """
         if self.K == 1:
             return self.butterfly.inverse_forward(x)
@@ -340,14 +347,11 @@ class ButterflyFactored(nn.Module):
         orig_shape = x.shape
         x = x.reshape(-1, self.K, self.m)
 
-        # Step 1: undo normalization
-        x = x * math.sqrt(self.total_dim)
-
-        # Step 2: apply Q_K^T over the K dimension (Q is orthogonal)
+        # Step 1: apply Q_K^T over the K dimension (Q is orthogonal)
         Q_K = self._get_Q().to(x.dtype)
         x = torch.einsum('ji,bjk->bik', Q_K, x)  # Q_K.T
 
-        # Step 3: apply inverse butterfly to each m-dim sub-block
+        # Step 2: apply inverse butterfly to each m-dim sub-block
         batch = x.shape[0]
         x = x.reshape(-1, self.m)
         x = self.butterfly.inverse_forward(x)

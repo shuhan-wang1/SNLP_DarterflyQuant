@@ -804,8 +804,10 @@ def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
     Hadamard rotation to Q/K after RoPE.
     """
     # R3 needs QKRotationWrapper even without K-cache quantization.
-    # Butterfly R3 is handled separately via setup_butterfly_r3_online.
-    _needs_r3_wrapper = args.use_r3 and not (args.butterfly or args.butterfly_only)
+    # When butterfly is enabled, the wrapper is still created (for K-cache
+    # quantization), but use_r3 is False (Hadamard skipped); the learned
+    # butterfly rotation is injected later by setup_butterfly_r3_online().
+    _needs_r3_wrapper = args.use_r3
     if args.k_bits >= 16 and not _needs_r3_wrapper:
         return
     if not umodel.has_rope:
@@ -819,12 +821,15 @@ def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
         logging.warning("Cannot set up K-cache quantization (missing imports)")
         return
 
+    # For butterfly, disable Hadamard inside QKRotationWrapper; the learned
+    # butterfly rotation is applied via setup_butterfly_r3_online() instead.
+    _use_hadamard_r3 = args.use_r3 and not (args.butterfly or args.butterfly_only)
     k_quant_config = {
         'k_bits': args.k_bits,
         'k_groupsize': args.k_groupsize,
         'k_sym': not args.k_asym,
         'k_clip_ratio': args.k_clip_ratio,
-        'use_r3': _needs_r3_wrapper,
+        'use_r3': _use_hadamard_r3,
     }
 
     layers = umodel.get_layers()
@@ -911,24 +916,74 @@ def configure_activation_quantization(model, args, umodel: UnifiedQuantModel):
 
 
 def setup_butterfly_r3_online(model, butterfly_r3, umodel: UnifiedQuantModel):
-    """Register butterfly R3 as online rotation for Q/K.
+    """Inject learned butterfly R3 into QKRotationWrapper for Q/K rotation.
 
-    When butterfly is used, we replace the Hadamard transform in
-    QKRotationWrapper with the learned butterfly.
+    The QKRotationWrapper (created by configure_kcache_quantization) normally
+    applies a fixed Hadamard to Q/K.  When butterfly is enabled, the Hadamard
+    is disabled (use_r3=False inside the wrapper) and this function wraps the
+    RoPE callable so that the learned butterfly rotation is applied instead.
+
+    Must be called AFTER configure_kcache_quantization().
+
+    The butterfly matrix B is orthogonal by construction (product of Givens
+    rotations), so no 1/sqrt(d) scaling is needed — unlike the Hadamard path
+    which requires explicit normalization (ButterflyQuant paper, Section 3.2).
     """
     R3_matrix = butterfly_r3.get_matrix().float()
 
-    # Register as a pre-forward hook on attention modules
     layers = umodel.get_layers()
+    rope_fn_name = umodel.rope_function_name
+    wrapper_attr = f"{rope_fn_name}_qk_rotation_wrapper"
+    n_patched = 0
+
     for layer in layers:
         self_attn = umodel.get_self_attn(layer)
-        # Store the R3 matrix as a buffer
+
+        # Store the R3 matrix as a buffer (for serialization / inspection)
         if not hasattr(self_attn, '_butterfly_r3'):
             self_attn.register_buffer(
                 '_butterfly_r3', R3_matrix.to(DEV)
             )
 
-    logging.info("Butterfly R3 registered for online Q/K rotation.")
+        # Patch QKRotationWrapper.func to apply butterfly after RoPE
+        wrapper = getattr(self_attn, wrapper_attr, None)
+        if wrapper is None:
+            logging.warning(
+                f"  setup_butterfly_r3_online: QKRotationWrapper not found "
+                f"on {type(self_attn).__name__}; butterfly R3 will NOT be "
+                f"applied for this layer."
+            )
+            continue
+
+        # Wrap the original RoPE callable: after RoPE produces (q, k),
+        # apply the learned butterfly rotation to both.
+        _orig_func = wrapper.func
+        _R3 = R3_matrix.to(DEV)
+
+        class _ButterflyRopeFunc:
+            """Wraps the RoPE function to apply butterfly R3 to Q/K."""
+            __slots__ = ('_orig', '_R3')
+
+            def __init__(self, orig, R3):
+                self._orig = orig
+                self._R3 = R3
+
+            def __call__(self, *args, **kwargs):
+                q, k = self._orig(*args, **kwargs)
+                dtype = q.dtype
+                # Butterfly is orthogonal → no scale factor needed
+                R3 = self._R3.to(dtype)
+                q = q @ R3
+                k = k @ R3
+                return q, k
+
+        wrapper.func = _ButterflyRopeFunc(_orig_func, _R3)
+        n_patched += 1
+
+    logging.info(
+        f"Butterfly R3 injected into {n_patched} QKRotationWrapper(s) "
+        f"for online Q/K rotation."
+    )
 
 
 def setup_butterfly_r4_online(model, butterfly_r4, umodel: UnifiedQuantModel):
@@ -1647,6 +1702,7 @@ def run_full_pipeline(args):
                     lambda_recon=args.lambda_recon,
                     quant_block_size=args.quant_block_size,
                     k_factor_mode=args.k_factor_mode,
+                    butterfly_init=args.butterfly_init,
                 )
                 del r3_acts
 
@@ -1676,6 +1732,7 @@ def run_full_pipeline(args):
                     quant_block_size=args.quant_block_size,
                     weight_matrices=r4_weight_bank,
                     weight_quantizer_type=args.quantizer_type,
+                    butterfly_init=args.butterfly_init,
                     k_factor_mode=args.k_factor_mode,
                 )
                 del r4_acts, r4_weight_bank
@@ -1718,6 +1775,7 @@ def run_full_pipeline(args):
                     lambda_recon=args.lambda_recon,
                     quant_block_size=args.quant_block_size,
                     k_factor_mode=args.k_factor_mode,
+                    butterfly_init=args.butterfly_init,
                 )
                 del r3_acts
 
@@ -1752,10 +1810,8 @@ def run_full_pipeline(args):
     # inside each ActQuantWrapper with Linear4bit, preserving the rotation logic.
     add_quantization_wrappers(model, args, umodel)
 
-    # Setup butterfly online components (R3 and/or R4)
+    # Setup butterfly R4 online (R3 is deferred to after QKRotationWrapper)
     if args.butterfly or args.butterfly_only:
-        if butterfly_r3 is not None:
-            setup_butterfly_r3_online(model, butterfly_r3, umodel)
         # R4 butterfly online only when full --butterfly (not --butterfly_only)
         if args.butterfly and butterfly_r4 is not None:
             setup_butterfly_r4_online(model, butterfly_r4, umodel)
@@ -1776,6 +1832,12 @@ def run_full_pipeline(args):
     # For NF4 with k_bits=16 + use_r3, adds QKRotationWrapper for R3
     # Hadamard rotation without K-cache quantization.
     configure_kcache_quantization(model, args, umodel)
+
+    # Butterfly R3: inject learned rotation into QKRotationWrapper.
+    # Must run AFTER configure_kcache_quantization (which creates the wrapper).
+    if (args.butterfly or args.butterfly_only) and butterfly_r3 is not None:
+        setup_butterfly_r3_online(model, butterfly_r3, umodel)
+
     logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========

@@ -102,6 +102,13 @@ def create_parser() -> argparse.ArgumentParser:
              'matrix solve per forward pass.')
     parser.set_defaults(k_factor_mode='latent')
     rot_group.add_argument(
+        '--butterfly_init', type=str, default='identity',
+        choices=['identity', 'hadamard'],
+        help='Butterfly angle initialization strategy. '
+             '"identity" (default, recommended by ButterflyQuant paper): '
+             'all angles=0, enabling gradual rotation learning. '
+             '"hadamard": warm-start by fitting to a random Hadamard matrix.')
+    rot_group.add_argument(
         '--use_r1', action='store_true', default=True,
         help='Use R1 global rotation')
     rot_group.add_argument(

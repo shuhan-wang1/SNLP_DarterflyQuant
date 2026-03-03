@@ -73,11 +73,17 @@ def create_parser() -> argparse.ArgumentParser:
 
     # ==== Rotation Options ====
     rot_group = parser.add_argument_group('Rotation Options')
-    rot_group.add_argument(
+    bf_group = rot_group.add_mutually_exclusive_group()
+    bf_group.add_argument(
         '--butterfly', action='store_true', default=False,
         help='Use learnable Butterfly Givens rotations for R3 and R4 '
              'instead of fixed random Hadamard. Only affects R3/R4, '
              'never R1/R2.')
+    bf_group.add_argument(
+        '--butterfly_only', action='store_true', default=False,
+        help='Use learnable Butterfly Givens rotation for R3 only. '
+             'R4 uses fixed Hadamard. R1/R2 train normally. '
+             'Mutually exclusive with --butterfly.')
     k_factor_mode = rot_group.add_mutually_exclusive_group()
     k_factor_mode.add_argument(
         '--latent', action='store_const', const='latent',

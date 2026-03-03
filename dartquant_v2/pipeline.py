@@ -798,8 +798,15 @@ def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
 
     In the official DartQuant code (main_for_test.py lines 193-210) K-cache
     quantization is set up AFTER weight quantization and activation config.
+
+    Even when k_bits >= 16 (no K-cache quantization), we still need
+    QKRotationWrapper if R3 is enabled — the wrapper applies the online
+    Hadamard rotation to Q/K after RoPE.
     """
-    if args.k_bits >= 16:
+    # R3 needs QKRotationWrapper even without K-cache quantization.
+    # Butterfly R3 is handled separately via setup_butterfly_r3_online.
+    _needs_r3_wrapper = args.use_r3 and not (args.butterfly or args.butterfly_only)
+    if args.k_bits >= 16 and not _needs_r3_wrapper:
         return
     if not umodel.has_rope:
         logging.warning("  K-cache quantization requires RoPE; skipping")
@@ -817,7 +824,7 @@ def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
         'k_groupsize': args.k_groupsize,
         'k_sym': not args.k_asym,
         'k_clip_ratio': args.k_clip_ratio,
-        'use_r3': args.use_r3 and not args.butterfly,
+        'use_r3': _needs_r3_wrapper,
     }
 
     layers = umodel.get_layers()
@@ -829,8 +836,11 @@ def configure_kcache_quantization(model, args, umodel: UnifiedQuantModel):
             config=model.config,
             **k_quant_config
         )
-    logging.info(f"  K-cache quantization configured: K{args.k_bits} "
-                 f"groupsize={args.k_groupsize}")
+    if args.k_bits < 16:
+        logging.info(f"  K-cache quantization configured: K{args.k_bits} "
+                     f"groupsize={args.k_groupsize}")
+    else:
+        logging.info(f"  QKRotationWrapper added for R3 (k_bits=16, no K-cache quant)")
 
 
 def configure_activation_quantization(model, args, umodel: UnifiedQuantModel):
@@ -1677,6 +1687,47 @@ def run_full_pipeline(args):
         if butterfly_r4 is not None:
             apply_r4_butterfly(model, butterfly_r4, umodel)
         logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
+    elif args.butterfly_only:
+        # Butterfly R3 only — R4 uses Hadamard, R1/R2 trained normally.
+        logging.info("[8/12] Training Butterfly R3 (R4=Hadamard)...")
+        _t8 = time.time()
+        model.to(DEV)
+
+        # Auto-select KL divergence loss for R3 based on quantizer type.
+        _bf_loss = 'kl_unif' if args.quantizer_type == 'int4' else 'kl_gauss'
+        logging.info(f"  Butterfly R3 distribution loss: {_bf_loss} "
+                     f"(auto-selected for {args.quantizer_type})")
+
+        # Train Butterfly R3 (for Q/K after RoPE)
+        if args.use_r3:
+            logging.info("  Training Butterfly R3...")
+            r3_acts = collect_r3_activations(model, calib_data, umodel, DEV)
+            if r3_acts is not None:
+                butterfly_r3 = train_butterfly(
+                    activations=r3_acts,
+                    dim=umodel.head_dim,
+                    loss_fn_name=_bf_loss,
+                    label="R3",
+                    lr=args.lr,
+                    momentum=args.momentum,
+                    epochs=args.butterfly_epochs,
+                    batch_size=args.batch_size,
+                    cos_lr=True,
+                    optim=args.optim,
+                    quantizer_type=args.quantizer_type,
+                    lambda_recon=args.lambda_recon,
+                    quant_block_size=args.quant_block_size,
+                    k_factor_mode=args.k_factor_mode,
+                )
+                del r3_acts
+
+        model.cpu()
+        cleanup_memory()
+
+        # R4 uses Hadamard (not butterfly) — bake into down_proj weights
+        if args.use_r4:
+            apply_r4_hadamard(model, umodel)
+        logging.info(f"  Step 8 done in {time.time() - _t8:.1f}s")
     else:
         logging.info("[8/12] Using Hadamard for R3/R4...")
         _t8 = time.time()
@@ -1694,17 +1745,20 @@ def run_full_pipeline(args):
     # K-cache and activation bits must NOT be active during GPTQ.
     logging.info("[9/12] Adding quantization wrappers (Phase 1: wrappers + Hadamard)...")
     _t = time.time()
-    if args.quantizer_type == 'int4':
-        add_quantization_wrappers(model, args, umodel)
+    # ActQuantWrapper is needed for BOTH int4 and nf4:
+    #   - INT4: Hadamard rotation + activation quantization
+    #   - NF4:  Hadamard rotation only (a_bits=16 → quantization is no-op)
+    # For NF4, apply_nf4_to_model() (Step 10) will replace the inner nn.Linear
+    # inside each ActQuantWrapper with Linear4bit, preserving the rotation logic.
+    add_quantization_wrappers(model, args, umodel)
 
-        # Setup butterfly online components
-        if args.butterfly:
-            if butterfly_r3 is not None:
-                setup_butterfly_r3_online(model, butterfly_r3, umodel)
-            if butterfly_r4 is not None:
-                setup_butterfly_r4_online(model, butterfly_r4, umodel)
-    else:
-        logging.info("  NF4 mode: skipping activation quantization wrappers")
+    # Setup butterfly online components (R3 and/or R4)
+    if args.butterfly or args.butterfly_only:
+        if butterfly_r3 is not None:
+            setup_butterfly_r3_online(model, butterfly_r3, umodel)
+        # R4 butterfly online only when full --butterfly (not --butterfly_only)
+        if args.butterfly and butterfly_r4 is not None:
+            setup_butterfly_r4_online(model, butterfly_r4, umodel)
     logging.info(f"  Step 9 done in {time.time() - _t:.1f}s")
 
     # ======== Step 10: Weight Quantization ========
@@ -1715,12 +1769,13 @@ def run_full_pipeline(args):
     run_weight_quantization(model, args, umodel, tokenizer)
 
     # Phase 2: activation quantization bits (AFTER weight quantization)
-    if args.quantizer_type == 'int4':
-        configure_activation_quantization(model, args, umodel)
+    # For NF4 with a_bits=16, this is a no-op (returns early).
+    configure_activation_quantization(model, args, umodel)
 
     # Phase 3: K-cache quantization (AFTER weight quantization)
-    if args.quantizer_type == 'int4':
-        configure_kcache_quantization(model, args, umodel)
+    # For NF4 with k_bits=16 + use_r3, adds QKRotationWrapper for R3
+    # Hadamard rotation without K-cache quantization.
+    configure_kcache_quantization(model, args, umodel)
     logging.info(f"  Step 10 done in {time.time() - _t:.1f}s")
 
     # ======== Step 11: Move to device ========
@@ -1786,6 +1841,7 @@ def run_full_pipeline(args):
                 'loss': args.loss,
                 'quantizer_type': args.quantizer_type,
                 'butterfly': args.butterfly,
+                'butterfly_only': args.butterfly_only,
             },
         }
         if butterfly_r3 is not None:

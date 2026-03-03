@@ -19,6 +19,9 @@ Usage:
   # Enable learnable Butterfly R3/R4 (instead of Hadamard)
   python scripts/run_all_experiments.py --only swd_gauss --butterfly
 
+  # Butterfly R3 only (R4=Hadamard, R1/R2 trained normally)
+  python scripts/run_all_experiments.py --only swd_gauss --butterfly-only
+
   # Specify models explicitly (skip auto-detection)
   python scripts/run_all_experiments.py --models meta-llama/Llama-3.2-1B
 
@@ -200,6 +203,7 @@ def build_comparison_experiments(
     eval_datasets: list[str],
     only_losses: list[str] | None = None,
     butterfly: bool = False,
+    butterfly_only: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -210,6 +214,9 @@ def build_comparison_experiments(
     When butterfly=True, learnable Butterfly Givens rotations are used for
     R3/R4 instead of fixed Hadamard.  This is orthogonal to the loss choice
     (loss controls R1/R2 training; butterfly controls R3/R4).
+
+    When butterfly_only=True, learnable Butterfly is used for R3 only.
+    R4 stays Hadamard. R1/R2 train normally with the selected loss.
     """
     experiments = []
     all_configs = [
@@ -223,7 +230,8 @@ def build_comparison_experiments(
     else:
         configs = all_configs
 
-    bf_suffix = "_bf" if butterfly else ""
+    # Tag suffix: _bf (full butterfly R3+R4), _bf3 (butterfly R3 only)
+    bf_suffix = "_bf" if butterfly else ("_bf3" if butterfly_only else "")
     for model in models:
         for cfg in configs:
             exp = {
@@ -233,6 +241,7 @@ def build_comparison_experiments(
                 "loss": cfg["loss"],
                 "quantizer_type": cfg["quantizer_type"],
                 "butterfly": butterfly,
+                "butterfly_only": butterfly_only,
                 "eval_datasets": eval_datasets,
             }
             experiments.append(exp)
@@ -291,6 +300,8 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
 
     if exp["butterfly"]:
         cmd.append("--butterfly")
+    elif exp.get("butterfly_only"):
+        cmd.append("--butterfly_only")
 
     if exp.get("baseline"):
         # Unquantized FP16: all bits=16 disables quantization entirely.
@@ -308,11 +319,10 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
         cmd.extend(["--w_bits", "4"])
 
         # Activation + KV-cache quantization:
-        #   NF4 is weight-only quantization (the pipeline skips ActQuantWrapper
-        #   and KV-cache wrappers for non-int4 modes), so passing a_bits/k_bits/
-        #   v_bits=4 would be silently ignored. Pass 16 explicitly to make the
-        #   run's configuration self-documenting and aligned with what the
-        #   pipeline actually does for NF4.
+        #   NF4 uses the same ActQuantWrapper/QKRotationWrapper infrastructure
+        #   as INT4, but with a_bits=16 / k_bits=16 / v_bits=16 (weight-only
+        #   quantization). The wrappers still apply online Hadamard rotations
+        #   (R3/R4) — only the activation/KV-cache quantization is skipped.
         #
         #   INT4: standard W4A4KV4 as per the official DartQuant configuration.
         if exp.get("quantizer_type") == "nf4":
@@ -371,9 +381,14 @@ def run_experiment(
     quantization stage.
     """
     model_short = _model_short(exp['model'])
+    if exp['butterfly']:
+        _bf_tag = 'BF'
+    elif exp.get('butterfly_only'):
+        _bf_tag = 'BF3'
+    else:
+        _bf_tag = 'Had'
     exp_label = (
-        f"{model_short} | {exp['loss']} | {exp['quantizer_type']}"
-        f"{' | BF' if exp['butterfly'] else ' | Had'}"
+        f"{model_short} | {exp['loss']} | {exp['quantizer_type']} | {_bf_tag}"
     )
 
     tqdm.write("")
@@ -751,13 +766,22 @@ def parse_args():
              "       --only whip swd_unif (whip + SWD-Uniform)\n"
              "Valid losses: whip, swd_unif, swd_gauss",
     )
-    parser.add_argument(
+    bf_group = parser.add_mutually_exclusive_group()
+    bf_group.add_argument(
         "--butterfly", action="store_true", default=False,
         help="Use learnable Butterfly Givens rotations for R3/R4 instead "
              "of fixed Hadamard.  This is orthogonal to the loss choice "
              "(loss controls R1/R2; butterfly controls R3/R4).  "
              "Combines with --only to test specific losses with butterfly. "
              "E.g.: --only swd_gauss --butterfly",
+    )
+    bf_group.add_argument(
+        "--butterfly-only", dest="butterfly_only",
+        action="store_true", default=False,
+        help="Use learnable Butterfly Givens rotation for R3 only. "
+             "R4 uses fixed Hadamard. R1/R2 train normally with the "
+             "selected loss.  Combines with --only to select loss. "
+             "E.g.: --butterfly-only --only swd_gauss",
     )
 
     return parser.parse_args()
@@ -778,6 +802,7 @@ def main():
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
     print(f"  Butterfly:    {args.butterfly}")
+    print(f"  BF R3 only:  {args.butterfly_only}")
     print(f"  lm_eval:      {args.lm_eval}")
     print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
@@ -829,7 +854,8 @@ def main():
         experiments.extend(build_comparison_experiments(
             models, eval_datasets,
             only_losses=args.only_losses,
-            butterfly=args.butterfly))
+            butterfly=args.butterfly,
+            butterfly_only=args.butterfly_only))
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):

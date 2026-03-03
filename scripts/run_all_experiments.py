@@ -318,17 +318,10 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
         # Weight quantization: always W4 for comparison experiments.
         cmd.extend(["--w_bits", "4"])
 
-        # Activation + KV-cache quantization:
-        #   NF4 uses the same ActQuantWrapper/QKRotationWrapper infrastructure
-        #   as INT4, but with a_bits=16 / k_bits=16 / v_bits=16 (weight-only
-        #   quantization). The wrappers still apply online Hadamard rotations
-        #   (R3/R4) — only the activation/KV-cache quantization is skipped.
-        #
-        #   INT4: standard W4A4KV4 as per the official DartQuant configuration.
-        if exp.get("quantizer_type") == "nf4":
-            cmd.extend(["--a_bits", "16", "--k_bits", "16", "--v_bits", "16"])
-        else:
-            cmd.extend(["--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
+        # Activation + KV-cache quantization: W4A4KV4 for all quantizer types.
+        # Both INT4 and NF4 use ActQuantWrapper + QKRotationWrapper, so
+        # activation and KV-cache quantization works uniformly.
+        cmd.extend(["--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
 
     if lm_eval:
         cmd.append("--lm_eval")

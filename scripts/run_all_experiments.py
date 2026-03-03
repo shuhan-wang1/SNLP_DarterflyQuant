@@ -3,19 +3,21 @@
 Unified One-Click Experiment Runner for DartQuant v2.
 
 Automatically discovers locally cached models and datasets, then runs all
-comparison and ablation experiments.
+comparison experiments.
 
 Experiment groups:
   1. Loss Function Comparison:  SWD-Gaussian vs SWD-Uniform vs Whip
-  2. Butterfly Ablation:        Butterfly R3/R4 vs Hadamard R3/R4
 
 Usage:
   # Run everything (auto-detect models & datasets)
   python scripts/run_all_experiments.py
 
-  # Filter to specific experiment group
-  python scripts/run_all_experiments.py --group comparison
-  python scripts/run_all_experiments.py --group ablation
+  # Run only specific loss(es)
+  python scripts/run_all_experiments.py --only swd_gauss
+  python scripts/run_all_experiments.py --only whip swd_unif
+
+  # Enable learnable Butterfly R3/R4 (instead of Hadamard)
+  python scripts/run_all_experiments.py --only swd_gauss --butterfly
 
   # Specify models explicitly (skip auto-detection)
   python scripts/run_all_experiments.py --models meta-llama/Llama-3.2-1B
@@ -197,12 +199,17 @@ def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
     only_losses: list[str] | None = None,
+    butterfly: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
     - whip + int4:      Original DartQuant exponential repulsion
     - swd_unif + int4:  Sliced Wasserstein Distance to Uniform
     - swd_gauss + nf4:  Sliced Wasserstein Distance to Gaussian
+
+    When butterfly=True, learnable Butterfly Givens rotations are used for
+    R3/R4 instead of fixed Hadamard.  This is orthogonal to the loss choice
+    (loss controls R1/R2 training; butterfly controls R3/R4).
     """
     experiments = []
     all_configs = [
@@ -216,41 +223,15 @@ def build_comparison_experiments(
     else:
         configs = all_configs
 
+    bf_suffix = "_bf" if butterfly else ""
     for model in models:
         for cfg in configs:
             exp = {
-                "name": f"comparison__{_model_short(model)}__{cfg['tag']}",
+                "name": f"comparison__{_model_short(model)}__{cfg['tag']}{bf_suffix}",
                 "group": "comparison",
                 "model": model,
                 "loss": cfg["loss"],
                 "quantizer_type": cfg["quantizer_type"],
-                "butterfly": False,
-                "eval_datasets": eval_datasets,
-            }
-            experiments.append(exp)
-
-    return experiments
-
-
-def build_ablation_experiments(
-    models: list[str],
-    eval_datasets: list[str],
-) -> list[dict]:
-    """Butterfly ablation: with Butterfly vs without (Hadamard).
-
-    Uses swd_unif + int4 as the base configuration (strongest INT4 combo).
-    """
-    experiments = []
-
-    for model in models:
-        for butterfly in [False, True]:
-            tag = "butterfly" if butterfly else "hadamard"
-            exp = {
-                "name": f"ablation__{_model_short(model)}__{tag}",
-                "group": "ablation",
-                "model": model,
-                "loss": "swd_unif",
-                "quantizer_type": "int4",
                 "butterfly": butterfly,
                 "eval_datasets": eval_datasets,
             }
@@ -323,7 +304,7 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
             "--no_r3", "--no_r4",
         ])
     else:
-        # Weight quantization: always W4 for the comparison/ablation groups.
+        # Weight quantization: always W4 for comparison experiments.
         cmd.extend(["--w_bits", "4"])
 
         # Activation + KV-cache quantization:
@@ -712,13 +693,13 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run all DartQuant v2 comparison and ablation experiments.",
+        description="Run all DartQuant v2 comparison experiments.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
         "--group", type=str, default="all",
-        choices=["all", "comparison", "ablation", "baseline"],
+        choices=["all", "comparison", "baseline"],
         help="Which experiment group to run.",
     )
     parser.add_argument(
@@ -770,6 +751,14 @@ def parse_args():
              "       --only whip swd_unif (whip + SWD-Uniform)\n"
              "Valid losses: whip, swd_unif, swd_gauss",
     )
+    parser.add_argument(
+        "--butterfly", action="store_true", default=False,
+        help="Use learnable Butterfly Givens rotations for R3/R4 instead "
+             "of fixed Hadamard.  This is orthogonal to the loss choice "
+             "(loss controls R1/R2; butterfly controls R3/R4).  "
+             "Combines with --only to test specific losses with butterfly. "
+             "E.g.: --only swd_gauss --butterfly",
+    )
 
     return parser.parse_args()
 
@@ -788,6 +777,7 @@ def main():
     print(f"  Output root:  {output_root}")
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
+    print(f"  Butterfly:    {args.butterfly}")
     print(f"  lm_eval:      {args.lm_eval}")
     print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
@@ -837,9 +827,9 @@ def main():
         log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(
-            models, eval_datasets, only_losses=args.only_losses))
-    if args.group in ("all", "ablation"):
-        experiments.extend(build_ablation_experiments(models, eval_datasets))
+            models, eval_datasets,
+            only_losses=args.only_losses,
+            butterfly=args.butterfly))
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):

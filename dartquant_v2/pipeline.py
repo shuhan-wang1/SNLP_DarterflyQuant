@@ -1303,6 +1303,31 @@ def run_full_pipeline(args):
                 f"(was {args.r1_batch_size})")
             args.r1_batch_size = 256
 
+    # ---- swd_gauss-specific tuning ----
+    # Gaussian targets produce much weaker gradients than Uniform because:
+    #   1. Orthogonal rotations preserve global RMS, so sigma_hat is constant
+    #      and quantile targets are fixed — gradient comes only from sorted
+    #      residuals which are small (CLT makes marginals ~Gaussian).
+    #   2. Per-sorted-element gradient ≈ 2·residual/B ≈ 0.002 at B=256.
+    #      With default lr=1e-3, parameter updates are ~2e-6 per step —
+    #      negligible for a D×D rotation matrix.
+    # Fix: 10× higher LR and 3× more epochs to let the optimizer actually
+    # move the rotation away from initialisation.
+    if args.loss == 'swd_gauss':
+        _SWD_GAUSS_LR = 1e-2
+        if args.lr <= 1e-3:
+            logging.info(
+                f"  [auto] lr raised to {_SWD_GAUSS_LR} for swd_gauss "
+                f"(was {args.lr}; Gaussian SWD gradients are ~10× weaker "
+                f"than Uniform SWD)")
+            args.lr = _SWD_GAUSS_LR
+        _SWD_GAUSS_R1_EPOCHS = 100
+        if args.r1_epochs < _SWD_GAUSS_R1_EPOCHS:
+            logging.info(
+                f"  [auto] r1_epochs raised to {_SWD_GAUSS_R1_EPOCHS} for "
+                f"swd_gauss (was {args.r1_epochs})")
+            args.r1_epochs = _SWD_GAUSS_R1_EPOCHS
+
     # ======== Step 2: Fuse LayerNorms ========
     logging.info("[2/12] Fusing LayerNorms...")
     _t = time.time()

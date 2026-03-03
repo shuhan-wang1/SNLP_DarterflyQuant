@@ -113,7 +113,9 @@ class ButterflyRotation(nn.Module):
         new_xi = cos_t * xi - sin_t * xj
         new_xj = sin_t * xi + cos_t * xj
 
-        result = x.clone()
+        # Every dimension appears in exactly one pair (i_idx ∪ j_idx = {0..d-1}),
+        # so we can allocate without copying — avoids O(batch*d) memcpy per layer.
+        result = torch.empty_like(x)
         result[:, i_idx] = new_xi
         result[:, j_idx] = new_xj
 
@@ -162,7 +164,8 @@ class ButterflyRotation(nn.Module):
         new_xi = cos_t * xi + sin_t * xj
         new_xj = -sin_t * xi + cos_t * xj
 
-        result = x.clone()
+        # All d dimensions covered by i_idx ∪ j_idx — allocate without copy.
+        result = torch.empty_like(x)
         result[:, i_idx] = new_xi
         result[:, j_idx] = new_xj
 

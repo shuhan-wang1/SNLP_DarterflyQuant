@@ -12,6 +12,7 @@ defaults (SGD, lr=1e-3, momentum=0.9, CosineAnnealingLR).
 
 import logging
 import math
+import time
 
 import numpy as np
 import torch
@@ -397,6 +398,60 @@ def _init_butterfly_from_hadamard(
     logging.info(f"  Butterfly Hadamard init (dim={dim}): fit loss = {fit_loss:.4f}")
 
 
+def _butterfly_train_step(
+    butterfly: nn.Module,
+    batch: torch.Tensor,
+    loss_fn,
+    fake_quant,
+    weight_fake_quant,
+    use_recon: bool,
+    use_weight_recon: bool,
+    weight_matrices,
+    num_weight_samples: int,
+    lambda_recon: float,
+) -> torch.Tensor:
+    """Single training step for butterfly rotation (extracted for clarity).
+
+    Returns the total loss tensor (un-backpropagated).
+    """
+    # Forward: X_out = B @ X_in  (butterfly acts on row vectors)
+    outputs = butterfly(batch)
+
+    # Distribution loss: L_dist(X_out)
+    dist_loss = loss_fn(outputs)
+
+    if use_weight_recon:
+        # ── Paper Eq 17: joint weight + activation reconstruction ──
+        # L_recon = ||Wx - Q(W@B^T) · Q(B@x)||^2
+        w_idx = torch.randint(0, num_weight_samples, (1,)).item()
+        W = weight_matrices[w_idx]
+
+        with torch.no_grad():
+            Bx_q = fake_quant(outputs)
+        Bx_ste = outputs + (Bx_q - outputs).detach()
+
+        W_rotated = butterfly.inverse_forward(W)
+        with torch.no_grad():
+            WBt_q = weight_fake_quant(W_rotated)
+        WBt_ste = W_rotated + (WBt_q - W_rotated).detach()
+
+        y_true = batch @ W.T
+        y_hat = Bx_ste @ WBt_ste.T
+        recon_loss = F.mse_loss(y_true, y_hat)
+        return dist_loss + lambda_recon * recon_loss
+
+    elif use_recon:
+        # ── Activation-only reconstruction (for R3 online rotation) ──
+        with torch.no_grad():
+            x_hat_q = fake_quant(outputs)
+        x_hat = outputs + (x_hat_q - outputs).detach()
+        x_recon = butterfly.inverse_forward(x_hat)
+        recon_loss = F.mse_loss(batch, x_recon)
+        return dist_loss + lambda_recon * recon_loss
+
+    return dist_loss
+
+
 def train_butterfly(
     activations: torch.Tensor,
     dim: int,
@@ -539,13 +594,66 @@ def train_butterfly(
     optimizer = _create_optimizer(butterfly.parameters(), optim, lr, momentum)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0) if cos_lr else None
 
-    # Prepare data
+    # ── Prepare data ────────────────────────────────────────────────────────
     if isinstance(activations, np.ndarray):
         activations = torch.tensor(activations, dtype=torch.float32)
     activations = activations.float().reshape(-1, dim)
+    n_samples = activations.shape[0]
+    data_mb = n_samples * dim * 4 / (1 << 20)  # float32 size in MB
 
-    dataset = TensorDataset(activations)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Move data to GPU when it fits (< 2 GB).  This eliminates the
+    # CPU → GPU transfer bottleneck that dominates training time for the
+    # small tensors typical of butterfly training (e.g. 131 K × 128 ≈ 64 MB).
+    _on_gpu = False
+    if data_mb < 2048:
+        try:
+            activations = activations.to(device)
+            _on_gpu = True
+        except RuntimeError:
+            pass  # OOM — keep data on CPU
+    if _on_gpu:
+        logging.info(f"  Data on GPU ({data_mb:.0f} MB, {n_samples} samples)")
+    else:
+        logging.info(f"  Data on CPU ({data_mb:.0f} MB, {n_samples} samples)")
+
+    # Auto-scale batch_size for GPU efficiency.  Butterfly operates on
+    # small dimensions (head_dim ≈ 64-128), so each kernel launch does
+    # very little work.  Larger batches amortize kernel-launch overhead
+    # and fill the GPU's compute units.  We scale up to min(n_samples, 4096)
+    # while keeping ≥ 50 steps/epoch (or using all data if < 50 batches).
+    min_steps_per_epoch = 50
+    auto_batch = min(n_samples, max(batch_size, n_samples // min_steps_per_epoch))
+    auto_batch = min(auto_batch, 4096)  # cap at 4096 to avoid excessive memory
+    if auto_batch != batch_size:
+        logging.info(
+            f"  Auto-scaled batch_size {batch_size} → {auto_batch} "
+            f"for GPU efficiency (dim={dim}, n={n_samples})"
+        )
+        batch_size = auto_batch
+
+    steps_per_epoch = max(1, (n_samples + batch_size - 1) // batch_size)
+    total_steps = steps_per_epoch * epochs
+
+    # Try torch.compile for kernel fusion (PyTorch ≥ 2.0).
+    # The butterfly forward pass consists of log₂(d) layers of tiny
+    # element-wise ops; torch.compile fuses them into fewer GPU kernels,
+    # dramatically reducing kernel-launch overhead.
+    _compiled = False
+    try:
+        butterfly = torch.compile(butterfly)
+        _compiled = True
+        logging.info("  torch.compile enabled")
+    except Exception:
+        pass
+
+    # CPU-data fallback: build DataLoader with pin_memory
+    _dataloader = None
+    if not _on_gpu:
+        dataset = TensorDataset(activations)
+        _dataloader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True,
+            pin_memory=True, num_workers=2,
+        )
 
     butterfly.train()
     if use_weight_recon:
@@ -555,76 +663,63 @@ def train_butterfly(
     else:
         recon_tag = ""
     logging.info(
-        f"Training Butterfly {label} (dim={dim}), {epochs} epochs, "
-        f"loss={loss_fn_name}{recon_tag}"
+        f"Training Butterfly {label} (dim={dim}), {epochs} epochs × "
+        f"{steps_per_epoch} steps = {total_steps} total, "
+        f"batch_size={batch_size}, loss={loss_fn_name}{recon_tag}"
     )
+
+    _t_train_start = time.time()
 
     for epoch in range(epochs):
         loss_log = []
-        for (batch,) in dataloader:
-            batch = batch.to(device)
 
-            # Forward: X_out = R3 @ X_in  (butterfly acts on row vectors)
-            outputs = butterfly(batch)
-
-            # Distribution loss: L_dist(X_out)
-            dist_loss = loss_fn(outputs)
-
-            if use_weight_recon:
-                # ── Paper Eq 17: joint weight + activation reconstruction ──
-                # L_recon = ||Wx - Q(W@B^T) · Q(B@x)||^2
-                # where Q = Dequant∘Quant (fake quantize-dequantize)
-
-                # Sample a random layer's weight from the bank
-                w_idx = torch.randint(0, num_weight_samples, (1,)).item()
-                W = weight_matrices[w_idx]  # (out_dim, dim)
-
-                # STE for activation quantisation: Bx
-                with torch.no_grad():
-                    Bx_q = fake_quant(outputs)
-                Bx_ste = outputs + (Bx_q - outputs).detach()
-
-                # Rotate weight rows by B^T and STE-quantise: WB^T
-                W_rotated = butterfly.inverse_forward(W)  # (out_dim, dim)
-                with torch.no_grad():
-                    WBt_q = weight_fake_quant(W_rotated)
-                WBt_ste = W_rotated + (WBt_q - W_rotated).detach()
-
-                # Ground-truth vs quantised output
-                y_true = batch @ W.T            # (batch_sz, out_dim)
-                y_hat = Bx_ste @ WBt_ste.T      # (batch_sz, out_dim)
-                recon_loss = F.mse_loss(y_true, y_hat)
-
-                loss = dist_loss + lambda_recon * recon_loss
-
-            elif use_recon:
-                # ── Activation-only reconstruction (for R3 online rotation) ──
-                # L_recon = ||X_in - B^T @ FakeQuant(B @ X_in)||^2
-                with torch.no_grad():
-                    x_hat_q = fake_quant(outputs)
-                x_hat = outputs + (x_hat_q - outputs).detach()  # STE
-
-                x_recon = butterfly.inverse_forward(x_hat)
-                recon_loss = F.mse_loss(batch, x_recon)
-
-                loss = dist_loss + lambda_recon * recon_loss
-            else:
-                loss = dist_loss
-
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            loss_log.append(loss.detach())
+        if _on_gpu:
+            # ── GPU-native random batching (no DataLoader overhead) ──
+            perm = torch.randperm(n_samples, device=device)
+            for start in range(0, n_samples, batch_size):
+                batch = activations[perm[start:start + batch_size]]
+                loss = _butterfly_train_step(
+                    butterfly, batch, loss_fn, fake_quant, weight_fake_quant,
+                    use_recon, use_weight_recon, weight_matrices,
+                    num_weight_samples if use_weight_recon else 0,
+                    lambda_recon,
+                )
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                loss_log.append(loss.detach())
+        else:
+            # ── CPU-data fallback with DataLoader ──
+            for (batch_cpu,) in _dataloader:
+                batch = batch_cpu.to(device)
+                loss = _butterfly_train_step(
+                    butterfly, batch, loss_fn, fake_quant, weight_fake_quant,
+                    use_recon, use_weight_recon, weight_matrices,
+                    num_weight_samples if use_weight_recon else 0,
+                    lambda_recon,
+                )
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                loss_log.append(loss.detach())
 
         if scheduler:
             scheduler.step()
 
         if (epoch + 1) % max(1, epochs // 5) == 0 or epoch == 0:
             mean_loss = torch.stack(loss_log).mean()
+            elapsed = time.time() - _t_train_start
+            steps_done = (epoch + 1) * steps_per_epoch
             logging.info(
                 f"  {label} Epoch [{epoch+1}/{epochs}], "
-                f"total Loss: {mean_loss.item():.6f}"
+                f"Loss: {mean_loss.item():.6f}, "
+                f"{steps_done}/{total_steps} steps, "
+                f"{elapsed:.1f}s elapsed"
             )
 
-    logging.info(f"Butterfly {label} training complete.")
+    elapsed = time.time() - _t_train_start
+    logging.info(
+        f"Butterfly {label} training complete in {elapsed:.1f}s "
+        f"({total_steps / elapsed:.0f} steps/s)"
+    )
     return butterfly

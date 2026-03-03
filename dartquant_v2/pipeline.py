@@ -359,45 +359,56 @@ def collect_r3_activations(model, calibration_data, umodel, device):
     """Collect Q/K activations after RoPE for butterfly R3 training.
 
     Hooks into the self-attention module to capture post-RoPE Q/K.
+    Uses ALL calibration samples (not a subset) to provide enough
+    training signal for the butterfly rotation — the ButterflyQuant
+    paper uses 128 calibration samples.  Per-hook subsampling keeps
+    memory manageable while still providing diverse activation data.
     """
     activations = []
     hooks = []
 
-    # We need to hook the rope output
-    # In Llama, apply_rotary_pos_emb is called inside the attention forward
-    # We hook into the attention module and capture the Q/K after projection
-    # (pre-RoPE, but that's what R3 acts on in the QK space)
+    # Hook Q projection output for all layers.
+    # R3 acts on head_dim chunks after RoPE; hooking q_proj captures
+    # the pre-RoPE Q activations which are reshaped to (N, head_dim).
     layers = umodel.get_layers()
     for layer in layers:
         q_proj, k_proj, _, _ = umodel.get_attn_projs(layer)
         def make_hook(name):
             def hook(module, inp, out):
                 flat = out.detach().float().cpu().reshape(-1, out.shape[-1])
-                if flat.shape[0] > 256:
-                    indices = torch.randperm(flat.shape[0])[:256]
+                # Subsample to 512 rows per hook to keep memory bounded.
+                # With all calibration samples × all layers, we still get
+                # a large and diverse training set.
+                if flat.shape[0] > 512:
+                    indices = torch.randperm(flat.shape[0])[:512]
                     flat = flat[indices]
                 activations.append(flat)
             return hook
-        # Hook Q projection output (R3 acts on head_dim chunks)
         hooks.append(q_proj.register_forward_hook(make_hook('q')))
 
+    n_cal = calibration_data.shape[0]
+    logging.info(f"  Collecting R3 activations from {n_cal} calibration samples "
+                 f"× {len(layers)} layers...")
     model.eval()
     with torch.no_grad():
-        for i in range(min(calibration_data.shape[0], 16)):
+        for i in tqdm(range(n_cal), desc="  R3 calibration", leave=False):
             inp = calibration_data[i:i+1].to(device)
             try:
                 model(inp)
             except Exception:
-                pass
+                if i == 0:
+                    logging.warning(
+                        f"  Forward pass failed on calibration sample {i}")
 
     for h in hooks:
         h.remove()
 
     if activations:
         all_acts = torch.cat(activations, dim=0)
-        # Reshape to head_dim chunks
         head_dim = umodel.head_dim
         all_acts = all_acts.reshape(-1, head_dim)
+        logging.info(f"  R3 activations: {all_acts.shape[0]} rows × dim={head_dim} "
+                     f"({all_acts.numel() * 4 / (1 << 20):.0f} MB)")
         return all_acts
     return None
 

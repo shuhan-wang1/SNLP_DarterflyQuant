@@ -153,40 +153,79 @@ def cleanup_memory():
 # ── CPU-memory-aware activation budget ──────────────────────────────────
 # collect_activations() stores every captured tensor on CPU via
 # .float().cpu(), so the budget must track *system RAM*, not GPU memory.
+# The budget adapts dynamically to available RAM and model size.
 
 
-def _get_available_ram_bytes() -> Optional[int]:
-    """Best-effort detection of free system RAM in bytes."""
+def _get_ram_bytes(available: bool = True) -> Optional[int]:
+    """Best-effort detection of system RAM in bytes.
+
+    Args:
+        available: If True return free RAM, otherwise total RAM.
+    """
     try:
         import psutil
-        return psutil.virtual_memory().available
+        mem = psutil.virtual_memory()
+        return mem.available if available else mem.total
     except ImportError:
         pass
     # Linux fallback (no psutil)
+    key = 'SC_AVPHYS_PAGES' if available else 'SC_PHYS_PAGES'
     try:
-        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES')
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf(key)
     except (AttributeError, ValueError, OSError):
         pass
     return None
 
 
-def _activation_budget_bytes() -> int:
+def _estimate_model_bytes(model: nn.Module) -> int:
+    """Estimate model memory footprint from parameter tensors."""
+    return sum(p.numel() * p.element_size() for p in model.parameters())
+
+
+def _activation_budget_bytes(model: nn.Module) -> int:
     """How many bytes of activation data we can store on CPU.
 
-    Uses ≤25 % of currently-free system RAM, clamped to [512 MB, 6 GB].
-    Falls back to a conservative 2 GB when detection fails.
+    Dynamically adapts to system RAM **and** model size.  During
+    activation collection the model sits on GPU; afterwards it moves
+    to CPU for rotation training.  The budget must leave room for:
+
+        • the model copy on CPU during training  (~model_bytes)
+        • the 2× peak when torch.cat merges per-sample lists
+        • OS, Python interpreter, calibration data  (~6 GB reserved)
+
+    Formula
+    -------
+        usable = min(total_ram × 0.5, available_ram × 0.7)
+        budget = (usable − model_bytes − reserved) / 2
+
+    The ``/ 2`` accounts for the temporary doubling during torch.cat.
+    Clamped to [1 GB, 32 GB].
     """
-    avail = _get_available_ram_bytes()
-    if avail is not None:
-        budget = int(avail * 0.25)          # ≤ 25 % of free RAM
-        avail_gb = avail / (1024 ** 3)
+    total_ram = _get_ram_bytes(available=False)
+    avail_ram = _get_ram_bytes(available=True)
+    model_bytes = _estimate_model_bytes(model)
+    model_gb = model_bytes / (1024 ** 3)
+    reserved = 6 * 1024 ** 3                    # OS + Python + misc
+
+    if total_ram is not None and avail_ram is not None:
+        usable = min(int(total_ram * 0.5), int(avail_ram * 0.7))
+        budget = max(0, usable - model_bytes - reserved) // 2
+        total_gb = total_ram / (1024 ** 3)
+        avail_gb = avail_ram / (1024 ** 3)
+    elif avail_ram is not None:
+        budget = max(0, int(avail_ram * 0.7) - model_bytes - reserved) // 2
+        total_gb = float('nan')
+        avail_gb = avail_ram / (1024 ** 3)
     else:
-        budget = 2 * 1024 ** 3              # 2 GB fallback
+        budget = 4 * 1024 ** 3                  # 4 GB fallback
+        total_gb = float('nan')
         avail_gb = float('nan')
-    budget = max(512 * 1024 ** 2, min(budget, 6 * 1024 ** 3))
+
+    budget = max(1 * 1024 ** 3, min(budget, 32 * 1024 ** 3))
     budget_gb = budget / (1024 ** 3)
-    logging.info(f"  CPU RAM available: ~{avail_gb:.1f} GB → "
-                 f"activation budget: ~{budget_gb:.1f} GB")
+    logging.info(
+        f"  System RAM: {total_gb:.0f} GB total, ~{avail_gb:.0f} GB free; "
+        f"model ~{model_gb:.1f} GB → activation budget ~{budget_gb:.1f} GB")
     return budget
 
 
@@ -1525,22 +1564,26 @@ def run_full_pipeline(args):
 
             # Memory-aware row limit: the hook fires once per sample, so
             # total rows per target = nsamples × min(seqlen, max_rows).
-            # Budget sized to available CPU RAM (activations live on CPU).
+            # Budget dynamically sized to system RAM and model footprint.
             _num_r1_targets = len(all_target_names)
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _max_total_rows = _activation_budget_bytes() // _row_bytes
+            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
             _max_r1_rows_per_hook = max(
                 16, _max_total_rows // (_num_r1_targets * _nsamples)
             )
+            # When budget is generous, rows_per_hook >= seqlen → no
+            # subsampling (full quality).  Cap to seqlen for display.
+            _effective_rows = min(_max_r1_rows_per_hook, args.seqlen)
             _est_gb = (_num_r1_targets * _nsamples *
-                       min(_max_r1_rows_per_hook, args.seqlen) *
-                       _row_bytes / (1024 ** 3))
+                       _effective_rows * _row_bytes / (1024 ** 3))
+            _quality = ("full (no subsampling)"
+                        if _max_r1_rows_per_hook >= args.seqlen
+                        else f"subsampled to {_max_r1_rows_per_hook}/{args.seqlen} rows")
 
             logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
                          f"layers in one pass ({_nsamples} samples, "
-                         f"max {_max_r1_rows_per_hook} rows/hook-call → "
-                         f"~{_est_gb:.1f} GB)...")
+                         f"{_quality} → ~{_est_gb:.1f} GB)...")
             _t_collect = time.time()
             all_acts = collect_activations(
                 model, calib_data, all_target_names, DEV,
@@ -1646,23 +1689,21 @@ def run_full_pipeline(args):
                 all_r2_targets[layer_idx] = target
                 all_r2_target_names.append(target)
 
-            # Memory-aware row limit — budget sized to CPU RAM.
+            # Memory-aware row limit — dynamically sized to system RAM
+            # and model footprint.
             _num_r2_targets = len(all_r2_target_names)
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _budget = _activation_budget_bytes()
+            _budget = _activation_budget_bytes(model)
             _max_total_rows = _budget // _row_bytes
             _max_r2_rows_per_hook = max(
                 16, _max_total_rows // (_num_r2_targets * _nsamples)
             )
+            _effective_rows = min(_max_r2_rows_per_hook, args.seqlen)
 
             # Determine how many layers to collect per chunk so that
             # each chunk's activations fit within the CPU RAM budget.
-            _per_layer_bytes = (
-                _nsamples
-                * min(_max_r2_rows_per_hook, args.seqlen)
-                * _row_bytes
-            )
+            _per_layer_bytes = _nsamples * _effective_rows * _row_bytes
             _layers_per_chunk = max(
                 1, _budget // max(1, _per_layer_bytes)
             )
@@ -1671,12 +1712,14 @@ def run_full_pipeline(args):
             _est_chunk_gb = (
                 _layers_per_chunk * _per_layer_bytes / (1024 ** 3)
             )
+            _quality = ("full (no subsampling)"
+                        if _max_r2_rows_per_hook >= args.seqlen
+                        else f"subsampled to {_max_r2_rows_per_hook}/{args.seqlen} rows")
 
             logging.info(
                 f"  R2: {umodel.num_layers} layers in {_num_chunks} "
                 f"chunk(s) of <={_layers_per_chunk} layers "
-                f"({_nsamples} samples, "
-                f"max {_max_r2_rows_per_hook} rows/hook → "
+                f"({_nsamples} samples, {_quality} → "
                 f"~{_est_chunk_gb:.1f} GB/chunk)")
 
             # ── Collect & train in chunks to bound peak CPU memory ──

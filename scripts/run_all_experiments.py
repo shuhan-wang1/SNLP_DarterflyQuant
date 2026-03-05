@@ -24,6 +24,9 @@ Usage:
 
   # Skip unquantized FP16 baselines (saves time when PPL ceiling is already known)
   python scripts/run_all_experiments.py --no-baseline
+
+  # Weight-only quantization (W4A16KV16, no activation/KV quant)
+  python scripts/run_all_experiments.py --w4-only
 """
 
 import os
@@ -196,6 +199,7 @@ def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
     only_losses: list[str] | None = None,
+    w4_only: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -204,6 +208,10 @@ def build_comparison_experiments(
     - swd_gauss + nf4:  Sliced Wasserstein Distance to Gaussian
 
     All experiments use fixed Hadamard rotations for R3/R4.
+
+    When w4_only=True, activation and KV-cache quantization are disabled
+    (a_bits=16, k_bits=16, v_bits=16) to isolate the effect of weight
+    quantization alone (W4A16KV16).
     """
     experiments = []
     all_configs = [
@@ -217,15 +225,28 @@ def build_comparison_experiments(
     else:
         configs = all_configs
 
+    # Bit configuration: W4A4KV4 (default) or W4A16KV16 (--w4-only)
+    if w4_only:
+        a_bits, k_bits, v_bits = 16, 16, 16
+        tier_tag = "W4A16KV16"
+        log.info("Weight-only mode: W4A16KV16 (activation/KV quant disabled)")
+    else:
+        a_bits, k_bits, v_bits = 4, 4, 4
+        tier_tag = "W4A4KV4"
+
     for model in models:
         for cfg in configs:
             exp = {
-                "name": f"comparison__{_model_short(model)}__{cfg['tag']}",
+                "name": f"comparison__{_model_short(model)}__{cfg['tag']}_{tier_tag}",
                 "group": "comparison",
                 "model": model,
                 "loss": cfg["loss"],
                 "quantizer_type": cfg["quantizer_type"],
                 "eval_datasets": eval_datasets,
+                "w_bits": 4,
+                "a_bits": a_bits,
+                "k_bits": k_bits,
+                "v_bits": v_bits,
             }
             experiments.append(exp)
 
@@ -293,13 +314,13 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
             "--no_r3", "--no_r4",
         ])
     else:
-        # Weight quantization: always W4 for comparison experiments.
-        cmd.extend(["--w_bits", "4"])
-
-        # Activation + KV-cache quantization: W4A4KV4 for all quantizer types.
-        # Both INT4 and NF4 use ActQuantWrapper + QKRotationWrapper, so
-        # activation and KV-cache quantization works uniformly.
-        cmd.extend(["--a_bits", "4", "--k_bits", "4", "--v_bits", "4"])
+        # Bit widths from experiment dict (W4A4KV4 default, W4A16KV16 if --w4-only)
+        cmd.extend(["--w_bits", str(exp.get("w_bits", 4))])
+        cmd.extend([
+            "--a_bits", str(exp.get("a_bits", 4)),
+            "--k_bits", str(exp.get("k_bits", 4)),
+            "--v_bits", str(exp.get("v_bits", 4)),
+        ])
 
     if lm_eval:
         cmd.append("--lm_eval")
@@ -618,12 +639,12 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
 
     for group_name, items in groups.items():
         print(f"\n  [{group_name.upper()}]")
-        header = f"  {'Experiment':<45} {'Status':<10} {'wikitext2':>10} {'ptb':>10} {'c4':>10}"
+        header = f"  {'Experiment':<55} {'Status':<10} {'wikitext2':>10} {'ptb':>10} {'c4':>10}"
         if has_lm_eval:
             header += f" {'acc_avg':>10}"
         header += f" {'Time':>8}"
         print(header)
-        sep = f"  {'-'*45} {'-'*10} {'-'*10} {'-'*10} {'-'*10}"
+        sep = f"  {'-'*55} {'-'*10} {'-'*10} {'-'*10} {'-'*10}"
         if has_lm_eval:
             sep += f" {'-'*10}"
         sep += f" {'-'*8}"
@@ -639,13 +660,16 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
             elapsed = res.get("elapsed_s", 0)
             time_str = f"{elapsed:.0f}s" if elapsed > 0 else "-"
 
+            a = exp.get('a_bits', 4)
+            bits_tag = f"W{exp.get('w_bits', 4)}A{a}KV{exp.get('k_bits', 4)}"
             label = (
                 f"{_model_short(exp.get('model', '?'))}"
                 f" | {exp.get('loss', '?')}"
                 f" | {exp.get('quantizer_type', '?')}"
+                f" | {bits_tag}"
             )
 
-            row = f"  {label:<45} {status:<10} {w2:>10} {pt:>10} {c4:>10}"
+            row = f"  {label:<55} {status:<10} {w2:>10} {pt:>10} {c4:>10}"
             if has_lm_eval:
                 avg = f"{lm['acc_avg']:.2f}" if "acc_avg" in lm else "-"
                 row += f" {avg:>10}"
@@ -719,6 +743,13 @@ def parse_args():
              "       --only whip swd_unif (whip + SWD-Uniform)\n"
              "Valid losses: whip, swd_unif, swd_gauss",
     )
+    parser.add_argument(
+        "--w4-only", dest="w4_only", action="store_true", default=False,
+        help="Weight-only quantization (W4A16KV16). "
+             "Disables activation and KV-cache quantization "
+             "(a_bits=16, k_bits=16, v_bits=16) to isolate the effect "
+             "of weight quantization alone.",
+    )
     return parser.parse_args()
 
 
@@ -736,6 +767,7 @@ def main():
     print(f"  Output root:  {output_root}")
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
+    print(f"  W4-only:      {args.w4_only}")
     print(f"  lm_eval:      {args.lm_eval}")
     print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
@@ -786,7 +818,8 @@ def main():
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(
             models, eval_datasets,
-            only_losses=args.only_losses))
+            only_losses=args.only_losses,
+            w4_only=args.w4_only))
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):

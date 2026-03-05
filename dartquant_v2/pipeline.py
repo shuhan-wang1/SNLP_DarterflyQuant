@@ -150,34 +150,44 @@ def cleanup_memory():
         torch.cuda.empty_cache()
 
 
-# Maximum GPU memory target (in GB).  The activation collection budget is
-# derived from this so that  model_vram + activations + overhead ≤ limit.
-_GPU_MEM_LIMIT_GB = 28
+# ── CPU-memory-aware activation budget ──────────────────────────────────
+# collect_activations() stores every captured tensor on CPU via
+# .float().cpu(), so the budget must track *system RAM*, not GPU memory.
 
 
-def _estimate_model_vram_gb(model: nn.Module) -> float:
-    """Estimate model GPU memory in GB from parameter tensors."""
-    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    return total_bytes / (1024 ** 3)
+def _get_available_ram_bytes() -> Optional[int]:
+    """Best-effort detection of free system RAM in bytes."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+    # Linux fallback (no psutil)
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES')
+    except (AttributeError, ValueError, OSError):
+        pass
+    return None
 
 
-def _activation_budget_bytes(model: nn.Module) -> int:
-    """Compute how many bytes of activation tensors we can afford.
+def _activation_budget_bytes() -> int:
+    """How many bytes of activation data we can store on CPU.
 
-    During collection the model sits on GPU, so the budget is:
-        act_budget = GPU_LIMIT − model_vram − overhead
-    with a floor of 1 GB and a ceiling of 8 GB (diminishing returns beyond
-    that; the trainer sub-samples anyway).
+    Uses ≤25 % of currently-free system RAM, clamped to [512 MB, 6 GB].
+    Falls back to a conservative 2 GB when detection fails.
     """
-    model_gb = _estimate_model_vram_gb(model)
-    overhead_gb = 3.0                       # CUDA ctx + forward intermediates
-    avail_gb = _GPU_MEM_LIMIT_GB - model_gb - overhead_gb
-    budget_gb = max(1.0, min(avail_gb, 8.0))
-    logging.info(f"  Memory budget: model ~{model_gb:.1f} GB, "
-                 f"overhead ~{overhead_gb:.0f} GB, "
-                 f"activation budget ~{budget_gb:.1f} GB "
-                 f"(GPU limit {_GPU_MEM_LIMIT_GB} GB)")
-    return int(budget_gb * 1024 ** 3)
+    avail = _get_available_ram_bytes()
+    if avail is not None:
+        budget = int(avail * 0.25)          # ≤ 25 % of free RAM
+        avail_gb = avail / (1024 ** 3)
+    else:
+        budget = 2 * 1024 ** 3              # 2 GB fallback
+        avail_gb = float('nan')
+    budget = max(512 * 1024 ** 2, min(budget, 6 * 1024 ** 3))
+    budget_gb = budget / (1024 ** 3)
+    logging.info(f"  CPU RAM available: ~{avail_gb:.1f} GB → "
+                 f"activation budget: ~{budget_gb:.1f} GB")
+    return budget
 
 
 # ============================================================================
@@ -371,6 +381,11 @@ def collect_activations(model, calibration_data, target_names, device,
                     logging.warning(
                         f"Forward pass failed on calibration sample {i}: {e}"
                     )
+            del inp
+            # Periodically release Python-side garbage so accumulated
+            # tensor metadata does not exhaust CPU RAM.
+            if (i + 1) % 16 == 0:
+                gc.collect()
 
     for h in hooks:
         h.remove()
@@ -1510,13 +1525,13 @@ def run_full_pipeline(args):
 
             # Memory-aware row limit: the hook fires once per sample, so
             # total rows per target = nsamples × min(seqlen, max_rows).
-            # Budget derived from GPU limit minus model + overhead.
+            # Budget sized to available CPU RAM (activations live on CPU).
             _num_r1_targets = len(all_target_names)
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
+            _max_total_rows = _activation_budget_bytes() // _row_bytes
             _max_r1_rows_per_hook = max(
-                64, _max_total_rows // (_num_r1_targets * _nsamples)
+                16, _max_total_rows // (_num_r1_targets * _nsamples)
             )
             _est_gb = (_num_r1_targets * _nsamples *
                        min(_max_r1_rows_per_hook, args.seqlen) *
@@ -1618,13 +1633,11 @@ def run_full_pipeline(args):
         else:
             logging.info("[6/12] Collecting activations and training R2...")
             _t6 = time.time()
-            model.to(DEV)
 
             from .trainers import train_r2_single_layer
             layers_prefix = umodel.arch.layers_path
 
-            # Build ALL R2 targets (o_proj for each layer) and collect
-            # in a single forward pass — same optimisation as R1.
+            # Build R2 targets (o_proj for each layer).
             all_r2_targets = {}
             all_r2_target_names = []
             for layer_idx in range(umodel.num_layers):
@@ -1633,78 +1646,107 @@ def run_full_pipeline(args):
                 all_r2_targets[layer_idx] = target
                 all_r2_target_names.append(target)
 
-            # Memory-aware row limit (same pattern as R1 collection above)
+            # Memory-aware row limit — budget sized to CPU RAM.
             _num_r2_targets = len(all_r2_target_names)
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
+            _budget = _activation_budget_bytes()
+            _max_total_rows = _budget // _row_bytes
             _max_r2_rows_per_hook = max(
-                64, _max_total_rows // (_num_r2_targets * _nsamples)
+                16, _max_total_rows // (_num_r2_targets * _nsamples)
             )
-            _est_gb = (_num_r2_targets * _nsamples *
-                       min(_max_r2_rows_per_hook, args.seqlen) *
-                       _row_bytes / (1024 ** 3))
 
-            logging.info(f"  Collecting R2 activations for all "
-                         f"{umodel.num_layers} layers in one pass "
-                         f"({_nsamples} samples, "
-                         f"max {_max_r2_rows_per_hook} rows/hook-call → "
-                         f"~{_est_gb:.1f} GB)...")
-            _t_collect = time.time()
-            all_acts = collect_activations(
-                model, calib_data, all_r2_target_names, DEV,
-                max_rows_per_hook=_max_r2_rows_per_hook,
+            # Determine how many layers to collect per chunk so that
+            # each chunk's activations fit within the CPU RAM budget.
+            _per_layer_bytes = (
+                _nsamples
+                * min(_max_r2_rows_per_hook, args.seqlen)
+                * _row_bytes
             )
-            logging.info(f"  R2 activation collection done in "
-                         f"{time.time() - _t_collect:.1f}s")
+            _layers_per_chunk = max(
+                1, _budget // max(1, _per_layer_bytes)
+            )
+            _layers_per_chunk = min(_layers_per_chunk, umodel.num_layers)
+            _num_chunks = -(-umodel.num_layers // _layers_per_chunk)
+            _est_chunk_gb = (
+                _layers_per_chunk * _per_layer_bytes / (1024 ** 3)
+            )
 
-            # Free GPU for training — model not needed during R2 optimisation
-            model.cpu()
-            cleanup_memory()
+            logging.info(
+                f"  R2: {umodel.num_layers} layers in {_num_chunks} "
+                f"chunk(s) of <={_layers_per_chunk} layers "
+                f"({_nsamples} samples, "
+                f"max {_max_r2_rows_per_hook} rows/hook → "
+                f"~{_est_chunk_gb:.1f} GB/chunk)")
 
-            # Train R2 per-layer (greedy), freeing activations after each
-            for layer_idx in range(umodel.num_layers):
-                target = all_r2_targets[layer_idx]
-                acts = all_acts.get(target)
-                if acts is None:
-                    logging.warning(
-                        f"  No R2 activations for layer {layer_idx}"
-                    )
-                    continue
+            # ── Collect & train in chunks to bound peak CPU memory ──
+            for _ci in range(_num_chunks):
+                _cs = _ci * _layers_per_chunk
+                _ce = min(_cs + _layers_per_chunk, umodel.num_layers)
+                _chunk_names = all_r2_target_names[_cs:_ce]
 
-                # Match official R2 batching: bsz=128 (nsamples) so entire
-                # dataset fits in ONE batch.  With accumulation_steps=2 and
-                # only 1 batch/epoch, (0+1)%2≠0 → no optimizer.step() fires.
-                # This means R2 stays at the Hadamard initialisation — which
-                # is exactly what the official DartQuant calibrater produces.
-                r2_batch_size = acts.shape[0]  # all rows in one batch
+                logging.info(
+                    f"    Chunk {_ci + 1}/{_num_chunks}: "
+                    f"layers {_cs}–{_ce - 1}")
 
-                key, rotation = train_r2_single_layer(
-                    acts=acts,
-                    hidden_size=umodel.hidden_size,
-                    num_heads=umodel.num_heads,
-                    kv_heads=umodel.kv_heads,
-                    loss_fn_name=args.loss,
-                    lr=args.lr,
-                    momentum=args.momentum,
-                    epochs=args.r2_epochs,
-                    batch_size=r2_batch_size,
-                    cos_lr=args.cos_lr,
-                    optim=args.optim,
-                    accumulation_steps=max(args.accumulation_steps, 2),
-                    device=DEV,
-                    layer_idx=layer_idx,
-                    layers_path=layers_prefix,
+                # Collect activations (model must be on GPU)
+                model.to(DEV)
+                _t_collect = time.time()
+                chunk_acts = collect_activations(
+                    model, calib_data, _chunk_names, DEV,
+                    max_rows_per_hook=_max_r2_rows_per_hook,
                 )
-                R2_dict[key] = rotation
+                logging.info(
+                    f"    Collection done in "
+                    f"{time.time() - _t_collect:.1f}s")
 
-                # Free this layer's activations
-                if target in all_acts:
-                    del all_acts[target]
-                del acts
+                # Free GPU for training
+                model.cpu()
                 cleanup_memory()
 
-            del all_acts
+                # Train R2 for each layer in this chunk
+                for layer_idx in range(_cs, _ce):
+                    target = all_r2_targets[layer_idx]
+                    acts = chunk_acts.pop(target, None)
+                    if acts is None:
+                        logging.warning(
+                            f"  No R2 activations for layer {layer_idx}"
+                        )
+                        continue
+
+                    # Match official R2 batching: bsz=128 (nsamples) so
+                    # entire dataset fits in ONE batch.  With
+                    # accumulation_steps=2 and only 1 batch/epoch,
+                    # (0+1)%2!=0 -> no optimizer.step() fires.
+                    # R2 stays at the Hadamard init — matching the
+                    # official DartQuant calibrater.
+                    r2_batch_size = acts.shape[0]
+
+                    key, rotation = train_r2_single_layer(
+                        acts=acts,
+                        hidden_size=umodel.hidden_size,
+                        num_heads=umodel.num_heads,
+                        kv_heads=umodel.kv_heads,
+                        loss_fn_name=args.loss,
+                        lr=args.lr,
+                        momentum=args.momentum,
+                        epochs=args.r2_epochs,
+                        batch_size=r2_batch_size,
+                        cos_lr=args.cos_lr,
+                        optim=args.optim,
+                        accumulation_steps=max(
+                            args.accumulation_steps, 2),
+                        device=DEV,
+                        layer_idx=layer_idx,
+                        layers_path=layers_prefix,
+                    )
+                    R2_dict[key] = rotation
+                    del acts
+                    cleanup_memory()
+
+                del chunk_acts
+                cleanup_memory()
+
             logging.info(f"  R2 training complete for {len(R2_dict)} layers "
                          f"in {time.time() - _t6:.1f}s")
             cleanup_memory()

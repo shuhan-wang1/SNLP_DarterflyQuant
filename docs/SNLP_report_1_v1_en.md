@@ -8,7 +8,7 @@ $$Y = XW^\top \tag{1}$$
 
 where $X$ denotes the activation matrix and $W$ represents the fixed weight matrix. The figure below illustrates the activation distributions of Llama-3.2-1B-Base and Instruct variants at the first layer.
 
-![1769609357677](image/summary_of_current_finding/1769609357677.png)
+![1769609357677](assets/summary_of_current_finding/1769609357677.png)
 
 In the upper-left subplot, we observe a distinct outlier ($\sim 8$) in the Base model's activations. **During quantization, accommodating both normal values and these extreme outliers forces the quantization range to expand significantly. Consequently, the majority of values concentrated in the central region are mapped to only a few quantization levels, resulting in severe precision degradation.** Two principal approaches exist for handling these anomalous activations:
 
@@ -31,7 +31,7 @@ Methods such as SpinQuant and OSTQuant typically employ "end-to-end fine-tuning"
 2. **Overfitting risk**: Fine-tuning on a specific dataset can lead to overfitting to particular distributional characteristics.
 3. **Optimisation difficulty**: Related to point 1, but specifically concerning $R$—maintaining orthogonality constraints requires specialised optimisers with prohibitively high time complexity.
 
-![1769610514407](image/summary_of_current_finding/1769610514407.png)
+![1769610514407](assets/summary_of_current_finding/1769610514407.png)
 
 ### 2.1 DartQuant Innovations
 
@@ -64,11 +64,11 @@ where $\mathbf{x} = [x_1, \ldots, x_{c_\text{in}}] \in \mathbb{R}^{c_\text{in}}$
 
 Traditional approaches using orthogonal optimisers (e.g., Cayley SGD) to train $R$ directly incur prohibitive time complexity. QR-Orth instead defines a latent variable matrix (an ordinary, unconstrained, non-orthogonal matrix), then extracts an orthogonal, norm-preserving rotation matrix via QR decomposition. The decomposed orthogonal matrix is passed to the Whip loss, and gradients are backpropagated to the latent variable matrix via standard SGD.
 
-![1769612177372](image/summary_of_current_finding/1769612177372.png)
+![1769612177372](assets/summary_of_current_finding/1769612177372.png)
 
-![1769612134178](image/summary_of_current_finding/1769612134178.png)
+![1769612134178](assets/summary_of_current_finding/1769612134178.png)
 
-![1769612145379](image/summary_of_current_finding/1769612145379.png)
+![1769612145379](assets/summary_of_current_finding/1769612145379.png)
 
 ### 2.4 Application of Rotation Matrices to Different Transformer Components
 
@@ -188,7 +188,7 @@ In MoE models (e.g., Mixtral), rotation matrix application follows similar logic
 ### 2.4.5 Complete Architecture Diagrams (Classic Transformer and MoE Transformer)
 
 ![alt text](image-1.png)
-![1769621567179](image/summary_of_current_finding/1769621567179.png)
+![1769621567179](assets/summary_of_current_finding/1769621567179.png)
 
 # Chapter 3: Proposed Innovation
 
@@ -273,11 +273,11 @@ As $y_k \rightarrow +\infty$, the gradient vanishes. This mathematically explain
 
 ### 3.1.3 Activation Distribution Comparison Between Loss Functions
 
-![1769640796702](image/summary_of_current_finding/1769640796702.png)
+![1769640796702](assets/summary_of_current_finding/1769640796702.png)
 
-![1769640803435](image/summary_of_current_finding/1769640803435.png)
+![1769640803435](assets/summary_of_current_finding/1769640803435.png)
 
-![1769640807050](image/summary_of_current_finding/1769640807050.png)
+![1769640807050](assets/summary_of_current_finding/1769640807050.png)
 
 ## 3.2 Current Experimental Results
 

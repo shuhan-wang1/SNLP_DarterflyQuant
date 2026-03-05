@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyc
+*.so
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# Experiment outputs
+dartquant_v2_output/
+experiment_results/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

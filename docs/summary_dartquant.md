@@ -7,10 +7,10 @@ LLM里的Linear layer可以表示为 $Y=XW^T$，其中 $X\in \mathbb{R}^{T\times
 $$Y=(XR)(R^\top W^\top)$$
 
 ### 经典Transformer Block (LLaMA)
-![经典结构](image/notes_darkquant/1769168502148.png)
+![经典结构](assets/notes_darkquant/1769168502148.png)
 
 ### DartQuant后的Transformer Block (LLaMA)
-![DartQuant结构](image/notes_darkquant/1769168547723.png)
+![DartQuant结构](assets/notes_darkquant/1769168547723.png)
 
 ---
 
@@ -21,7 +21,7 @@ $$Y=(XR)(R^\top W^\top)$$
 3. **QR-Orth Optimization**：用QR分解替代昂贵的流形优化（Cayley SGD），显著提升效率
 4. **资源效率**：首次在单张3090 GPU上完成70B模型的旋转校准（约3小时），实现47×加速和10×显存节省
 
-![计算成本对比](image/notes_darkquant/1769166602593.png)
+![计算成本对比](assets/notes_darkquant/1769166602593.png)
 
 ---
 
@@ -48,7 +48,7 @@ LLM后训练量化中，激活值比权重更难处理，因为存在**极端out
 
 ## Method
 
-![方法框架](image/notes_darkquant/1769170936353.png)
+![方法框架](assets/notes_darkquant/1769170936353.png)
 
 ### 4.1 Rotational Distribution Calibration
 
@@ -67,8 +67,8 @@ $$\min_R\sum_{i=1}^{C_\text{in}}\mathbb{I}(|(Rx)_i|>\tau)$$
 
 **目标**：将Laplace分布的激活转换为均匀分布，从而减少outliers。
 
-![分布变换直觉](image/notes_darkquant/1769192918814.png)
-![Whip Loss效果](image/notes_darkquant/1769192959029.png)
+![分布变换直觉](assets/notes_darkquant/1769192918814.png)
+![Whip Loss效果](assets/notes_darkquant/1769192959029.png)
 
 **假设**：激活服从 Laplace$(0, b)$ 分布，PDF为：
 $$f(x) = \frac{1}{2b}\exp\left(-\frac{|x|}{b}\right)$$
@@ -165,8 +165,8 @@ Table 19显示LLaMA系列激活统计特性：
 
 **局限**：若mean显著偏离0，Whip Loss效果可能下降。
 
-![激活统计](image/notes_darkquant/1769194688478.png)
-![激活分布](image/notes_darkquant/1769194672006.png)
+![激活统计](assets/notes_darkquant/1769194688478.png)
+![激活分布](assets/notes_darkquant/1769194672006.png)
 
 ### B. 复杂度分析
 

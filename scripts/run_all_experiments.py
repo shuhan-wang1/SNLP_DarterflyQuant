@@ -16,12 +16,6 @@ Usage:
   python scripts/run_all_experiments.py --only swd_gauss
   python scripts/run_all_experiments.py --only whip swd_unif
 
-  # Enable learnable Butterfly R3/R4 (instead of Hadamard)
-  python scripts/run_all_experiments.py --only swd_gauss --butterfly
-
-  # Butterfly R3 only (R4=Hadamard, R1/R2 trained normally)
-  python scripts/run_all_experiments.py --only swd_gauss --butterfly-only
-
   # Specify models explicitly (skip auto-detection)
   python scripts/run_all_experiments.py --models meta-llama/Llama-3.2-1B
 
@@ -202,8 +196,6 @@ def build_comparison_experiments(
     models: list[str],
     eval_datasets: list[str],
     only_losses: list[str] | None = None,
-    butterfly: bool = False,
-    butterfly_only: bool = False,
 ) -> list[dict]:
     """Loss function comparison: SWD-Gaussian vs SWD-Uniform vs Whip.
 
@@ -211,12 +203,7 @@ def build_comparison_experiments(
     - swd_unif + int4:  Sliced Wasserstein Distance to Uniform
     - swd_gauss + nf4:  Sliced Wasserstein Distance to Gaussian
 
-    When butterfly=True, learnable Butterfly Givens rotations are used for
-    R3/R4 instead of fixed Hadamard.  This is orthogonal to the loss choice
-    (loss controls R1/R2 training; butterfly controls R3/R4).
-
-    When butterfly_only=True, learnable Butterfly is used for R3 only.
-    R4 stays Hadamard. R1/R2 train normally with the selected loss.
+    All experiments use fixed Hadamard rotations for R3/R4.
     """
     experiments = []
     all_configs = [
@@ -230,18 +217,14 @@ def build_comparison_experiments(
     else:
         configs = all_configs
 
-    # Tag suffix: _bf (full butterfly R3+R4), _bf3 (butterfly R3 only)
-    bf_suffix = "_bf" if butterfly else ("_bf3" if butterfly_only else "")
     for model in models:
         for cfg in configs:
             exp = {
-                "name": f"comparison__{_model_short(model)}__{cfg['tag']}{bf_suffix}",
+                "name": f"comparison__{_model_short(model)}__{cfg['tag']}",
                 "group": "comparison",
                 "model": model,
                 "loss": cfg["loss"],
                 "quantizer_type": cfg["quantizer_type"],
-                "butterfly": butterfly,
-                "butterfly_only": butterfly_only,
                 "eval_datasets": eval_datasets,
             }
             experiments.append(exp)
@@ -297,11 +280,6 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
         "--output_dir", output_dir,
         "--ppl_eval_dataset", *exp["eval_datasets"],
     ]
-
-    if exp["butterfly"]:
-        cmd.append("--butterfly")
-    elif exp.get("butterfly_only"):
-        cmd.append("--butterfly_only")
 
     if exp.get("baseline"):
         # Unquantized FP16: all bits=16 disables quantization entirely.
@@ -374,14 +352,8 @@ def run_experiment(
     quantization stage.
     """
     model_short = _model_short(exp['model'])
-    if exp['butterfly']:
-        _bf_tag = 'BF'
-    elif exp.get('butterfly_only'):
-        _bf_tag = 'BF3'
-    else:
-        _bf_tag = 'Had'
     exp_label = (
-        f"{model_short} | {exp['loss']} | {exp['quantizer_type']} | {_bf_tag}"
+        f"{model_short} | {exp['loss']} | {exp['quantizer_type']}"
     )
 
     tqdm.write("")
@@ -455,11 +427,6 @@ def run_experiment(
                 layer_info = _LOG_PREFIX_RE.sub('', line_stripped).strip()
                 stage_bar.set_postfix_str(layer_info[:55])
 
-            # Detect Butterfly training progress
-            elif 'Butterfly' in line_stripped or 'butterfly' in line_stripped:
-                bf_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
-                stage_bar.set_postfix_str(bf_info[:55])
-
             # Detect PPL evaluation results
             elif 'PPL' in line_stripped.upper() and ':' in line_stripped:
                 ppl_info = line_stripped.split('- ')[-1] if '- ' in line_stripped else line_stripped
@@ -501,9 +468,6 @@ def run_experiment(
                 _show = True
             elif 'final Loss' in line_stripped:
                 # R2 final loss
-                _show = True
-            elif 'Butterfly' in line_stripped and 'Epoch' in line_stripped:
-                # Butterfly training progress
                 _show = True
             elif 'activation collection' in line_stripped.lower():
                 # Activation collection progress
@@ -680,10 +644,6 @@ def print_summary(all_results: list[dict], experiments: list[dict]):
                 f" | {exp.get('loss', '?')}"
                 f" | {exp.get('quantizer_type', '?')}"
             )
-            if exp.get("butterfly"):
-                label += " | BF"
-            else:
-                label += " | Had"
 
             row = f"  {label:<45} {status:<10} {w2:>10} {pt:>10} {c4:>10}"
             if has_lm_eval:
@@ -759,24 +719,6 @@ def parse_args():
              "       --only whip swd_unif (whip + SWD-Uniform)\n"
              "Valid losses: whip, swd_unif, swd_gauss",
     )
-    bf_group = parser.add_mutually_exclusive_group()
-    bf_group.add_argument(
-        "--butterfly", action="store_true", default=False,
-        help="Use learnable Butterfly Givens rotations for R3/R4 instead "
-             "of fixed Hadamard.  This is orthogonal to the loss choice "
-             "(loss controls R1/R2; butterfly controls R3/R4).  "
-             "Combines with --only to test specific losses with butterfly. "
-             "E.g.: --only swd_gauss --butterfly",
-    )
-    bf_group.add_argument(
-        "--butterfly-only", dest="butterfly_only",
-        action="store_true", default=False,
-        help="Use learnable Butterfly Givens rotation for R3 only. "
-             "R4 uses fixed Hadamard. R1/R2 train normally with the "
-             "selected loss.  Combines with --only to select loss. "
-             "E.g.: --butterfly-only --only swd_gauss",
-    )
-
     return parser.parse_args()
 
 
@@ -794,8 +736,6 @@ def main():
     print(f"  Output root:  {output_root}")
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
-    print(f"  Butterfly:    {args.butterfly}")
-    print(f"  BF R3 only:  {args.butterfly_only}")
     print(f"  lm_eval:      {args.lm_eval}")
     print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
@@ -846,9 +786,7 @@ def main():
     if args.group in ("all", "comparison"):
         experiments.extend(build_comparison_experiments(
             models, eval_datasets,
-            only_losses=args.only_losses,
-            butterfly=args.butterfly,
-            butterfly_only=args.butterfly_only))
+            only_losses=args.only_losses))
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):

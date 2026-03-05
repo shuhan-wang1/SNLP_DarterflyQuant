@@ -150,6 +150,36 @@ def cleanup_memory():
         torch.cuda.empty_cache()
 
 
+# Maximum GPU memory target (in GB).  The activation collection budget is
+# derived from this so that  model_vram + activations + overhead ≤ limit.
+_GPU_MEM_LIMIT_GB = 28
+
+
+def _estimate_model_vram_gb(model: nn.Module) -> float:
+    """Estimate model GPU memory in GB from parameter tensors."""
+    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    return total_bytes / (1024 ** 3)
+
+
+def _activation_budget_bytes(model: nn.Module) -> int:
+    """Compute how many bytes of activation tensors we can afford.
+
+    During collection the model sits on GPU, so the budget is:
+        act_budget = GPU_LIMIT − model_vram − overhead
+    with a floor of 1 GB and a ceiling of 8 GB (diminishing returns beyond
+    that; the trainer sub-samples anyway).
+    """
+    model_gb = _estimate_model_vram_gb(model)
+    overhead_gb = 3.0                       # CUDA ctx + forward intermediates
+    avail_gb = _GPU_MEM_LIMIT_GB - model_gb - overhead_gb
+    budget_gb = max(1.0, min(avail_gb, 8.0))
+    logging.info(f"  Memory budget: model ~{model_gb:.1f} GB, "
+                 f"overhead ~{overhead_gb:.0f} GB, "
+                 f"activation budget ~{budget_gb:.1f} GB "
+                 f"(GPU limit {_GPU_MEM_LIMIT_GB} GB)")
+    return int(budget_gb * 1024 ** 3)
+
+
 # ============================================================================
 # LayerNorm Fusion (adapted from rotation_utils.py for UnifiedQuantModel)
 # ============================================================================
@@ -1480,12 +1510,11 @@ def run_full_pipeline(args):
 
             # Memory-aware row limit: the hook fires once per sample, so
             # total rows per target = nsamples × min(seqlen, max_rows).
-            # Budget the combined tensor at ≤ 4 GB:
-            #   4 GB = num_targets × nsamples × max_rows × hidden × 4
+            # Budget derived from GPU limit minus model + overhead.
             _num_r1_targets = len(all_target_names)
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _max_total_rows = (4 * 1024 ** 3) // _row_bytes  # 4 GB budget
+            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
             _max_r1_rows_per_hook = max(
                 64, _max_total_rows // (_num_r1_targets * _nsamples)
             )
@@ -1604,11 +1633,27 @@ def run_full_pipeline(args):
                 all_r2_targets[layer_idx] = target
                 all_r2_target_names.append(target)
 
+            # Memory-aware row limit (same pattern as R1 collection above)
+            _num_r2_targets = len(all_r2_target_names)
+            _nsamples = calib_data.shape[0]
+            _row_bytes = umodel.hidden_size * 4          # float32
+            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
+            _max_r2_rows_per_hook = max(
+                64, _max_total_rows // (_num_r2_targets * _nsamples)
+            )
+            _est_gb = (_num_r2_targets * _nsamples *
+                       min(_max_r2_rows_per_hook, args.seqlen) *
+                       _row_bytes / (1024 ** 3))
+
             logging.info(f"  Collecting R2 activations for all "
-                         f"{umodel.num_layers} layers in one pass...")
+                         f"{umodel.num_layers} layers in one pass "
+                         f"({_nsamples} samples, "
+                         f"max {_max_r2_rows_per_hook} rows/hook-call → "
+                         f"~{_est_gb:.1f} GB)...")
             _t_collect = time.time()
             all_acts = collect_activations(
-                model, calib_data, all_r2_target_names, DEV
+                model, calib_data, all_r2_target_names, DEV,
+                max_rows_per_hook=_max_r2_rows_per_hook,
             )
             logging.info(f"  R2 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")

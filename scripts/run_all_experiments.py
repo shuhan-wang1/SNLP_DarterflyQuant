@@ -27,6 +27,9 @@ Usage:
 
   # Weight-only quantization (W4A16KV16, no activation/KV quant)
   python scripts/run_all_experiments.py --w4-only
+
+  # Resume from the most recent incomplete run
+  python scripts/run_all_experiments.py --resume
 """
 
 import os
@@ -750,7 +753,50 @@ def parse_args():
              "(a_bits=16, k_bits=16, v_bits=16) to isolate the effect "
              "of weight quantization alone.",
     )
+    parser.add_argument(
+        "--resume", action="store_true", default=False,
+        help="Auto-resume from the most recent experiment run. "
+             "Detects the newest timestamped directory under --output_root, "
+             "identifies experiments with empty or missing results, and "
+             "resumes from there instead of starting from scratch.",
+    )
     return parser.parse_args()
+
+
+def find_latest_run_dir(output_root: str) -> str | None:
+    """Find the most recent timestamped run directory under output_root.
+
+    Directories are expected to be named like '20260306_221220' (YYYYMMDD_HHMMSS).
+    Returns the full path to the newest one, or None if none exist.
+    """
+    root = Path(output_root)
+    if not root.exists():
+        return None
+
+    timestamp_re = re.compile(r'^\d{8}_\d{6}$')
+    run_dirs = sorted(
+        [d for d in root.iterdir() if d.is_dir() and timestamp_re.match(d.name)],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    return str(run_dirs[0]) if run_dirs else None
+
+
+def detect_completed_experiments(run_dir: str, experiments: list[dict]) -> set[str]:
+    """Check which experiments in a previous run completed successfully.
+
+    An experiment is considered complete if its output subdirectory exists
+    and contains a non-empty results.txt file.
+
+    Returns a set of experiment names that are already done.
+    """
+    completed = set()
+    for exp in experiments:
+        exp_dir = os.path.join(run_dir, exp["name"])
+        results_file = os.path.join(exp_dir, "results.txt")
+        if os.path.isfile(results_file) and os.path.getsize(results_file) > 0:
+            completed.add(exp["name"])
+    return completed
 
 
 def main():
@@ -768,6 +814,7 @@ def main():
     print(f"  Datasets dir: {_DATASETS_CACHE}")
     print(f"  Group:        {args.group}")
     print(f"  W4-only:      {args.w4_only}")
+    print(f"  Resume:       {args.resume}")
     print(f"  lm_eval:      {args.lm_eval}")
     print(f"  No baseline:  {args.no_baseline}")
     print(f"  Dry run:      {args.dry_run}")
@@ -820,6 +867,31 @@ def main():
             models, eval_datasets,
             only_losses=args.only_losses,
             w4_only=args.w4_only))
+
+    # ---- Resume from previous run if requested ----
+    resumed = False
+    if args.resume:
+        latest_dir = find_latest_run_dir(args.output_root)
+        if latest_dir:
+            completed = detect_completed_experiments(latest_dir, experiments)
+            if completed:
+                # Reuse the previous run directory instead of creating a new one
+                output_root = latest_dir
+                pending = [e for e in experiments if e["name"] not in completed]
+                log.info(f"\nResuming from: {latest_dir}")
+                log.info(f"  Completed:  {len(completed)} experiment(s)")
+                for name in sorted(completed):
+                    log.info(f"    [DONE] {name}")
+                log.info(f"  Remaining:  {len(pending)} experiment(s)")
+                experiments = pending
+                resumed = True
+            else:
+                log.info(f"\nFound previous run at {latest_dir} but no experiments "
+                         f"completed — starting fresh in same directory.")
+                output_root = latest_dir
+                resumed = True
+        else:
+            log.info("\nNo previous run found — starting from scratch.")
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):
@@ -875,6 +947,36 @@ def main():
         )
 
     exp_bar.close()
+
+    # ---- Merge previously completed results when resuming ----
+    if resumed:
+        completed_exps = detect_completed_experiments(output_root,
+            build_baseline_experiments(models, eval_datasets) +
+            build_comparison_experiments(models, eval_datasets,
+                only_losses=args.only_losses, w4_only=args.w4_only))
+        # Re-build the full experiment list for the summary
+        all_experiments_full = []
+        if args.group in ("all", "baseline") and not args.no_baseline:
+            all_experiments_full.extend(build_baseline_experiments(models, eval_datasets))
+        if args.group in ("all", "comparison"):
+            all_experiments_full.extend(build_comparison_experiments(
+                models, eval_datasets,
+                only_losses=args.only_losses, w4_only=args.w4_only))
+
+        # Load results for previously completed experiments
+        prev_results = []
+        for exp in all_experiments_full:
+            if exp["name"] in completed_exps and exp["name"] not in {r["name"] for r in all_results}:
+                results_file = os.path.join(output_root, exp["name"], "results.txt")
+                ppl, lm = _parse_results_file(results_file) if os.path.isfile(results_file) else ({}, {})
+                prev_results.append({
+                    "name": exp["name"],
+                    "status": "success (prev)",
+                    "ppl": ppl,
+                    "lm_eval": lm,
+                })
+        all_results = prev_results + all_results
+        experiments = all_experiments_full
 
     # ---- Summary ----
     print_summary(all_results, experiments)

@@ -185,51 +185,61 @@ def _estimate_model_bytes(model: nn.Module) -> int:
 def _activation_budget_bytes(model: nn.Module) -> int:
     """How many bytes of activation data we can store on CPU.
 
-    Dynamically adapts to system RAM **and** model size.  During
-    activation collection the model sits on GPU; afterwards it moves
-    to CPU for rotation training.  The budget must leave room for:
+    Dynamically adapts to system RAM, model size, and model device.
 
-        • the model copy on CPU during training  (~1.5× model_bytes to
-          account for optimizer states and gradient buffers)
-        • the 2× peak when torch.cat merges per-sample lists
-        • OS, Python interpreter, calibration data  (~4 GB base)
+    The model stays on GPU during activation collection and rotation
+    training (to avoid a costly model.cpu() that would spike CPU RAM).
+    When the model is on GPU, CPU only needs room for:
 
-    Formula
-    -------
-        reserved = 4 GB + 1.5 × model_bytes
-        usable   = min(total_ram × 0.4, available_ram × 0.55)
-        budget   = (usable − reserved) / 2
+        • the activation data itself (this budget)
+        • OS, Python interpreter, CUDA driver  (~4 GB base)
 
-    The ``/ 2`` accounts for the temporary doubling during torch.cat.
-    Clamped to [512 MB, 24 GB].
+    When the model is on CPU (fallback), we also reserve 1.5× model
+    bytes for the model, optimizer states, and gradient buffers.
+
+    The ``/ 2`` safety factor accounts for transient peaks during
+    torch.cat and DataLoader pin_memory.  Clamped to [256 MB, 24 GB].
     """
     total_ram = _get_ram_bytes(available=False)
     avail_ram = _get_ram_bytes(available=True)
     model_bytes = _estimate_model_bytes(model)
     model_gb = model_bytes / (1024 ** 3)
-    # Reserve scales with model size: base overhead + model on CPU
-    # with optimizer/gradient buffers (~1.5× param size)
-    reserved = 4 * 1024 ** 3 + int(model_bytes * 1.5)
+
+    # Check if model is on GPU — if so, it doesn't consume CPU RAM
+    try:
+        _first_param = next(model.parameters())
+        model_on_gpu = _first_param.device.type != 'cpu'
+    except StopIteration:
+        model_on_gpu = False
+
+    base_reserved = 4 * 1024 ** 3               # OS + Python + CUDA driver
+    if model_on_gpu:
+        reserved = base_reserved
+    else:
+        reserved = base_reserved + int(model_bytes * 1.5)
+
+    device_tag = "GPU" if model_on_gpu else "CPU"
 
     if total_ram is not None and avail_ram is not None:
-        usable = min(int(total_ram * 0.4), int(avail_ram * 0.55))
+        usable = min(int(total_ram * 0.5), int(avail_ram * 0.7))
         budget = max(0, usable - reserved) // 2
         total_gb = total_ram / (1024 ** 3)
         avail_gb = avail_ram / (1024 ** 3)
     elif avail_ram is not None:
-        budget = max(0, int(avail_ram * 0.55) - reserved) // 2
+        budget = max(0, int(avail_ram * 0.7) - reserved) // 2
         total_gb = float('nan')
         avail_gb = avail_ram / (1024 ** 3)
     else:
-        budget = 2 * 1024 ** 3                  # 2 GB fallback
+        budget = 2 * 1024 ** 3                   # 2 GB fallback
         total_gb = float('nan')
         avail_gb = float('nan')
 
-    budget = max(512 * 1024 ** 2, min(budget, 24 * 1024 ** 3))
+    budget = max(256 * 1024 ** 2, min(budget, 24 * 1024 ** 3))
     budget_gb = budget / (1024 ** 3)
     logging.info(
         f"  System RAM: {total_gb:.0f} GB total, ~{avail_gb:.0f} GB free; "
-        f"model ~{model_gb:.1f} GB → activation budget ~{budget_gb:.1f} GB")
+        f"model ~{model_gb:.1f} GB ({device_tag}) → "
+        f"activation budget ~{budget_gb:.1f} GB")
     return budget
 
 
@@ -397,11 +407,17 @@ def collect_activations(model, calibration_data, target_names, device,
         def hook(module, inp, out):
             tensor = inp[0] if isinstance(inp, tuple) else inp
             if isinstance(tensor, torch.Tensor):
-                flat = tensor.detach().float().cpu().reshape(-1, tensor.shape[-1])
+                # Subsample ON GPU first, THEN move to CPU.
+                # This avoids copying the full (1, seqlen, hidden) tensor
+                # to CPU per hook per sample — for a 3B model with 42
+                # hooks per chunk that would be ~1 GB transient CPU RAM
+                # per sample.
+                flat = tensor.detach().reshape(-1, tensor.shape[-1])
                 if max_rows_per_hook and flat.shape[0] > max_rows_per_hook:
-                    indices = torch.randperm(flat.shape[0])[:max_rows_per_hook]
+                    indices = torch.randperm(
+                        flat.shape[0], device=flat.device)[:max_rows_per_hook]
                     flat = flat[indices]
-                activations[name].append(flat)
+                activations[name].append(flat.float().cpu())
         return hook
 
     for name in target_names:
@@ -427,7 +443,7 @@ def collect_activations(model, calibration_data, target_names, device,
             del inp
             # Periodically release Python-side garbage so accumulated
             # tensor metadata does not exhaust CPU RAM.
-            if (i + 1) % 16 == 0:
+            if (i + 1) % 4 == 0:
                 gc.collect()
 
     for h in hooks:

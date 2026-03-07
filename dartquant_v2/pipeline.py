@@ -189,39 +189,43 @@ def _activation_budget_bytes(model: nn.Module) -> int:
     activation collection the model sits on GPU; afterwards it moves
     to CPU for rotation training.  The budget must leave room for:
 
-        • the model copy on CPU during training  (~model_bytes)
+        • the model copy on CPU during training  (~1.5× model_bytes to
+          account for optimizer states and gradient buffers)
         • the 2× peak when torch.cat merges per-sample lists
-        • OS, Python interpreter, calibration data  (~6 GB reserved)
+        • OS, Python interpreter, calibration data  (~4 GB base)
 
     Formula
     -------
-        usable = min(total_ram × 0.5, available_ram × 0.7)
-        budget = (usable − model_bytes − reserved) / 2
+        reserved = 4 GB + 1.5 × model_bytes
+        usable   = min(total_ram × 0.4, available_ram × 0.55)
+        budget   = (usable − reserved) / 2
 
     The ``/ 2`` accounts for the temporary doubling during torch.cat.
-    Clamped to [1 GB, 32 GB].
+    Clamped to [512 MB, 24 GB].
     """
     total_ram = _get_ram_bytes(available=False)
     avail_ram = _get_ram_bytes(available=True)
     model_bytes = _estimate_model_bytes(model)
     model_gb = model_bytes / (1024 ** 3)
-    reserved = 6 * 1024 ** 3                    # OS + Python + misc
+    # Reserve scales with model size: base overhead + model on CPU
+    # with optimizer/gradient buffers (~1.5× param size)
+    reserved = 4 * 1024 ** 3 + int(model_bytes * 1.5)
 
     if total_ram is not None and avail_ram is not None:
-        usable = min(int(total_ram * 0.5), int(avail_ram * 0.7))
-        budget = max(0, usable - model_bytes - reserved) // 2
+        usable = min(int(total_ram * 0.4), int(avail_ram * 0.55))
+        budget = max(0, usable - reserved) // 2
         total_gb = total_ram / (1024 ** 3)
         avail_gb = avail_ram / (1024 ** 3)
     elif avail_ram is not None:
-        budget = max(0, int(avail_ram * 0.7) - model_bytes - reserved) // 2
+        budget = max(0, int(avail_ram * 0.55) - reserved) // 2
         total_gb = float('nan')
         avail_gb = avail_ram / (1024 ** 3)
     else:
-        budget = 4 * 1024 ** 3                  # 4 GB fallback
+        budget = 2 * 1024 ** 3                  # 2 GB fallback
         total_gb = float('nan')
         avail_gb = float('nan')
 
-    budget = max(1 * 1024 ** 3, min(budget, 32 * 1024 ** 3))
+    budget = max(512 * 1024 ** 2, min(budget, 24 * 1024 ** 3))
     budget_gb = budget / (1024 ** 3)
     logging.info(
         f"  System RAM: {total_gb:.0f} GB total, ~{avail_gb:.0f} GB free; "
@@ -1570,7 +1574,7 @@ def run_full_pipeline(args):
             _row_bytes = umodel.hidden_size * 4          # float32
             _max_total_rows = _activation_budget_bytes(model) // _row_bytes
             _max_r1_rows_per_hook = max(
-                16, _max_total_rows // (_num_r1_targets * _nsamples)
+                8, _max_total_rows // (_num_r1_targets * _nsamples)
             )
             # When budget is generous, rows_per_hook >= seqlen → no
             # subsampling (full quality).  Cap to seqlen for display.
@@ -1697,7 +1701,7 @@ def run_full_pipeline(args):
             _budget = _activation_budget_bytes(model)
             _max_total_rows = _budget // _row_bytes
             _max_r2_rows_per_hook = max(
-                16, _max_total_rows // (_num_r2_targets * _nsamples)
+                8, _max_total_rows // (_num_r2_targets * _nsamples)
             )
             _effective_rows = min(_max_r2_rows_per_hook, args.seqlen)
 

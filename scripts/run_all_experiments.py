@@ -803,8 +803,20 @@ def main():
     args = parse_args()
     cache_dir = args.cache_dir or _HF_HOME
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_root = os.path.join(args.output_root, timestamp)
+    # ---- Resolve output directory (resume reuses the latest run) ----
+    resumed = False
+    if args.resume:
+        latest_dir = find_latest_run_dir(args.output_root)
+        if latest_dir:
+            output_root = latest_dir
+            resumed = True
+        else:
+            log.info("No previous run found — starting from scratch.")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_root = os.path.join(args.output_root, timestamp)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root = os.path.join(args.output_root, timestamp)
 
     print("=" * 70)
     print("DartQuant v2: Unified Experiment Runner")
@@ -868,30 +880,20 @@ def main():
             only_losses=args.only_losses,
             w4_only=args.w4_only))
 
-    # ---- Resume from previous run if requested ----
-    resumed = False
-    if args.resume:
-        latest_dir = find_latest_run_dir(args.output_root)
-        if latest_dir:
-            completed = detect_completed_experiments(latest_dir, experiments)
-            if completed:
-                # Reuse the previous run directory instead of creating a new one
-                output_root = latest_dir
-                pending = [e for e in experiments if e["name"] not in completed]
-                log.info(f"\nResuming from: {latest_dir}")
-                log.info(f"  Completed:  {len(completed)} experiment(s)")
-                for name in sorted(completed):
-                    log.info(f"    [DONE] {name}")
-                log.info(f"  Remaining:  {len(pending)} experiment(s)")
-                experiments = pending
-                resumed = True
-            else:
-                log.info(f"\nFound previous run at {latest_dir} but no experiments "
-                         f"completed — starting fresh in same directory.")
-                output_root = latest_dir
-                resumed = True
+    # ---- Skip completed experiments when resuming ----
+    if resumed:
+        completed = detect_completed_experiments(output_root, experiments)
+        if completed:
+            pending = [e for e in experiments if e["name"] not in completed]
+            log.info(f"\nResuming from: {output_root}")
+            log.info(f"  Completed:  {len(completed)} experiment(s)")
+            for name in sorted(completed):
+                log.info(f"    [DONE] {name}")
+            log.info(f"  Remaining:  {len(pending)} experiment(s)")
+            experiments = pending
         else:
-            log.info("\nNo previous run found — starting from scratch.")
+            log.info(f"\nFound previous run at {output_root} but no experiments "
+                     f"completed — re-running all.")
 
     log.info(f"\nTotal experiments to run: {len(experiments)}")
     for i, exp in enumerate(experiments, 1):

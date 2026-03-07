@@ -526,10 +526,22 @@ def collect_r4_activations(model, calibration_data, umodel, device):
         target_names.append(_r4_hook_path(umodel, i))
 
     acts = collect_activations(model, calibration_data, target_names, device)
-    if acts:
-        all_acts = torch.cat(list(acts.values()), dim=0)
-        return all_acts
-    return None
+    if not acts:
+        return None
+    # Merge incrementally to avoid holding dict + list + cat output
+    _keys = list(acts.keys())
+    _total = sum(acts[k].numel() // acts[_keys[0]].shape[-1] for k in _keys)
+    _dim = acts[_keys[0]].shape[-1]
+    all_acts = torch.empty(_total, _dim, dtype=torch.float32)
+    _off = 0
+    for k in _keys:
+        t = acts.pop(k).reshape(-1, _dim)
+        all_acts[_off:_off + t.shape[0]] = t
+        _off += t.shape[0]
+        del t
+    del acts
+    gc.collect()
+    return all_acts[:_off]
 
 
 def collect_r4_weight_bank(umodel: 'UnifiedQuantModel',
@@ -1571,72 +1583,93 @@ def run_full_pipeline(args):
                     f"{layers_prefix}.{layer_idx}.{umodel.arch.q_proj_attr}"
                 )
 
-            # Memory-aware row limit: the hook fires once per sample, so
-            # total rows per target = nsamples × min(seqlen, max_rows).
-            # Budget dynamically sized to system RAM and model footprint.
-            _num_r1_targets = len(all_target_names)
+            # ── Memory-aware chunked R1 activation collection ──
+            # Collect activations in chunks of layers to bound peak CPU
+            # memory.  Each chunk runs a full forward-pass set, merges
+            # its results into a pre-allocated output tensor, then frees
+            # the chunk.  This avoids holding all 56 targets in RAM at
+            # once (which can exceed available memory on tight systems).
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
-            _max_total_rows = _activation_budget_bytes(model) // _row_bytes
-            _max_r1_rows_per_hook = max(
-                8, _max_total_rows // (_num_r1_targets * _nsamples)
+            _budget = _activation_budget_bytes(model)
+
+            # Decide how many targets to collect per chunk.
+            # Each target produces nsamples × rows_per_hook × hidden × 4 bytes.
+            # We size chunks so each chunk fits within the budget.
+            _num_r1_targets = len(all_target_names)
+            _rows_per_hook = max(
+                8, _budget // max(1, _num_r1_targets * _nsamples * _row_bytes)
             )
-            # When budget is generous, rows_per_hook >= seqlen → no
-            # subsampling (full quality).  Cap to seqlen for display.
-            _effective_rows = min(_max_r1_rows_per_hook, args.seqlen)
-            _est_gb = (_num_r1_targets * _nsamples *
-                       _effective_rows * _row_bytes / (1024 ** 3))
+            _rows_per_hook = min(_rows_per_hook, args.seqlen)
+            _per_target_bytes = _nsamples * _rows_per_hook * _row_bytes
+            _targets_per_chunk = max(
+                1, _budget // max(1, _per_target_bytes)
+            )
+            _targets_per_chunk = min(_targets_per_chunk, _num_r1_targets)
+            _num_chunks = -(-_num_r1_targets // _targets_per_chunk)
+
             _quality = ("full (no subsampling)"
-                        if _max_r1_rows_per_hook >= args.seqlen
-                        else f"subsampled to {_max_r1_rows_per_hook}/{args.seqlen} rows")
+                        if _rows_per_hook >= args.seqlen
+                        else f"subsampled to {_rows_per_hook}/{args.seqlen} rows")
+            _total_est_rows = _num_r1_targets * _nsamples * _rows_per_hook
+            _est_gb = _total_est_rows * _row_bytes / (1024 ** 3)
+            _chunk_gb = _targets_per_chunk * _per_target_bytes / (1024 ** 3)
 
-            logging.info(f"  Collecting R1 activations for all {umodel.num_layers} "
-                         f"layers in one pass ({_nsamples} samples, "
-                         f"{_quality} → ~{_est_gb:.1f} GB)...")
+            logging.info(
+                f"  R1: {_num_r1_targets} targets in {_num_chunks} "
+                f"chunk(s) of <={_targets_per_chunk} targets "
+                f"({_nsamples} samples, {_quality} → "
+                f"~{_est_gb:.1f} GB total, ~{_chunk_gb:.1f} GB/chunk)")
+
+            # Pre-allocate the combined output tensor
+            combined = torch.empty(
+                _total_est_rows, umodel.hidden_size, dtype=torch.float32)
+            _offset = 0
             _t_collect = time.time()
-            all_acts = collect_activations(
-                model, calib_data, all_target_names, DEV,
-                max_rows_per_hook=_max_r1_rows_per_hook,
-            )
-            logging.info(f"  R1 activation collection done in "
-                         f"{time.time() - _t_collect:.1f}s")
 
-            # Merge all per-target activations into a single tensor
-            # BEFORE moving the model to CPU, to avoid holding both
-            # the per-target dict and the model on CPU simultaneously.
-            #
-            # Pre-allocate the output tensor and copy each target's data
-            # into it, then immediately free that target.  This avoids
-            # the 2× peak of torch.cat (which holds both the input list
-            # and the output tensor simultaneously).
-            _act_keys = list(all_acts.keys())
-            # First pass: compute total rows and validate
-            _total_rows = 0
-            for _k in _act_keys:
-                _total_rows += all_acts[_k].numel() // umodel.hidden_size
+            for _ci in range(_num_chunks):
+                _cs = _ci * _targets_per_chunk
+                _ce = min(_cs + _targets_per_chunk, _num_r1_targets)
+                _chunk_names = all_target_names[_cs:_ce]
 
-            if _total_rows == 0:
-                logging.error("No R1 activations collected!")
-                combined = None
-                del all_acts
-            else:
-                combined = torch.empty(
-                    _total_rows, umodel.hidden_size, dtype=torch.float32)
-                _offset = 0
-                for _k in _act_keys:
-                    _chunk = all_acts.pop(_k).reshape(-1, umodel.hidden_size)
-                    _n = _chunk.shape[0]
-                    combined[_offset:_offset + _n] = _chunk
+                logging.info(
+                    f"    R1 chunk {_ci + 1}/{_num_chunks}: "
+                    f"targets {_cs}–{_ce - 1}")
+
+                chunk_acts = collect_activations(
+                    model, calib_data, _chunk_names, DEV,
+                    max_rows_per_hook=_rows_per_hook,
+                )
+
+                # Copy into combined tensor and free chunk immediately
+                for _k in list(chunk_acts.keys()):
+                    _t = chunk_acts.pop(_k).reshape(-1, umodel.hidden_size)
+                    _n = _t.shape[0]
+                    combined[_offset:_offset + _n] = _t
                     _offset += _n
-                    del _chunk
-                del all_acts
+                    del _t
+                del chunk_acts
                 gc.collect()
 
-            # Free GPU for training — model not needed during R1 optimisation.
-            # Done AFTER activations are merged to avoid the peak of
-            # (model on CPU + all per-target tensors + combined tensor).
-            model.cpu()
-            cleanup_memory()
+            # Trim in case actual rows < estimated (due to rounding)
+            if _offset < combined.shape[0]:
+                combined = combined[:_offset]
+            logging.info(f"  R1 activation collection done in "
+                         f"{time.time() - _t_collect:.1f}s "
+                         f"({_offset} rows, "
+                         f"{_offset * _row_bytes / (1024**3):.2f} GB)")
+
+            if _offset == 0:
+                logging.error("No R1 activations collected!")
+                del combined
+                combined = None
+
+            # NOTE: model stays on GPU during R1 training.  The R1
+            # rotation matrix is tiny (~36 MB for hidden=3072) and the
+            # training batches stream from CPU via DataLoader, so GPU
+            # memory is not a bottleneck.  Keeping the model on GPU
+            # avoids a ~6 GB CPU RAM spike from model.cpu() that can
+            # trigger the OOM killer on tight-RAM systems.
 
             if combined is not None:
                 # Auto-adjust batch size so we get ≥ 6 gradient steps per
@@ -1769,8 +1802,9 @@ def run_full_pipeline(args):
                     f"    Collection done in "
                     f"{time.time() - _t_collect:.1f}s")
 
-                # Free GPU for training
-                model.cpu()
+                # Model stays on GPU — R2 rotation matrices are tiny
+                # and training streams data from CPU via DataLoader.
+                # Avoiding model.cpu() saves ~6 GB of CPU RAM.
                 cleanup_memory()
 
                 # Train R2 for each layer in this chunk

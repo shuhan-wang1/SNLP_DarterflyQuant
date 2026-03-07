@@ -437,8 +437,13 @@ def collect_activations(model, calibration_data, target_names, device,
     for name in target_names:
         if activations[name]:
             result[name] = torch.cat(activations[name], dim=0)
+            # Free the list of small tensors immediately after cat
+            # to avoid holding 2× memory per target.
+            del activations[name]
         else:
             logging.warning(f"No activations collected for {name}")
+    del activations
+    gc.collect()
 
     return result
 
@@ -1596,27 +1601,44 @@ def run_full_pipeline(args):
             logging.info(f"  R1 activation collection done in "
                          f"{time.time() - _t_collect:.1f}s")
 
-            # Free GPU for training — model not needed during R1 optimisation
+            # Merge all per-target activations into a single tensor
+            # BEFORE moving the model to CPU, to avoid holding both
+            # the per-target dict and the model on CPU simultaneously.
+            #
+            # Pre-allocate the output tensor and copy each target's data
+            # into it, then immediately free that target.  This avoids
+            # the 2× peak of torch.cat (which holds both the input list
+            # and the output tensor simultaneously).
+            _act_keys = list(all_acts.keys())
+            # First pass: compute total rows and validate
+            _total_rows = 0
+            for _k in _act_keys:
+                _total_rows += all_acts[_k].numel() // umodel.hidden_size
+
+            if _total_rows == 0:
+                logging.error("No R1 activations collected!")
+                combined = None
+                del all_acts
+            else:
+                combined = torch.empty(
+                    _total_rows, umodel.hidden_size, dtype=torch.float32)
+                _offset = 0
+                for _k in _act_keys:
+                    _chunk = all_acts.pop(_k).reshape(-1, umodel.hidden_size)
+                    _n = _chunk.shape[0]
+                    combined[_offset:_offset + _n] = _chunk
+                    _offset += _n
+                    del _chunk
+                del all_acts
+                gc.collect()
+
+            # Free GPU for training — model not needed during R1 optimisation.
+            # Done AFTER activations are merged to avoid the peak of
+            # (model on CPU + all per-target tensors + combined tensor).
             model.cpu()
             cleanup_memory()
 
-            # Concatenate activations from ALL layers into one tensor
-            # and train a SINGLE global R1 (paper Algorithm 1).
-            # No shuffle needed: collect_activations already randomly
-            # subsamples each hook, so every layer contributes proportionally.
-            # The DataLoader in train_r1_single_layer uses np.random.choice
-            # to draw a fresh random subset each call.
-            all_act_tensors = [
-                a.reshape(-1, umodel.hidden_size)
-                for a in all_acts.values()
-            ]
-            del all_acts
-            if not all_act_tensors:
-                logging.error("No R1 activations collected!")
-            else:
-                combined = torch.cat(all_act_tensors, dim=0)
-                del all_act_tensors
-
+            if combined is not None:
                 # Auto-adjust batch size so we get ≥ 6 gradient steps per
                 # epoch even when the combined dataset is much smaller than
                 # the default r1_batch_size (131072).

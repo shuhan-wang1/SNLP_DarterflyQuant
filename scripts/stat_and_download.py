@@ -25,6 +25,7 @@ The script automatically sets offline flags for the training run
 import os
 import sys
 import gc
+import time
 import random
 import numpy as np
 import torch
@@ -34,6 +35,32 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def _retry(fn, max_retries=5, base_delay=10):
+    """Call *fn()* with exponential-backoff retries on transient errors.
+
+    Catches network-related exceptions (httpx, requests, RuntimeError with
+    CAS/Reqwest messages) and retries up to *max_retries* times.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            err = str(e)
+            is_transient = any(k in err for k in (
+                "RemoteProtocolError", "Server disconnected",
+                "CAS service error", "ReqwestMiddleware",
+                "Request failed after", "ConnectionError",
+                "ReadTimeout", "ConnectTimeout",
+                "HTTPSConnectionPool", "ChunkedEncodingError",
+            ))
+            if not is_transient or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"      ↳ transient error (attempt {attempt}/{max_retries}), "
+                  f"retrying in {delay}s... ({type(e).__name__})")
+            time.sleep(delay)
 
 # ============================================================================
 # USER CONFIGURATION
@@ -187,12 +214,12 @@ def load_calibration_data(tokenizer, seq_length: int = 2048) -> torch.Tensor:
     """Load calibration data from wikitext dataset."""
     try:
         print("  Loading wikitext-2-raw-v1 dataset...")
-        dataset = load_dataset(
+        dataset = _retry(lambda: load_dataset(
             "wikitext", "wikitext-2-raw-v1",
             split="train",
             cache_dir=os.environ["HF_DATASETS_CACHE"],
             token=HF_TOKEN,
-        )
+        ))
 
         # Concatenate texts
         texts = []
@@ -306,11 +333,11 @@ def download_datasets():
         for split in splits:
             try:
                 if cfg:
-                    ds = load_dataset(repo, cfg, split=split,
-                                     cache_dir=cache, token=HF_TOKEN)
+                    ds = _retry(lambda r=repo, c=cfg, s=split: load_dataset(
+                        r, c, split=s, cache_dir=cache, token=HF_TOKEN))
                 else:
-                    ds = load_dataset(repo, split=split,
-                                     cache_dir=cache, token=HF_TOKEN)
+                    ds = _retry(lambda r=repo, s=split: load_dataset(
+                        r, split=s, cache_dir=cache, token=HF_TOKEN))
                 print(f"    ✓ {split}: {len(ds):,} samples")
                 del ds
             except Exception as e:
@@ -320,13 +347,13 @@ def download_datasets():
     print(f"\n  [C4] allenai/c4  (validation only: {len(C4_DATA_FILES['validation'])} shard)")
     for split, files in C4_DATA_FILES.items():
         try:
-            ds = load_dataset(
+            ds = _retry(lambda s=split, f=files: load_dataset(
                 "allenai/c4",
-                data_files={split: files},
-                split=split,
+                data_files={s: f},
+                split=s,
                 cache_dir=cache,
                 token=HF_TOKEN,
-            )
+            ))
             print(f"    ✓ {split}: {len(ds):,} samples")
             del ds
         except Exception as e:
@@ -345,18 +372,18 @@ def analyze_model(model_name: str):
     try:
         # Load tokenizer
         print("  Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = _retry(lambda: AutoTokenizer.from_pretrained(
             model_name,
             cache_dir=HF_HOME,
             trust_remote_code=True,
             token=HF_TOKEN
-        )
+        ))
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
         # Load model
         print("  Loading model...")
-        model = AutoModelForCausalLM.from_pretrained(
+        model = _retry(lambda: AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=DTYPE,
             device_map="auto",
@@ -364,7 +391,7 @@ def analyze_model(model_name: str):
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             token=HF_TOKEN
-        )
+        ))
         model.eval()
 
         # Get number of layers

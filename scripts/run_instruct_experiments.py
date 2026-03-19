@@ -49,11 +49,9 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
-INSTRUCT_MODELS = [
-    "meta-llama/Llama-3.2-1B-Instruct",
-    "meta-llama/Llama-3.2-3B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
-]
+def _is_instruct_model(name: str) -> bool:
+    lower = name.lower()
+    return 'instruct' in lower or 'chat' in lower
 
 
 def parse_args():
@@ -81,17 +79,16 @@ def main():
     args = parse_args()
     cache_dir = args.cache_dir or _HF_HOME
 
-    # ---- Resolve models ----
+    # ---- Resolve models (auto-detect all instruct models from cache) ----
     if args.models:
         models = args.models
     else:
         cached = detect_cached_models(cache_dir)
-        models = [m for m in cached if m in INSTRUCT_MODELS]
+        models = [m for m in cached if _is_instruct_model(m)]
         if not models:
             log.warning(
                 "No instruct models found in cache. "
-                "Available: %s\nExpected: %s",
-                cached, INSTRUCT_MODELS,
+                "Available: %s", cached,
             )
             sys.exit(1)
     log.info("Instruct models: %s", models)

@@ -84,6 +84,7 @@ def main():
         models = args.models
     else:
         cached = detect_cached_models(cache_dir)
+        log.info("All cached models: %s", cached)
         models = [m for m in cached if _is_instruct_model(m)]
         if not models:
             log.warning(
@@ -91,7 +92,7 @@ def main():
                 "Available: %s", cached,
             )
             sys.exit(1)
-    log.info("Instruct models: %s", models)
+    log.info("Instruct models (%d): %s", len(models), models)
 
     # ---- Resolve datasets ----
     eval_datasets = detect_cached_datasets(_DATASETS_CACHE) or ["wikitext2"]
@@ -156,10 +157,13 @@ def main():
     print("=" * 70)
 
     for i, exp in enumerate(experiments, 1):
-        a = exp.get('a_bits', 4)
-        tag = f"W{exp.get('w_bits', 4)}A{a}KV{exp.get('k_bits', 4)}"
-        print(f"  [{i:2d}] {_model_short(exp['model'])} | "
-              f"{exp['loss']} | {exp['quantizer_type']} | {tag}")
+        if exp.get("baseline"):
+            print(f"  [{i:2d}] {_model_short(exp['model'])} | FP16 baseline")
+        else:
+            a = exp.get('a_bits', 4)
+            tag = f"W{exp.get('w_bits', 4)}A{a}KV{exp.get('k_bits', 4)}"
+            print(f"  [{i:2d}] {_model_short(exp['model'])} | "
+                  f"{exp['loss']} | {exp['quantizer_type']} | {tag}")
     print()
 
     # ---- Extra CLI args ----

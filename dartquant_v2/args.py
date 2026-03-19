@@ -287,6 +287,16 @@ def create_parser() -> argparse.ArgumentParser:
         help='lm_eval zero-shot tasks')
     eval_group.add_argument('--lm_eval_batch_size', type=int, default=32,
                             help='Batch size for lm_eval')
+    eval_group.add_argument(
+        '--apply_chat_template', action='store_true', default=False,
+        help='Apply the model\'s chat template when running lm_eval. '
+             'Required for instruction-tuned models (e.g. Llama-3.2-1B-Instruct) '
+             'to get correct benchmark scores. Auto-enabled when the model '
+             'name contains "Instruct" or "chat".')
+    eval_group.add_argument(
+        '--no_apply_chat_template', action='store_false',
+        dest='apply_chat_template',
+        help='Disable chat template even for instruct models.')
 
     # ==== Output ====
     out_group = parser.add_argument_group('Output')

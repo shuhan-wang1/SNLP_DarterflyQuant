@@ -328,6 +328,11 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
     if lm_eval:
         cmd.append("--lm_eval")
 
+    # Auto-enable chat template for instruct models
+    model_lower = exp["model"].lower()
+    if 'instruct' in model_lower or 'chat' in model_lower:
+        cmd.append("--apply_chat_template")
+
     cmd.extend(extra_args)
 
     return cmd

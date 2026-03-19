@@ -1311,6 +1311,12 @@ def _restore_offline_and_cache(restore):
             os.environ[key] = val
 
 
+def _is_instruct_model(model_name: str) -> bool:
+    """Detect whether a model is instruction-tuned from its name."""
+    lower = model_name.lower()
+    return 'instruct' in lower or 'chat' in lower
+
+
 def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
     """Run zero-shot benchmarks via lm-evaluation-harness."""
     try:
@@ -1321,11 +1327,23 @@ def evaluate_model_lm_eval(model, args, umodel: UnifiedQuantModel):
         return {}
 
     tokenizer = umodel.get_tokenizer()
-    hflm = HFLM(
+
+    # Auto-detect instruct models and enable chat template
+    use_chat_template = getattr(args, 'apply_chat_template', False)
+    if not use_chat_template and _is_instruct_model(args.model):
+        logging.info("  Auto-enabling apply_chat_template for instruct model")
+        use_chat_template = True
+
+    hflm_kwargs = dict(
         pretrained=model,
         tokenizer=tokenizer,
         batch_size=args.lm_eval_batch_size,
     )
+    if use_chat_template:
+        hflm_kwargs['apply_chat_template'] = True
+        logging.info("  lm_eval: using model chat template for prompts")
+
+    hflm = HFLM(**hflm_kwargs)
 
     task_names = args.lm_eval_tasks
     logging.info(f"  lm_eval tasks: {task_names}")
@@ -1401,6 +1419,8 @@ def _ensure_dartquant_compat_args(args):
         'eval_dataset': 'wikitext2',
         # DartQuant calibrater: alternative arg names
         'a_bits_down_proj': None,
+        # lm_eval: chat template for instruct models
+        'apply_chat_template': False,
     }
     for key, default in _DEFAULTS.items():
         if not hasattr(args, key):

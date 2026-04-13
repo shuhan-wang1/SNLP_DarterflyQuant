@@ -43,7 +43,13 @@
       "Bash(git add \"dartquant_v2/__pycache__/\" \"dartquant_v2/arch/__pycache__/\" \"dartquant_v2/arch/dense/__pycache__/\")",
       "Bash(xargs grep -l \"ActQuantWrapper\")",
       "Bash(xargs grep -l \"class.*QuantWrapper\")",
-      "Bash(xargs grep -l \"3B\\\\|3b\\\\|3 billion\\\\|3b model\")"
+      "Bash(xargs grep -l \"3B\\\\|3b\\\\|3 billion\\\\|3b model\")",
+      "WebSearch",
+      "Bash(find:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:blog.eleuther.ai)"
     ]
   }
 }

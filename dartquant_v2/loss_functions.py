@@ -74,8 +74,11 @@ def calc_swd_unif_loss(outputs: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         rms = torch.sqrt((x ** 2).mean())                # scalar — GLOBAL RMS
         b = math.sqrt(3) * rms                            # scalar — same for ALL dims
-        t = torch.linspace(0, 1, steps=B, device=outputs.device)   # (B,)
-        target = b * (2 * t.unsqueeze(1) - 1)             # (B, D) — uniform scale
+        # Midpoint convention u_i = (i - 0.5)/N (paper Eq. 4) — keeps all
+        # evaluation points strictly inside (0, 1) so SWD-Unif and SWD-Gauss
+        # share the same quantile grid.
+        u = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
+        target = b * (2 * u.unsqueeze(1) - 1)             # (B, D) — uniform scale
 
     # sum over D (features), mean over B (batch) — matches Whip convention
     loss = (x_sorted - target).pow(2).sum(dim=-1).mean()
@@ -103,9 +106,6 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
       large residuals, giving the optimiser a clear direction to
       reduce the loss.  This is the same approach swd_unif uses.
 
-    Standard-normal quantiles are clamped to [-4, 4] to prevent extreme
-    tail residuals when batch size is very large (B > 10k).
-
     Reduction: sum over D (feature dims), mean over B (batch).
 
     Pairs naturally with NF4 (Normal Float 4-bit) quantizer.
@@ -120,10 +120,10 @@ def calc_swd_gauss_loss(outputs: torch.Tensor) -> torch.Tensor:
 
     with torch.no_grad():
         sigma_hat = torch.sqrt((x ** 2).mean()).clamp(min=1e-8)  # scalar — GLOBAL RMS
-        probs = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
-        probs = probs.clamp(1e-6, 1 - 1e-6)             # (B,)
-        std_quantiles = math.sqrt(2) * torch.erfinv(2 * probs - 1)  # (B,) standard normal
-        std_quantiles = std_quantiles.clamp(-4.0, 4.0)   # prevent extreme tails
+        # Midpoint convention u_i = (i - 0.5)/N (paper Eq. 5) — already
+        # strictly inside (0, 1), so Phi^{-1} is finite without clamping.
+        u = (torch.arange(1, B + 1, device=outputs.device, dtype=torch.float32) - 0.5) / B
+        std_quantiles = math.sqrt(2) * torch.erfinv(2 * u - 1)   # (B,) standard normal
         quantiles = std_quantiles.unsqueeze(1) * sigma_hat  # (B, D) — broadcast scalar
 
     # sum over D (features), mean over B (batch) — matches Whip convention

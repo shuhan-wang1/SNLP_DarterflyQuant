@@ -179,6 +179,7 @@ def train_r1_single_layer(
     train_subset_size: float = 1.0,
     device='cuda',
     layer_idx: int = 0,
+    init_matrix: torch.Tensor = None,
 ) -> torch.Tensor:
     """Train R1 rotation for a single layer.
 
@@ -189,6 +190,10 @@ def train_r1_single_layer(
         acts: Activation tensor (N, hidden_size) — already concatenated
               from all targets for this layer.
         layer_idx: Layer index (for logging only).
+        init_matrix: Optional pre-computed initialization matrix shared
+              across layers.  When provided, overrides init_mode.  Used to
+              implement the paper's "each R_1^(l) is initialised from the
+              SAME random Hadamard matrix" (§3.4).
 
     Returns:
         Trained rotation matrix tensor (hidden_size, hidden_size), float64.
@@ -204,7 +209,10 @@ def train_r1_single_layer(
     dataset = TensorDataset(acts)
 
     R1 = R1_QR(hidden_size).to(device)
-    R1.matrix.data = _get_init_matrix(hidden_size, init_mode, device).float()
+    if init_matrix is not None:
+        R1.matrix.data = init_matrix.to(device=device, dtype=torch.float32)
+    else:
+        R1.matrix.data = _get_init_matrix(hidden_size, init_mode, device).float()
 
     optimizer = _create_optimizer(R1.parameters(), optim, lr, momentum)
     scheduler = (CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)

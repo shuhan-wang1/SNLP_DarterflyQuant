@@ -1575,65 +1575,42 @@ def run_full_pipeline(args):
     logging.info(f"  Calibration data: {calib_data.shape}")
     logging.info(f"  Step 3 done in {time.time() - _t:.1f}s")
 
-    # ======== Step 4: Train per-layer independent R1 (report §3.4) ========
-    # Each Transformer block gets its own learned R1^(l) rotation, trained
-    # on that layer's own up_proj and q_proj input activations.  All
-    # R1^(l) are initialised from the SAME random Hadamard matrix so
-    # differences between layers reflect only each layer's loss landscape,
-    # not initialisation noise.  The per-layer rotation is then applied
-    # symmetrically (W_in = W_in @ R1^(l); W_out = R1^(l)^T @ W_out) so
-    # the residual bypass remains in the original space.
-    R1_dict = None
+    # ======== Step 4: Train R1 (single global rotation) ========
+    # DartQuant paper (Section 4, Appendix A, Figure 9) defines R1 as a
+    # SINGLE global orthogonal rotation for the entire residual stream.
+    # R1 is absorbed into embeddings, lm_head, and all per-layer weights
+    # to preserve mathematical equivalence.  Using per-layer R1 would
+    # break the residual connections and attention score computation.
+    R1_global = None
     if args.use_r1:
-        _num_layers = umodel.num_layers
         if args.r1_path:
             logging.info(f"[4/12] Loading R1 from {args.r1_path}...")
             r1_data = torch.load(args.r1_path, map_location='cpu')
-            if (isinstance(r1_data, dict) and len(r1_data) > 0
-                    and all(isinstance(k, (int,)) for k in r1_data.keys())):
-                # Native per-layer dict: {layer_idx (int): Tensor}
-                R1_dict = {int(k): v for k, v in r1_data.items()}
-                logging.info(f"  Loaded per-layer R1 dict ({len(R1_dict)} layers)")
-            elif isinstance(r1_data, dict) and 'R1' in r1_data:
-                # Legacy global-tensor format wrapped in {'R1': Tensor}
-                _R1 = r1_data['R1']
-                R1_dict = {i: _R1 for i in range(_num_layers)}
-                logging.warning(
-                    "Loaded legacy global R1 — broadcasting to all layers. "
-                    "For paper-compliant per-layer R1 training, retrain "
-                    "without --r1_path."
-                )
+            if isinstance(r1_data, dict) and 'R1' in r1_data:
+                R1_global = r1_data['R1']
             elif isinstance(r1_data, torch.Tensor):
-                # Legacy global-tensor format
-                R1_dict = {i: r1_data for i in range(_num_layers)}
+                R1_global = r1_data
+            elif isinstance(r1_data, dict):
+                # Legacy per-layer format: use layer 0 as global
+                # (better than nothing, but retraining is recommended)
+                first_key = next(iter(r1_data))
+                R1_global = r1_data[first_key]
                 logging.warning(
-                    "Loaded legacy global R1 tensor — broadcasting to all "
-                    "layers. For paper-compliant per-layer R1 training, "
-                    "retrain without --r1_path."
-                )
-            else:
-                raise ValueError(
-                    f"Unrecognised R1 checkpoint format in {args.r1_path}: "
-                    f"{type(r1_data)}"
+                    "Loaded per-layer R1 dict — using first entry as "
+                    "global R1. Retraining with global R1 is recommended."
                 )
         else:
-            logging.info("[4/12] Collecting activations and training per-layer R1...")
+            logging.info("[4/12] Collecting activations and training R1 (global)...")
             _t4 = time.time()
             model.to(DEV)
 
-            from .trainers import (
-                train_r1_single_layer,
-                _get_init_matrix,
-                _parse_layer_idx as _trainer_parse_layer_idx,
-            )
+            from .trainers import train_r1_single_layer
             layers_prefix = umodel.arch.layers_path
 
             # Build ALL target names across all layers so we can collect
-            # every layer's up_proj + q_proj activations in a SINGLE
-            # forward pass.  Activations are then dispatched into per-layer
-            # buckets for independent R1^(l) training.
+            # every layer's activations in a SINGLE forward pass.
             all_target_names = []
-            for layer_idx in range(_num_layers):
+            for layer_idx in range(umodel.num_layers):
                 if umodel.arch.mlp_up_proj_attr:
                     all_target_names.append(
                         f"{layers_prefix}.{layer_idx}.{umodel.arch.mlp_up_proj_attr}"
@@ -1643,13 +1620,18 @@ def run_full_pipeline(args):
                 )
 
             # ── Memory-aware chunked R1 activation collection ──
-            # Collect activations in chunks of targets to bound peak CPU
-            # memory.  Each chunk runs a full forward-pass set, dispatches
-            # its outputs into per-layer buckets, then frees the chunk.
+            # Collect activations in chunks of layers to bound peak CPU
+            # memory.  Each chunk runs a full forward-pass set, merges
+            # its results into a pre-allocated output tensor, then frees
+            # the chunk.  This avoids holding all 56 targets in RAM at
+            # once (which can exceed available memory on tight systems).
             _nsamples = calib_data.shape[0]
             _row_bytes = umodel.hidden_size * 4          # float32
             _budget = _activation_budget_bytes(model)
 
+            # Decide how many targets to collect per chunk.
+            # Each target produces nsamples × rows_per_hook × hidden × 4 bytes.
+            # We size chunks so each chunk fits within the budget.
             _num_r1_targets = len(all_target_names)
             _rows_per_hook = max(
                 8, _budget // max(1, _num_r1_targets * _nsamples * _row_bytes)
@@ -1675,9 +1657,10 @@ def run_full_pipeline(args):
                 f"({_nsamples} samples, {_quality} → "
                 f"~{_est_gb:.1f} GB total, ~{_chunk_gb:.1f} GB/chunk)")
 
-            # Per-layer activation accumulators (list of (N, hidden) tensors
-            # to be concatenated once collection finishes).
-            acts_per_layer: dict = {i: [] for i in range(_num_layers)}
+            # Pre-allocate the combined output tensor
+            combined = torch.empty(
+                _total_est_rows, umodel.hidden_size, dtype=torch.float32)
+            _offset = 0
             _t_collect = time.time()
 
             for _ci in range(_num_chunks):
@@ -1694,110 +1677,87 @@ def run_full_pipeline(args):
                     max_rows_per_hook=_rows_per_hook,
                 )
 
-                # Dispatch each target's activations into its layer's bucket
+                # Copy into combined tensor and free chunk immediately
                 for _k in list(chunk_acts.keys()):
-                    lid = _trainer_parse_layer_idx(_k)
                     _t = chunk_acts.pop(_k).reshape(-1, umodel.hidden_size)
-                    if lid < 0 or lid not in acts_per_layer:
-                        del _t
-                        continue
-                    acts_per_layer[lid].append(_t)
+                    _n = _t.shape[0]
+                    combined[_offset:_offset + _n] = _t
+                    _offset += _n
+                    del _t
                 del chunk_acts
                 gc.collect()
 
-            # Concatenate per-layer buckets; drop empty layers
-            _total_rows = 0
-            for lid in list(acts_per_layer.keys()):
-                if not acts_per_layer[lid]:
-                    del acts_per_layer[lid]
-                    continue
-                acts_per_layer[lid] = torch.cat(acts_per_layer[lid], dim=0)
-                _total_rows += acts_per_layer[lid].shape[0]
-            logging.info(
-                f"  R1 activation collection done in "
-                f"{time.time() - _t_collect:.1f}s "
-                f"({_total_rows} rows across {len(acts_per_layer)} layers, "
-                f"{_total_rows * _row_bytes / (1024**3):.2f} GB)"
-            )
+            # Trim in case actual rows < estimated (due to rounding)
+            if _offset < combined.shape[0]:
+                combined = combined[:_offset]
+            logging.info(f"  R1 activation collection done in "
+                         f"{time.time() - _t_collect:.1f}s "
+                         f"({_offset} rows, "
+                         f"{_offset * _row_bytes / (1024**3):.2f} GB)")
 
-            if not acts_per_layer:
+            if _offset == 0:
                 logging.error("No R1 activations collected!")
-            else:
-                # Single shared Hadamard init reused by every layer
-                # (report §3.4: "each R_1^(l) is initialised from the SAME
-                # random Hadamard matrix").
-                shared_init = _get_init_matrix(
-                    umodel.hidden_size, args.rotate_mode, DEV
-                ).float().detach().cpu()
-                logging.info(
-                    f"  Shared {args.rotate_mode} init matrix sampled "
-                    f"(shape {tuple(shared_init.shape)})"
+                del combined
+                combined = None
+
+            # NOTE: model stays on GPU during R1 training.  The R1
+            # rotation matrix is tiny (~36 MB for hidden=3072) and the
+            # training batches stream from CPU via DataLoader, so GPU
+            # memory is not a bottleneck.  Keeping the model on GPU
+            # avoids a ~6 GB CPU RAM spike from model.cpu() that can
+            # trigger the OOM killer on tight-RAM systems.
+
+            if combined is not None:
+                # Auto-adjust batch size so we get ≥ 6 gradient steps per
+                # epoch even when the combined dataset is much smaller than
+                # the default r1_batch_size (131072).
+                _approx_subset_rows = max(1, int(combined.shape[0] * args.train_subset_size))
+                _r1_batch_size = args.r1_batch_size
+                if _approx_subset_rows < _r1_batch_size * 6:
+                    _r1_batch_size = max(64, _approx_subset_rows // 6)
+                    logging.info(
+                        f"  Auto-adjusted r1_batch_size: {args.r1_batch_size} → "
+                        f"{_r1_batch_size} (subset ≈ {_approx_subset_rows} rows, "
+                        f"targeting ≥6 batches/epoch)"
+                    )
+
+                logging.info(f"  Training single global R1 on "
+                             f"{combined.shape[0]} rows from "
+                             f"{umodel.num_layers} layers "
+                             f"(subset {args.train_subset_size:.0%} per epoch)...")
+
+                R1_global = train_r1_single_layer(
+                    acts=combined,
+                    hidden_size=umodel.hidden_size,
+                    loss_fn_name=args.loss,
+                    lr=args.lr,
+                    momentum=args.momentum,
+                    epochs=args.r1_epochs,
+                    batch_size=_r1_batch_size,
+                    cos_lr=args.cos_lr,
+                    optim=args.optim,
+                    init_mode=args.rotate_mode,
+                    accumulation_steps=args.accumulation_steps,
+                    train_subset_size=args.train_subset_size,
+                    device=DEV,
+                    layer_idx=0,
                 )
 
-                R1_dict = {}
-                for lid in sorted(acts_per_layer.keys()):
-                    layer_acts = acts_per_layer[lid]
-
-                    # Auto-adjust batch size: ensure ≥6 gradient steps per
-                    # epoch even when a single layer's activation tensor is
-                    # smaller than the default r1_batch_size (131072).
-                    _approx_subset_rows = max(
-                        1, int(layer_acts.shape[0] * args.train_subset_size)
-                    )
-                    _r1_batch_size = args.r1_batch_size
-                    if _approx_subset_rows < _r1_batch_size * 6:
-                        _r1_batch_size = max(64, _approx_subset_rows // 6)
-
-                    logging.info(
-                        f"  Training R1 layer {lid}: "
-                        f"{layer_acts.shape[0]} rows, "
-                        f"batch_size={_r1_batch_size}"
-                    )
-
-                    R1_dict[lid] = train_r1_single_layer(
-                        acts=layer_acts,
-                        hidden_size=umodel.hidden_size,
-                        loss_fn_name=args.loss,
-                        lr=args.lr,
-                        momentum=args.momentum,
-                        epochs=args.r1_epochs,
-                        batch_size=_r1_batch_size,
-                        cos_lr=args.cos_lr,
-                        optim=args.optim,
-                        init_mode=args.rotate_mode,
-                        accumulation_steps=args.accumulation_steps,
-                        train_subset_size=args.train_subset_size,
-                        device=DEV,
-                        layer_idx=lid,
-                        init_matrix=shared_init,
-                    )
-
-                    # Free this layer's activations immediately
-                    del layer_acts
-                    acts_per_layer[lid] = None
-                    gc.collect()
-
-                del acts_per_layer, shared_init
-            logging.info(
-                f"  Per-layer R1 training complete "
-                f"in {time.time() - _t4:.1f}s "
-                f"({len(R1_dict) if R1_dict else 0} layers)"
-            )
+                del combined
+            logging.info(f"  R1 training complete "
+                         f"in {time.time() - _t4:.1f}s")
             cleanup_memory()
     else:
         logging.info("[4/12] R1 disabled, skipping...")
 
-    # ======== Step 5: Apply per-layer R1 ========
-    if R1_dict:
-        logging.info(
-            f"[5/12] Applying per-layer R1 rotation to model "
-            f"({len(R1_dict)} layers)..."
-        )
+    # ======== Step 5: Apply R1 (global) ========
+    if R1_global is not None:
+        logging.info("[5/12] Applying global R1 rotation to model...")
         _t = time.time()
         smooth_scale = None
         if args.smooth:
             smooth_scale = torch.load(args.smooth)
-        apply_r1_rotation_per_layer(model, R1_dict, umodel, smooth_scale)
+        apply_r1_rotation(model, R1_global, umodel, smooth_scale)
         logging.info(f"  Step 5 done in {time.time() - _t:.1f}s")
     else:
         logging.info("[5/12] No R1, skipping rotation...")
@@ -2170,11 +2130,10 @@ def run_full_pipeline(args):
         logging.info(f"  {task}: {acc:.2f}%")
     logging.info("=" * 70)
 
-    # Save rotations — R1 is saved as a per-layer dict {layer_idx: Tensor}
-    # matching the format expected by apply_r1_rotation_per_layer.
+    # Save rotations
     if args.save_rotations:
         save_data = {
-            'R1': R1_dict,
+            'R1': R1_global,
             'R2': R2_dict,
             'config': {
                 'model': args.model,

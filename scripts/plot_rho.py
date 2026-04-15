@@ -82,6 +82,12 @@ PALETTE = {
     "3B": "#D55E00",   # vermillion
     "8B": "#009E73",   # green
 }
+# Exact model family per scale (1B/3B are Llama-3.2; 8B is Llama-3.1).
+FAMILY = {
+    "1B": "Llama-3.2-1B",
+    "3B": "Llama-3.2-3B",
+    "8B": "Llama-3.1-8B",
+}
 STREAM_STYLE = {
     "Q": dict(linestyle="-",  lw=1.4),
     "K": dict(linestyle="--", lw=1.4),
@@ -190,7 +196,7 @@ def plot_rho_profile(df_agg: pd.DataFrame, out_path: Path) -> None:
 
     # --- shared legend below the panels ---------------------------------
     scale_handles = [
-        Line2D([], [], color=PALETTE[s], lw=1.4, label=f"Llama-3.x-{s}")
+        Line2D([], [], color=PALETTE[s], lw=1.4, label=FAMILY[s])
         for s in ("1B", "3B", "8B")
     ]
     stream_handles = [
@@ -229,7 +235,7 @@ def plot_rho_distribution(summary_csvs: dict[str, pd.DataFrame],
     for model in ("llama-3.2-1b", "llama-3.2-3b", "llama-3.1-8b"):
         scale = _scale_of(model)
         x_ticks.append(pos + 0.5)
-        x_tick_labels.append(f"Llama-3.x-{scale}")
+        x_tick_labels.append(FAMILY[scale])
         for stream in ("Q", "K"):
             df_full = summary_csvs[model]
             r = np.abs(df_full[df_full["stream"] == stream]["rho"].to_numpy())

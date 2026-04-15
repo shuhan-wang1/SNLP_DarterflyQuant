@@ -197,10 +197,53 @@ def _collect_r1_activations(model, umodel: UnifiedQuantModel,
     return combined
 
 
+def _load_r1_from_file(path: str, hidden_size: int) -> torch.Tensor:
+    """Load a pre-trained R1 from a ``rotations.pt`` or bare-tensor ``.pt``.
+
+    Mirrors the loader in ``dartquant_v2/pipeline.py`` (``--r1_path``) so that
+    a capture run can reuse an R1 that a full-pipeline run already trained,
+    skipping the 30-100 epoch retraining.
+
+    Accepted shapes:
+      * ``{'R1': tensor(H, H), ...}``       (standard save_data format)
+      * raw ``tensor(H, H)``                 (bare tensor save)
+      * ``{layer_idx: tensor(H, H), ...}``   (legacy per-layer dict — takes
+                                              the first entry as global R1)
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(blob, dict) and "R1" in blob and blob["R1"] is not None:
+        R1 = blob["R1"]
+    elif isinstance(blob, torch.Tensor):
+        R1 = blob
+    elif isinstance(blob, dict) and len(blob) > 0:
+        first = next(iter(blob))
+        R1 = blob[first]
+        log.warning("Loaded per-layer R1 dict from %s; using entry %r as "
+                    "global R1.", path, first)
+    else:
+        raise ValueError(
+            f"--r1_path {path!r} does not contain a usable R1 (keys: "
+            f"{list(blob.keys()) if isinstance(blob, dict) else type(blob)})."
+        )
+    if R1 is None:
+        raise ValueError(
+            f"--r1_path {path!r} loaded R1=None. This is typically a "
+            "rotations.pt produced by a --no_r1 run (e.g. nf4_naive) and "
+            "cannot be reused for rotation visualisation."
+        )
+    if R1.shape != (hidden_size, hidden_size):
+        raise ValueError(
+            f"R1 shape {tuple(R1.shape)} != (hidden={hidden_size},"
+            f" {hidden_size}). Wrong model?"
+        )
+    return R1
+
+
 def train_and_apply_r1(model, umodel: UnifiedQuantModel, calib: torch.Tensor,
                        loss_name: str, r1_epochs: int, r1_batch_size: int,
-                       max_rows_per_hook: int, seed: int) -> None:
-    """Collect R1 activations → train global R1 with the given loss → bake in.
+                       max_rows_per_hook: int, seed: int,
+                       r1_path: str | None = None) -> None:
+    """Either load R1 from disk or collect acts → train R1 → apply to weights.
 
     Hyperparameters follow pipeline.run_full_pipeline's auto-tuning logic
     for SWD/Gauss losses so the visualisation reflects the same training
@@ -209,46 +252,51 @@ def train_and_apply_r1(model, umodel: UnifiedQuantModel, calib: torch.Tensor,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    _DIST = ("swd_unif", "swd_gauss", "kl_unif", "kl_gauss",
-             "bin_kl_unif", "bin_kl_nf4")
-    if loss_name in _DIST:
-        r1_epochs = max(r1_epochs, 30)
-        r1_batch_size = max(r1_batch_size, 256)
-        optim = "adam"
-        cos_lr = True
-        lr = 1e-3
+    if r1_path:
+        log.info("Loading R1 from %s (skipping training)", r1_path)
+        R1 = _load_r1_from_file(r1_path, umodel.hidden_size)
     else:
-        optim = "sgd"
-        cos_lr = False
-        lr = 1e-3
-    if loss_name == "swd_gauss":
-        lr = 1e-2
-        r1_epochs = max(r1_epochs, 100)
+        _DIST = ("swd_unif", "swd_gauss", "kl_unif", "kl_gauss",
+                 "bin_kl_unif", "bin_kl_nf4")
+        if loss_name in _DIST:
+            r1_epochs = max(r1_epochs, 30)
+            r1_batch_size = max(r1_batch_size, 256)
+            optim = "adam"
+            cos_lr = True
+            lr = 1e-3
+        else:
+            optim = "sgd"
+            cos_lr = False
+            lr = 1e-3
+        if loss_name == "swd_gauss":
+            lr = 1e-2
+            r1_epochs = max(r1_epochs, 100)
 
-    log.info("R1 training config: loss=%s epochs=%d bs=%d optim=%s lr=%g cos=%s",
-             loss_name, r1_epochs, r1_batch_size, optim, lr, cos_lr)
+        log.info("R1 training config: loss=%s epochs=%d bs=%d optim=%s "
+                 "lr=%g cos=%s",
+                 loss_name, r1_epochs, r1_batch_size, optim, lr, cos_lr)
 
-    acts = _collect_r1_activations(model, umodel, calib, max_rows_per_hook)
-    log.info("R1 activation pool: %s", tuple(acts.shape))
+        acts = _collect_r1_activations(model, umodel, calib, max_rows_per_hook)
+        log.info("R1 activation pool: %s", tuple(acts.shape))
 
-    R1 = train_r1_single_layer(
-        acts=acts,
-        hidden_size=umodel.hidden_size,
-        loss_fn_name=loss_name,
-        lr=lr,
-        momentum=0.9,
-        epochs=r1_epochs,
-        batch_size=r1_batch_size,
-        cos_lr=cos_lr,
-        optim=optim,
-        init_mode="hadamard",
-        accumulation_steps=1,
-        train_subset_size=0.1,
-        device=DEV,
-        layer_idx=0,
-    )
-    del acts
-    cleanup_memory()
+        R1 = train_r1_single_layer(
+            acts=acts,
+            hidden_size=umodel.hidden_size,
+            loss_fn_name=loss_name,
+            lr=lr,
+            momentum=0.9,
+            epochs=r1_epochs,
+            batch_size=r1_batch_size,
+            cos_lr=cos_lr,
+            optim=optim,
+            init_mode="hadamard",
+            accumulation_steps=1,
+            train_subset_size=0.1,
+            device=DEV,
+            layer_idx=0,
+        )
+        del acts
+        cleanup_memory()
 
     log.info("Applying R1 to model weights (%d x %d)", R1.shape[0], R1.shape[1])
     apply_r1_rotation(model, R1, umodel, smooth_scale=None)
@@ -336,6 +384,15 @@ def main() -> None:
                         "the hidden dim and expose R1's rotation. "
                         "down_proj is in the FFN dim where R1 cancels — only "
                         "useful for showing R4's effect, not R1.")
+    p.add_argument("--r1_path", type=str, default=None,
+                   help="Optional path to a previously saved rotations.pt "
+                        "(or bare R1 tensor .pt) to reuse instead of "
+                        "retraining R1 for this config. R1 must match the "
+                        "target model's hidden_size. Ignored when --config "
+                        "is 'raw'. Typical source: "
+                        "<output_dir>/rotations.pt from a full "
+                        "dartquant_v2/run_quantize.py run that trained with "
+                        "the matching loss.")
 
     p.add_argument("--nsamples", type=int, default=32,
                    help="Calibration samples for R1 training and capture")
@@ -414,6 +471,7 @@ def main() -> None:
             r1_batch_size=args.r1_batch_size,
             max_rows_per_hook=args.rows_per_layer_r1,
             seed=args.seed,
+            r1_path=args.r1_path,
         )
         model.to(DEV)
         cleanup_memory()

@@ -1,0 +1,74 @@
+# rho / variance summary for meta-llama/Llama-3.1-8B-Instruct
+
+meta: layers_hooked=32, q_heads=32, kv_heads=8, head_dim=128, rope_theta=10000, seqlen=2048
+RoPE bands: 10 low-freq (C_k>0.5), 54 high-freq
+
+## Stream Q
+[all bands]  n=65536
+  mean |rho|     = 0.1370
+  median |rho|   = 0.1002
+  p90  |rho|     = 0.2971
+  p95  |rho|     = 0.3929
+  p99  |rho|     = 0.6507
+  max  |rho|     = 0.9976
+  frac |rho|>.05 = 0.7276
+  frac |rho|>.10 = 0.5008
+  frac |rho|>.20 = 0.2196
+[low-freq bands (C_k>0.5)]  n=10240
+  mean |rho|     = 0.1292
+  median |rho|   = 0.0962
+  p90  |rho|     = 0.2750
+  p95  |rho|     = 0.3553
+  p99  |rho|     = 0.6129
+  max  |rho|     = 0.9976
+  frac |rho|>.05 = 0.7210
+  frac |rho|>.10 = 0.4846
+  frac |rho|>.20 = 0.1993
+[high-freq bands (C_k<=0.5)]  n=55296
+  mean |rho|     = 0.1384
+  median |rho|   = 0.1011
+  p90  |rho|     = 0.3014
+  p95  |rho|     = 0.4000
+  p99  |rho|     = 0.6568
+  max  |rho|     = 0.9815
+  frac |rho|>.05 = 0.7288
+  frac |rho|>.10 = 0.5039
+  frac |rho|>.20 = 0.2234
+  variance heterogeneity |log(sigma1^2/sigma2^2)|: mean=0.373, p90=0.848, max=4.679
+
+## Stream K
+[all bands]  n=16384
+  mean |rho|     = 0.1552
+  median |rho|   = 0.1097
+  p90  |rho|     = 0.3570
+  p95  |rho|     = 0.4658
+  p99  |rho|     = 0.6981
+  max  |rho|     = 0.9993
+  frac |rho|>.05 = 0.7418
+  frac |rho|>.10 = 0.5334
+  frac |rho|>.20 = 0.2687
+[low-freq bands (C_k>0.5)]  n=2560
+  mean |rho|     = 0.1046
+  median |rho|   = 0.0769
+  p90  |rho|     = 0.2165
+  p95  |rho|     = 0.2821
+  p99  |rho|     = 0.5108
+  max  |rho|     = 0.9993
+  frac |rho|>.05 = 0.6504
+  frac |rho|>.10 = 0.3969
+  frac |rho|>.20 = 0.1234
+[high-freq bands (C_k<=0.5)]  n=13824
+  mean |rho|     = 0.1646
+  median |rho|   = 0.1175
+  p90  |rho|     = 0.3812
+  p95  |rho|     = 0.4868
+  p99  |rho|     = 0.7029
+  max  |rho|     = 0.9705
+  frac |rho|>.05 = 0.7587
+  frac |rho|>.10 = 0.5587
+  frac |rho|>.20 = 0.2956
+  variance heterogeneity |log(sigma1^2/sigma2^2)|: mean=0.504, p90=1.195, max=4.909
+
+# Conclusions:
+# - If mean |rho| << 0.05 across all bands, Theorem's rho=0 assumption is well-supported and the post-RoPE variance formula is predictive.
+# - The Hadamard failure mode (Corollary hadamard_rope) needs EITHER non-zero rho OR sigma_1^2 != sigma_2^2 within a band. Check the variance-heterogeneity line: if |log(sigma1^2/sigma2^2)| is materially > 0, the Hadamard-suboptimality argument holds independent of rho.

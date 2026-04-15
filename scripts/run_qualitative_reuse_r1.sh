@@ -38,6 +38,21 @@ NSAMPLES="${NSAMPLES:-32}"
 SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
 
+# Pin the interpreter so nohup children don't inherit a broken PATH.
+# Override with e.g. PYTHON=/opt/conda/envs/foo/bin/python ...
+if [[ -z "${PYTHON:-}" ]]; then
+    if [[ -x "/root/miniconda3/bin/python" ]]; then
+        PYTHON="/root/miniconda3/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON="$(command -v python)"
+    else
+        echo "[ERROR] no python interpreter found; set PYTHON=..." >&2
+        exit 1
+    fi
+fi
+
 SHORT="$(basename "${MODEL}")"
 SHORT_LC="${SHORT,,}"
 OUT_ROOT="${OUT_ROOT:-artifacts/qualitative}"
@@ -58,6 +73,7 @@ echo "  swd_unif R1: ${SWDU_PT}"
 echo "  swd_gauss  : ${SWDG_PT}"
 echo "  captures   : ${OUT}"
 echo "  figures    : ${FIG_DIR}"
+echo "  python     : ${PYTHON}"
 echo "============================================================"
 
 for f in "${WHIP_PT}" "${SWDU_PT}" "${SWDG_PT}"; do
@@ -82,7 +98,7 @@ run_capture() {
         return 0
     fi
     echo "---- capture: ${cfg} ----"
-    python scripts/capture_qualitative_activations.py \
+    "${PYTHON}" scripts/capture_qualitative_activations.py \
         --model    "${MODEL}" \
         --config   "${cfg}" \
         --hook     "${HOOK}" \
@@ -100,11 +116,11 @@ run_capture swd_gauss --r1_path "${SWDG_PT}"
 
 echo
 echo "---- plotting ----"
-python scripts/plot_rotation_before_after.py \
+"${PYTHON}" scripts/plot_rotation_before_after.py \
     --in_dir "${OUT}" \
     --out    "${FIG_DIR}/rotation_before_after.pdf"
 
-python scripts/plot_activation_qualitative.py \
+"${PYTHON}" scripts/plot_activation_qualitative.py \
     --in_dir  "${OUT}" \
     --out_dir "${FIG_DIR}"
 

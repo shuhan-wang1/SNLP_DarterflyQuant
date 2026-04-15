@@ -286,7 +286,88 @@ def parse_layers(spec: str, num_layers: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# 6) Entry point
+# 6) Metrics (printed to stdout + saved as CSV for analysis)
+# ---------------------------------------------------------------------------
+_METRIC_COLS = (
+    "kurt",        # excess kurtosis of flat values (heavy tail if >> 0)
+    "skew",        # skewness (sanity: ~0 for a good rotation)
+    "rms",         # global RMS of x
+    "absmax",      # max|x| — the outlier story
+    "p99_9",       # 99.9th percentile of |x| — sub-max tail
+    "chan_ratio",  # max(channel_absmax) / mean(channel_absmax) — outlier concentration
+    "amax_rms",    # absmax / rms — clipping headroom (lower = friendlier to INT4)
+    "chan_cv",     # std(channel_rms) / mean(channel_rms) — channel balance (lower = more uniform)
+)
+
+
+def compute_metrics(x: np.ndarray) -> dict[str, float]:
+    """Scalar metrics summarising the distribution shape of a (N, d) tensor."""
+    v = x.ravel()
+    mu = float(v.mean())
+    s = float(v.std()) + 1e-12
+    rms = float(np.sqrt((v ** 2).mean()))
+
+    channel_absmax = np.abs(x).max(axis=0)
+    channel_rms = np.sqrt((x ** 2).mean(axis=0))
+
+    return {
+        "kurt":       float(((v - mu) ** 4).mean() / (s ** 4) - 3.0),
+        "skew":       float(((v - mu) ** 3).mean() / (s ** 3)),
+        "rms":        rms,
+        "absmax":     float(np.abs(v).max()),
+        "p99_9":      float(np.percentile(np.abs(v), 99.9)),
+        "chan_ratio": float(channel_absmax.max() / (channel_absmax.mean() + 1e-12)),
+        "amax_rms":   float(np.abs(v).max() / (rms + 1e-12)),
+        "chan_cv":    float(channel_rms.std() / (channel_rms.mean() + 1e-12)),
+    }
+
+
+def _fmt(v: float) -> str:
+    if abs(v) >= 1000:
+        return f"{v:8.1f}"
+    if abs(v) >= 10:
+        return f"{v:8.2f}"
+    return f"{v:8.3f}"
+
+
+def print_layer_table(layer: int, per_config: dict[str, dict[str, float]]) -> None:
+    header = f"  {'config':<10}" + "".join(f" {c:>8}" for c in _METRIC_COLS)
+    print(f"\n--- layer {layer:03d} ---")
+    print(header)
+    for cfg in _ORDER:
+        row = per_config[cfg]
+        line = f"  {cfg:<10}" + "".join(_fmt(row[c]) for c in _METRIC_COLS)
+        print(line)
+
+
+def print_summary_table(rows: list[dict]) -> None:
+    """rows: list of {layer, config, ...metric floats...}."""
+    print("\n=== mean +/- std across layers ===")
+    header = f"  {'config':<10}" + "".join(f" {c:>8}" for c in _METRIC_COLS)
+    print(header)
+    for cfg in _ORDER:
+        by_cfg = [r for r in rows if r["config"] == cfg]
+        means: list[str] = []
+        for c in _METRIC_COLS:
+            vals = np.array([r[c] for r in by_cfg], dtype=float)
+            means.append(f"{vals.mean():8.3f}")
+        print(f"  {cfg:<10}" + "".join(means))
+    print()
+
+
+def save_metrics_csv(rows: list[dict], path: Path) -> None:
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["layer", "config", *_METRIC_COLS])
+        for r in rows:
+            w.writerow([r["layer"], r["config"], *(f"{r[c]:.6g}" for c in _METRIC_COLS)])
+    print(f"wrote metrics CSV: {path}")
+
+
+# ---------------------------------------------------------------------------
+# 7) Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -387,9 +468,10 @@ def main() -> None:
                 rotations[loss_name][L] = R1
             del pool
 
-    # Plot per layer
+    # Plot per layer + accumulate metrics
     args.out_dir.mkdir(parents=True, exist_ok=True)
     width = max(2, len(str(max(layers))))
+    metric_rows: list[dict] = []
     for L in layers:
         acts = acts_by_layer[L]
         bundles: dict[str, torch.Tensor] = {"raw": acts}
@@ -398,6 +480,13 @@ def main() -> None:
         out_path = args.out_dir / f"layer_{L:0{width}d}.pdf"
         plot_comparison(bundles, out_path, L, args.model)
 
+        per_config = {cfg: compute_metrics(bundles[cfg].numpy()) for cfg in _ORDER}
+        print_layer_table(L, per_config)
+        for cfg, m in per_config.items():
+            metric_rows.append({"layer": L, "config": cfg, **m})
+
+    print_summary_table(metric_rows)
+    save_metrics_csv(metric_rows, args.out_dir / "metrics.csv")
     print(f"done — wrote {len(layers)} PDFs to {args.out_dir}")
 
 

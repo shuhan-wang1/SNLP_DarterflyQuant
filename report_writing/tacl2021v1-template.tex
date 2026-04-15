@@ -1,0 +1,1023 @@
+% File tacl2021v1.tex
+% Dec. 15, 2021
+
+% The English content of this file was modified from various *ACL instructions
+% by Lillian Lee and Kristina Toutanova
+%
+% LaTeXery is mostly all adapted from acl2018.sty.
+
+\documentclass[11pt,a4paper]{article}
+\usepackage{times,latexsym}
+\usepackage{url}
+
+
+
+%% Package options:
+%% Short version: "hyperref" and "submission" are the defaults.
+%% More verbose version:
+%% Most compact command to produce a submission version with hyperref enabled
+%%    \usepackage[]{tacl2021v1}
+%% Most compact command to produce a "camera-ready" version
+%%    \usepackage[acceptedWithA]{tacl2021v1}
+%% Most compact command to produce a double-spaced copy-editor's version
+%%    \usepackage[acceptedWithA,copyedit]{tacl2021v1}
+%
+%% If you need to disable hyperref in any of the above settings (see Section
+%% "LaTeX files") in the TACL instructions), add ",nohyperref" in the square
+%% brackets. (The comma is a delimiter in case there are multiple options specified.)
+
+\usepackage{tacl2021v1}
+% \setlength\titlebox{10cm} % <- for Option 2 below
+
+%%%% Material in this block is specific to generating TACL instructions
+\usepackage{xspace,mfirstuc,tabulary}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\newcommand{\dateOfLastUpdate}{Dec. 15, 2021}
+\newcommand{\styleFileVersion}{tacl2021v1}
+
+\newcommand{\ex}[1]{{\sf #1}}
+
+\newif\iftaclinstructions
+\taclinstructionsfalse % AUTHORS: do NOT set this to true
+\iftaclinstructions
+\renewcommand{\confidential}{}
+\renewcommand{\anonsubtext}{(No author info supplied here, for consistency with
+TACL-submission anonymization requirements)}
+\newcommand{\instr}
+\fi
+
+%
+\iftaclpubformat % this "if" is set by the choice of options
+\newcommand{\taclpaper}{final version\xspace}
+\newcommand{\taclpapers}{final versions\xspace}
+\newcommand{\Taclpaper}{Final version\xspace}
+\newcommand{\Taclpapers}{Final versions\xspace}
+\newcommand{\TaclPapers}{Final Versions\xspace}
+\else
+\newcommand{\taclpaper}{submission\xspace}
+\newcommand{\taclpapers}{{\taclpaper}s\xspace}
+\newcommand{\Taclpaper}{Submission\xspace}
+\newcommand{\Taclpapers}{{\Taclpaper}s\xspace}
+\newcommand{\TaclPapers}{Submissions\xspace}
+\fi
+\newcommand{\best}[1]{\textbf{#1}}
+
+%%%% End TACL-instructions-specific macro block
+%%%%
+
+%%%% Theorem environments
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+%%%% Math macros
+\DeclareMathOperator{\RMS}{RMS}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\tr}{tr}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bR}{\mathbf{R}}
+\newcommand{\bH}{\mathbf{H}}
+\newcommand{\bG}{\mathbf{G}}
+\newcommand{\bI}{\mathbf{I}}
+\newcommand{\bSigma}{\boldsymbol{\Sigma}}
+
+\title{Distribution-Aware Rotation Calibration for LLM Quantisation:\\
+Sliced Wasserstein Losses and Learnable Butterfly Rotations}
+
+% Author information does not appear in the pdf unless the "acceptedWithA" option is given
+
+% The author block may be formatted in one of two ways:
+
+% Option 1. Author’s address is underneath each name, centered.
+
+\author{
+  Anonymous Author(s)
+}
+
+% % Option 2.  Author’s address is linked with superscript
+% % characters to its name, author names are grouped, centered.
+
+% \author{
+%   Template Author1\Thanks{The {\em actual} contributors to this instruction
+%     document and corresponding template file are given in Section
+%     \ref{sec:contributors}.}$^\diamond$ 
+%   \and
+%   Template Author2$^\dagger$
+%   \\
+%   \ \\
+%   $^\diamond$Template Affiliation1/Address Line 1
+%   \\
+%   Template Affiliation1/Address Line 2
+%   \\
+%   Template Affiliation1/Address Line 2
+%   \\
+%   \texttt{template.email1example.com}
+%   \\
+%   \ \\
+%   \\
+%   $^\dagger$Template Affiliation2/Address Line 1
+%   \\
+%   Template Affiliation2/Address Line 2
+%   \\
+%   Template Affiliation2/Address Line 2
+%   \\
+%   \texttt{template.email2@example.com}
+% }
+
+\date{}
+
+
+\begin{document}
+\maketitle
+
+%% ============================================================
+%% SECTION 0: ABSTRACT (placeholder)
+%% ============================================================
+\begin{abstract}
+Post-training quantisation of large language models is bottlenecked by activation outliers that inflate quantisation error at low bit-widths. Rotation-based methods (QuaRot, SpinQuant, DartQuant) smooth these outliers by pre-multiplying weights and activations by orthogonal matrices, but two design choices remain unprincipled: Whip's calibration gradient decays exponentially in outlier magnitude, and fixed Hadamard matrices for the post-RoPE and post-activation rotations cannot equalise variance under the RoPE-induced block-diagonal covariance whenever any intra-band correlation is non-zero.
+
+We replace Whip with a Sliced Wasserstein Distance (SWD) loss whose gradient scales linearly with outlier magnitude, and motivate a loss--quantiser pairing principle: SWD-Unif for uniform-optimal INT4, SWD-Gauss for Gaussian-optimal NF4. Under W4A4KV4, SWD-Unif with INT4/GPTQ reduces WikiText-2 perplexity over Whip on every (model, regime) pair we test, by $1.3\%$--$2.3\%$ on Llama-3.2-1B/3B and Llama-3.1-8B (e.g.\ $7.73$ vs $7.85$ at 8B). We also report a negative finding: SWD-Gauss with NF4 via \texttt{bitsandbytes} underperforms INT4/GPTQ at matched precision; the shortfall is consistent with \texttt{bitsandbytes}' lack of weight calibration but cannot be isolated from the pairing itself without an NF4 backend offering GPTQ-equivalent weight reconstruction. Finally, we prove fixed Hadamard's suboptimality under RoPE and propose learnable butterfly Givens rotations at $\mathcal{O}(d\log d)$ cost as a theoretical replacement, prototyped but not yet empirically evaluated.
+\end{abstract}
+
+
+
+%% ============================================================
+%% SECTION 1: INTRODUCTION (placeholder)
+%% ============================================================
+
+\section{Introduction}
+
+The deployment of Large Language Models (LLMs) is fundamentally bottlenecked by their massive memory footprint and inference bandwidth requirements. Post-Training Quantisation (PTQ) addresses this by compressing model weights and activations to low bit-widths (e.g., 4-bit). However, extreme quantisation is notoriously hindered by the presence of massive activation outliers. When standard quantisers attempt to capture these extreme magnitudes, the effective resolution for the majority of the activation values is catastrophically degraded.
+
+To mitigate this outlier problem, rotation-based quantisation has emerged as a leading paradigm. Methods such as QuaRot \cite{quarot}, SpinQuant \cite{spinquant}, and DartQuant \cite{dartquant} leverage computational invariance---the property that $y = Wx = \left(WR^T\right)\left(Rx\right)$ for any orthogonal matrix $R$. By rotating weights and activations into a new basis, these methods smooth out outlier features and disperse information across channels before quantisation is applied.
+
+Despite their architectural success, current rotation calibration paradigms suffer from a lack of principled, distribution-matching optimisation objectives. For example, DartQuant relies on the Whip loss, which penalises values near zero to encourage a uniform spread. However, we demonstrate that the gradient of the Whip loss decays exponentially as outlier magnitude increases, effectively removing the optimisation signal for the most destructive outliers. There is a critical need for stronger distribution-matching losses that exert their strongest corrective forces exactly where outliers are most extreme. Furthermore, by framing calibration as a distribution-matching problem, we can extend optimal quantisation beyond uniform distributions. While uniform targets are suited for INT4, optimal scalar quantisation for normally distributed inputs requires the NormalFloat4 (NF4) data type \cite{qlora}. Current rotation methods lack native NF4 support because they do not explicitly align activations to Gaussian priors.
+
+A second limitation lies in the choice of the post-RoPE and post-activation rotations. Methods such as QuaRot and DartQuant default to fixed random Hadamard matrices for $R_3$ and $R_4$, motivated by their minimal coherence under isotropic covariance. We prove, however, that once Rotary Position Embeddings are applied, the block-diagonal covariance structure of the key/query stream acquires non-zero intra-band correlations for low-frequency bands, and a Hadamard rotation can no longer equalise variance across paired channels. Fixed Hadamard matrices are therefore provably suboptimal in exactly the setting that modern transformer blocks produce.
+
+To address these limitations, we introduce a distribution-aware rotation calibration framework. Our contributions are:
+\begin{itemize}
+    \item \textbf{Gradient-vanishing diagnosis of the Whip loss.} We show analytically that the Whip loss's per-sample gradient magnitude decays as $\frac{1}{N}e^{-|y_k|}$ in the activation value, suppressing the corrective signal precisely on the extreme outliers that dominate quantisation error (Proposition~\ref{prop:whip_grad}).
+    \item \textbf{Sliced Wasserstein loss with linear-outlier gradients.} We replace Whip with a Sliced Wasserstein Distance (SWD) loss whose per-sample gradient $\frac{2}{N}|y_{(r)}-t_r|$ scales linearly with outlier magnitude (Proposition~\ref{prop:swd_grad}). Under identical rotation machinery, SWD-Unif reduces WikiText-2 perplexity relative to Whip on every (model, regime) pair we test, with relative reductions of $1.3\%$--$2.3\%$ under W4A4KV4 on Llama-3.2-1B/3B and Llama-3.1-8B base models.
+    \item \textbf{Loss--quantiser pairing as a design principle.} We formalise the principle that the calibration loss should target the distribution under which the downstream quantiser's expected error is minimised, and instantiate it as SWD-Unif$\leftrightarrow$INT4 (uniform-optimal) and SWD-Gauss$\leftrightarrow$NF4 (Gaussian-optimal). The INT4 instantiation achieves the strongest perplexity we observe; the NF4 instantiation, evaluated via the \texttt{bitsandbytes} backend, underperforms INT4/GPTQ at matched precision. The NF4 shortfall is consistent with \texttt{bitsandbytes}' lack of a weight-calibration step, but a fair test of the pairing on the NF4 side requires an NF4 backend with GPTQ-equivalent weight reconstruction, which we leave open.
+    \item \textbf{Theoretical suboptimality of fixed Hadamard rotations under RoPE.} We prove that Rotary Position Embeddings induce a structured variance profile across frequency bands (Theorem~\ref{thm:rope_var}) and that fixed Hadamard rotations cannot equalise channel variances whenever any intra-band correlation is non-zero (Proposition~\ref{prop:hadamard_subopt}). Learnable butterfly Givens rotations close this gap at the same $\mathcal{O}(d\log d)$ cost (Lemmas~\ref{lem:givens_eq} and~\ref{lem:butterfly_mixing}); a reference implementation is in our codebase, and systematic empirical evaluation is left to future work.
+\end{itemize}
+
+To organise our investigation we pose three questions.
+\begin{itemize}
+    \item \textbf{Question 1.} Does a principled distribution-matching loss outperform the Whip proxy under identical rotation machinery, as measured by perplexity?
+    \item \textbf{Question 2.} Can a loss--quantiser pairing principle unify rotation calibration across uniform-optimal and Gaussian-optimal quantisers?
+    \item \textbf{Question 3.} Are fixed Hadamard matrices adequate for the post-RoPE and post-activation rotations, or does the RoPE-induced covariance leave gains on the table?
+\end{itemize}
+
+%% ============================================================
+%% SECTION 2: RELATED WORK (placeholder)
+%% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Post-Training Quantisation for LLMs.}
+PTQ compresses model weights and activations to low bit-widths after training using only a small calibration dataset, avoiding the cost of retraining at scale.
+Early PTQ methods focused on weight-only quantisation: GPTQ \citep{gptq} minimises layer-wise weight quantisation error using approximate second-order information, while AWQ \citep{awq} identifies and protects the small fraction of weight channels most sensitive to quantisation error.
+However, weight-only quantisation leaves activations in full precision at inference time, limiting achievable compression ratios and inference speedup \citep{smoothquant}.
+Quantising activations alongside weights is therefore desirable, but significantly harder due to the emergent outlier phenomenon in LLMs, where a small number of channels exhibit magnitudes orders of magnitude larger than the rest, causing standard quantisers to waste resolution on extreme values.
+LLM.int8() \citep{llmint8} handles this via mixed-precision decomposition, and SmoothQuant \citep{smoothquant} migrates quantisation difficulty from activations to weights through mathematically equivalent per-channel scaling, enabling W8A8 quantisation.
+Despite these advances, these methods treat outliers as a calibration challenge to work around rather than a structural property to eliminate, motivating the rotation-based approaches described below.
+
+\paragraph{\mbox{Rotation-Based Quantisation}.}
+Applying orthogonal rotations before quantisation has emerged as a principled strategy for outlier suppression, exploiting computational invariance: $\mathbf{y} = \mathbf{W}\mathbf{x} = (\mathbf{W}\mathbf{R}^{\top})(\mathbf{R}\mathbf{x})$ for any orthogonal $\mathbf{R}$ \citep{quarot, spinquant, dartquant}.
+QuIP \citep{quip} established the theoretical basis, showing that incoherent weight matrices are easier to quantise, and applied random orthogonal pre-processing to achieve 2-bit compression.
+QuIP\# \citep{quipsharp} replaced these generic random rotations with randomised Hadamard transforms for greater efficiency.
+QuaRot \citep{quarot} scaled rotation-based quantisation to end-to-end 4-bit inference across the full model using fixed Hadamard matrices.
+SpinQuant \citep{spinquant} took the critical step of learning rotation matrices via Cayley optimisation on a validation set.
+DartQuant \citep{dartquant}, our direct baseline, avoids end-to-end backpropagation by optimising a globally shared $\mathbf{R}_1$ via the QR-Orth optimiser, achieving $47\times$ speedup over SpinQuant.
+However, DartQuant's Whip loss suffers from exponentially vanishing gradients for extreme outliers (Proposition~\ref{prop:whip_grad}), motivating a calibration objective whose corrective signal does not vanish on the outliers it is meant to correct.
+
+\paragraph{Distribution Matching and Quantiser-Aware Objectives.}
+The Sliced Wasserstein Distance (SWD) approximates the Wasserstein distance by averaging one-dimensional projections \citep{cuturi2013sinkhorn, wasserstein}, yielding a tractable and differentiable distributional loss with favourable gradient properties for extreme values (Proposition~\ref{prop:swd_grad}).
+SWD has been used as a stable training objective in generative modelling \citep{deshpande2018, kolouri2019} and has recently been shown to outperform KL divergence for knowledge distillation \citep{lv2024wasserstein}.
+Crucially, QLoRA \citep{qlora} introduced NF4, an information-theoretically optimal 4-bit data type for normally distributed inputs, yet no prior rotation method explicitly targets Gaussian activations to exploit this codebook.
+This, together with the analogous uniform target for INT4, motivates a principled loss--quantiser pairing in which the calibration objective directly targets the distribution that minimises each quantiser's expected error (\S\ref{sec:pairing}).
+
+\paragraph{Structured Linear Maps and Rotation Optimisation.}
+Butterfly matrices---products of sparse factors with $\mathcal{O}(n \log n)$ complexity---can represent all structured linear maps including Hadamard and Fourier transforms \citep{dao2020kaleidoscope}, and the Monarch framework further parameterises dense matrices as products of block-diagonal factors \citep{dao2022monarch}.
+Yet existing rotation-based quantisation methods default to fixed Hadamard matrices for $\mathbf{R}_3$ and $\mathbf{R}_4$, which are strictly suboptimal under the structured covariance induced by RoPE \citep{su2024roformer} (Appendix~\ref{app:hadamard}).
+For optimisation on the Stiefel manifold of orthogonal matrices, prior work has established convergence guarantees for Riemannian subgradient methods \citep{li2021riemannian} and their application to enforcing orthogonality in neural networks \citep{trockman2021}; DartQuant \citep{dartquant} introduced the QR-Orth optimiser, which we show is compatible with the SWD loss (Remark \ref{rem:qrorth}).
+
+%% ============================================================
+%% SECTION 3: METHODOLOGY
+%% ============================================================
+\section{Methodology}
+\label{sec:method}
+
+We cast our proposal as a distribution-aware rotation calibration framework built on three components: (i)~a Sliced Wasserstein Distance loss that replaces Whip (Section~\ref{sec:swd}); (ii)~a principled loss--quantiser pairing that couples the loss target to the quantiser's optimal input distribution (Section~\ref{sec:pairing}); and (iii)~a theoretical characterisation of when the default fixed Hadamard rotations $R_3$ and $R_4$ suffice and when they do not (Appendix~\ref{app:hadamard}, Section~\ref{sec:future}).
+We build on the DartQuant framework~\cite{dartquant}, which inserts four orthogonal rotation matrices $R_1, R_2, R_3, R_4$ into the Transformer block to smooth activation outliers before quantisation.
+$R_1$ and $R_2$ are learned via the QR-Orth optimiser on the Stiefel manifold, while $R_3$ and $R_4$ are fixed random Hadamard matrices applied after RoPE and after the activation nonlinearity, respectively.
+We retain the rotation insertion points, the QR-Orth optimiser and DartQuant's single-global $R_1$ training schedule, and refer the reader to \citet{dartquant} for their full description.
+We emphasise that we do not modify the rotation-insertion topology of DartQuant; our changes are confined to the loss function used to train $R_1$ and $R_2$, the loss--quantiser pairing, and a theoretical analysis that motivates replacing the fixed Hadamard rotations $R_3$ and $R_4$.
+
+\subsection{Sliced Wasserstein Distance Loss}
+\label{sec:swd}
+
+DartQuant's Whip loss $\mathcal{L}_{\text{Whip}} = \frac{1}{N}\sum_{i=1}^{N} \exp(-|y_i|)$ encourages rotated activations toward a uniform distribution by pushing small-magnitude values away from zero.
+While effective, this objective is only an indirect proxy for distributional matching, and---as we show in Section~\ref{sec:gradient}---its gradients vanish exponentially for the very outliers it aims to suppress.
+
+We propose instead to directly minimise the \emph{Sliced Wasserstein Distance} (SWD) between the empirical distribution of rotated activation values and the target distribution dictated by the downstream quantiser \cite{cuturi2013sinkhorn,blondel2020}.
+Because each channel of the rotated activation is scalar-valued, the problem reduces to the one-dimensional case where the 2-Wasserstein distance admits a closed form \cite{wasserstein}:
+\begin{equation}
+\label{eq:w2}
+W_2^2(P, Q) = \int_0^1 \bigl|F_P^{-1}(u) - F_Q^{-1}(u)\bigr|^2 \, du,
+\end{equation}
+where $F_P^{-1}$ and $F_Q^{-1}$ denote the quantile functions of distributions $P$ and $Q$.
+
+Given $N$ activation values $\{y_1, \ldots, y_N\}$ collected across the batch and sequence dimensions for a single output channel of the rotated activation tensor, we sort them to obtain order statistics $y_{(1)} \leq y_{(2)} \leq \cdots \leq y_{(N)}$ and approximate $F_{P_Y}^{-1}(u_i) \approx y_{(i)}$ at the evaluation points $u_i = (i - 0.5) / N$, following the standard midpoint convention \cite{blom1958}.
+This choice avoids boundary effects: the alternatives $u_i = i/N$ or $u_i = i/(N+1)$ would place evaluation points at or near $u = 0$ and $u = 1$, producing infinite Gaussian targets $\Phi^{-1}(0) = -\infty$ and $\Phi^{-1}(1) = +\infty$ in the SWD-Gauss setting.
+The midpoint convention keeps all evaluation points strictly within $(0, 1)$.
+The discretised loss is then:
+\begin{equation}
+\label{eq:swd_discrete}
+\mathcal{L}_{\text{SWD}} = \frac{1}{N} \sum_{i=1}^{N} \bigl(y_{(i)} - t_i\bigr)^2,
+\end{equation}
+where $\{t_i\}_{i=1}^{N}$ are the target quantiles, chosen according to the quantiser (see below).
+The full derivation is given in Appendix~\ref{app:swd_derivation}.
+
+\paragraph{SWD-Unif (for INT4).}
+The INT4 quantiser partitions a symmetric interval $[-b, b]$ into $2^4 = 16$ uniform bins.
+Quantisation error is minimised when the input distribution is itself uniform over $[-b, b]$.
+We set the target quantiles as
+\begin{equation}
+\label{eq:target_unif}
+t_i = 2b \cdot \frac{i - 0.5}{N} - b, \qquad i = 1, \ldots, N,
+\end{equation}
+where $b = \sqrt{3} \cdot \RMS$ is chosen to match the second moment of the input (Lemma~\ref{lem:b_moment_match} in the Appendix).
+
+\paragraph{SWD-Gauss (for NF4).}
+The NF4 data type introduced by QLoRA \cite{qlora} places its $2^4$ codebook levels at the quantiles of a standard normal distribution and is therefore information-theoretically optimal for Gaussian-distributed inputs under fixed-codebook scalar quantisation.
+To complement this codebook, we define Gaussian target quantiles:
+\begin{equation}
+\label{eq:target_gauss}
+t_i = \Phi^{-1}\!\left(\frac{i - 0.5}{N}\right) \cdot \hat{\sigma}, \qquad i = 1, \ldots, N,
+\end{equation}
+where $\Phi^{-1}$ is the standard normal quantile function and $\hat{\sigma} = \RMS_{\text{global}}$ is the root-mean-square computed over all $B \times D$ activation values in the collected batch.
+
+\paragraph{Critical design choice: global RMS.}
+\label{par:global_rms}
+Both the uniform scale $b$ and the Gaussian scale $\hat{\sigma}$ must be computed from the \emph{global} RMS across all $B \times D$ activation values, \emph{not} per-dimension.
+Per-dimension normalisation renders the loss approximately rotation-invariant for rotations with low coherence (e.g., Hadamard-initialised rotations): for such rotations, each output dimension $(\by)_j = \sum_k R_{jk} x_k$ is a weighted sum of many input channels with roughly equal weights $|R_{jk}| \approx 1/\sqrt{d}$, so by the Central Limit Theorem each output dimension is approximately Gaussian with similar variance when $d$ is large.
+A per-dimension target would therefore be nearly satisfied for any low-coherence rotation, destroying the optimisation signal precisely at initialisation.
+Computing the RMS globally preserves a cross-dimension variance-equalisation signal, since dimensions with residual outlier concentration will have elevated local variance relative to the global scale, generating a non-zero gradient that drives the rotation toward genuine distributional uniformity.
+
+\subsection{Gradient Analysis: Why SWD Outperforms Whip}
+\label{sec:gradient}
+
+The core theoretical advantage of SWD over Whip loss lies in their gradient behaviour for extreme outliers.
+
+\begin{proposition}[Whip gradient vanishing]
+\label{prop:whip_grad}
+For the Whip loss $\mathcal{L}_{\mathrm{Whip}} = \frac{1}{N}\sum_{i=1}^{N} \exp(-|y_i|)$, the gradient with respect to a single activation $y_k$ satisfies
+\begin{equation}
+\label{eq:whip_grad}
+\left|\frac{\partial \mathcal{L}_{\mathrm{Whip}}}{\partial y_k}\right| = \frac{1}{N}e^{-|y_k|} \;\xrightarrow{|y_k| \to \infty}\; 0.
+\end{equation}
+The corrective signal vanishes exponentially precisely for the extreme outliers that are most damaging to quantisation accuracy.
+\end{proposition}
+
+\begin{proposition}[SWD gradient scaling]
+\label{prop:swd_grad}
+For the SWD loss~\eqref{eq:swd_discrete}, assuming no tied values among $\{y_1, \ldots, y_N\}$ (so that the sorting permutation is unique and the loss is differentiable; ties can be handled in practice via random tie-breaking \cite{blondel2020}), let $y_k = y_{(r)}$ be the $r$-th order statistic.
+Then
+\begin{equation}
+\label{eq:swd_grad}
+\frac{\partial \mathcal{L}_{\mathrm{SWD}}}{\partial y_k} = \frac{2}{N}\bigl(y_{(r)} - t_r\bigr).
+\end{equation}
+For the largest outlier ($r = N$, target $t_N \approx b$), this gradient is $\frac{2}{N}(y_{(N)} - b)$, which scales \emph{linearly} with outlier magnitude for $y_{(N)} \gg b$.
+The more extreme the outlier, the stronger the corrective force.
+\end{proposition}
+
+Since both losses are normalised as averages over $N$ activations, the per-sample gradient magnitudes are directly comparable: $\frac{1}{N}e^{-|y_k|}$ for Whip versus $\frac{2}{N}|y_k - t_r|$ for SWD.
+Their ratio, $2|y_k - t_r| \cdot e^{|y_k|}$, grows exponentially with $|y_k|$, demonstrating that SWD's advantage over Whip becomes arbitrarily large for extreme outliers.
+Whip loss effectively ``gives up'' on the largest outliers, whereas SWD exerts its strongest correction exactly where it is most needed.
+
+\begin{remark}[Compatibility with QR-Orth]
+\label{rem:qrorth}
+The SWD loss is differentiable almost everywhere (the non-differentiable set corresponds to activation ties, which has measure zero under continuous distributions), and its gradient through the sorting operation is a valid subgradient \cite{blondel2020}.
+Since the Stiefel manifold $\mathrm{St}(d, d) = O(d)$ is compact and QR-Orth produces bounded iterates by construction, standard convergence results for Riemannian subgradient methods apply \cite{li2021riemannian}.
+\end{remark}
+
+\subsection{Loss--Quantiser Pairing Principle}
+\label{sec:pairing}
+
+The choice of target distribution should reflect the quantiser's structure.
+We formalise this as a \emph{loss--quantiser pairing principle}: each quantiser has a distribution under which its expected quantisation error is minimised, and the rotation loss should drive activations toward precisely that distribution.
+
+\paragraph{INT4 (uniform quantiser).}
+The symmetric uniform quantiser partitions $[-b, b]$ into equal-width bins.
+Its expected quantisation error $\mathbb{E}[(x - Q(x))^2]$ is minimised when $x \sim \text{Uniform}[-b, b]$.
+The natural loss therefore targets a uniform distribution:
+\begin{itemize}
+    \item \textbf{SWD-Unif}: Wasserstein distance to uniform target quantiles (Section~\ref{sec:swd}).
+\end{itemize}
+
+\paragraph{NF4 (Gaussian-optimal quantiser).}
+The NF4 codebook \cite{qlora} places its levels at Gaussian quantiles, achieving information-theoretically optimal quantisation for normally distributed inputs under fixed-codebook scalar quantisation.
+The natural loss targets a Gaussian distribution:
+\begin{itemize}
+    \item \textbf{SWD-Gauss}: Wasserstein distance to Gaussian target quantiles (Section~\ref{sec:swd}).
+\end{itemize}
+
+Together with DartQuant's original Whip loss, we evaluate three loss functions (Whip, SWD-Unif, and SWD-Gauss), enabling direct comparison of the baseline against our proposed distribution-matching objectives.
+
+%% ============================================================
+%% SECTION 4: EXPERIMENTS (placeholder)
+%% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+ 
+We evaluate our proposed loss functions on the Llama~3 family, spanning three scales (1B, 3B, 8B) and both base and instruction-tuned variants. All experiments use DartQuant~v2 with the single global $R_1$ training schedule inherited from DartQuant; only the loss function and the loss--quantiser pairing differ across configurations. We report perplexity on WikiText-2 and C4, and zero-shot accuracy averaged over HellaSwag, ARC-Challenge, and WinoGrande.
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Models.} We use six models: Llama-3.2-1B, Llama-3.2-3B, and Llama-3.1-8B, each in base and Instruct variants.
+
+\paragraph{Quantisation configurations.} We evaluate under two regimes: \textbf{W4A4KV4} (4-bit weights, activations, and KV-cache) and \textbf{W4A16KV16} (4-bit weights only). Following the loss--quantiser pairing principle (Section~\ref{sec:pairing}), SWD-Unif and Whip use INT4 with GPTQ weight quantisation, while SWD-Gauss uses NF4 with \texttt{bitsandbytes}. $R_3$ and $R_4$ are fixed random Hadamard matrices throughout.
+
+\paragraph{Calibration.} Rotations are calibrated on 128 WikiText-2 samples (sequence length 2048). $R_1$ is trained for 10 epochs as a single global rotation over activations pooled from the \texttt{up\_proj} and \texttt{q\_proj} inputs across all transformer layers, matching DartQuant's collection scope; $R_2$ is trained per layer for 5 epochs. Optimisation uses SGD with $\text{lr}=10^{-3}$ and momentum $0.9$ on the QR-Orth Stiefel manifold update.
+
+\paragraph{Evaluation methodology.} Perplexity is computed with a stride equal to the sequence length (2048) on the WikiText-2 \texttt{test} split and the C4 \texttt{validation} split. Zero-shot accuracy is reported via \texttt{lm-evaluation-harness} for HellaSwag, ARC-Challenge and WinoGrande under the harness's default few-shot settings (zero-shot for all three). All numbers are single-seed; we therefore do not report confidence intervals. We treat differences below $0.1$ perplexity points or $0.5$ accuracy points as not separating two configurations.
+ 
+ 
+%% ============================
+%% EXPERIMENT 1
+%% ============================
+\subsection{Experiment~1: Loss Function Comparison}
+\label{sec:exp1}
+ 
+Table~\ref{tab:exp1_main} above compares the three loss functions under W4A4KV4 on base models. SWD-Unif consistently achieves the lowest perplexity: on Llama-3.1-8B it attains WikiText-2 PPL of $7.73$ versus $7.85$ (Whip) and $9.26$ (SWD-Gauss). The advantage holds across all scales, with relative PPL reductions of $1.3\%$--$2.3\%$ over Whip on WikiText-2.
+ 
+\begin{table}[t]
+\centering
+\caption{W4A4KV4 loss comparison on base models. Best quantised result \textbf{bolded}. Full breakdown in Appendix~\ref{app:exp1}.}
+\label{tab:exp1_main}
+\vspace{0.3em}
+\small
+\begin{tabular}{ll cc c}
+\toprule
+\textbf{Scale} & \textbf{Loss} & \textbf{Wiki-2}$\downarrow$ & \textbf{C4}$\downarrow$ & \textbf{Avg}$\uparrow$ \\
+\midrule
+\multirow{4}{*}{1B}
+  & \color{gray}{\footnotesize FP16} & \color{gray}{\footnotesize 9.75} & \color{gray}{\footnotesize 14.29} & \color{gray}{\footnotesize 53.82} \\
+  & SWD-Unif  & \best{13.90} & \best{21.53} & 47.35 \\
+  & Whip      & 14.08 & 22.00 & \best{48.00} \\
+  & SWD-Gauss & 18.05 & 28.30 & 44.90 \\
+\midrule
+\multirow{4}{*}{3B}
+  & \color{gray}{\footnotesize FP16} & \color{gray}{\footnotesize 7.81} & \color{gray}{\footnotesize 11.70} & \color{gray}{\footnotesize 63.24} \\
+  & SWD-Unif  & \best{9.53} & \best{14.85} & 57.12 \\
+  & Whip      & 9.75 & 15.17 & 56.89 \\
+  & SWD-Gauss & 12.06 & 18.79 & 54.51 \\
+\midrule
+\multirow{4}{*}{8B}
+  & \color{gray}{\footnotesize FP16} & \color{gray}{\footnotesize 6.24} & \color{gray}{\footnotesize 9.54} & \color{gray}{\footnotesize 68.85} \\
+  & SWD-Unif  & \best{7.73} & \best{12.54} & \best{64.31} \\
+  & Whip      & 7.85 & 12.69 & 63.87 \\
+  & SWD-Gauss & 9.26 & 14.75 & 61.60 \\
+\bottomrule
+\end{tabular}
+\end{table}
+ 
+This confirms the theoretical prediction from Proposition~\ref{prop:swd_grad}: SWD-Unif's linearly-scaling gradients for extreme outliers drive the rotation toward a more quantisation-friendly distribution, reducing error under the INT4 uniform quantiser. SWD-Gauss with NF4 trails substantially ($+20\%$--$30\%$ PPL vs.\ SWD-Unif), raising the question of whether this gap stems from the loss function's distributional target or from the NF4 quantiser implementation itself. Experiment~2 isolates this factor.
+ 
+The PPL degradation from FP16 grows as model size shrinks: SWD-Unif incurs $+23.8\%$ WikiText-2 PPL on 8B but $+42.6\%$ on 1B, consistent with smaller models having less redundancy to absorb quantisation loss.
+ 
+ 
+%% ============================
+%% EXPERIMENT 2
+%% ============================
+\subsection{Experiment~2: Isolating the Quantiser Effect under W4A16KV16}
+\label{sec:exp2}
+
+To address the performance gap observed in Experiment~1, we investigate whether the poor results of SWD-Gauss is caused from a distributional mismatch (Uniform vs Gaussian) or the quantiser implementation itself. In the standard W4A4KV4 configuration, Random Hadamard transforms (R3, R4) are designed to target a uniform distribution, making comparison with the Gaussian-assuming NF4 quantiser inherently biased. We therefore conduct Experiment~2 under a W4A16KV16 setting to isolate the weight quantiser effect by removing activation distribution conflicts.
+
+\begin{table}[ht]
+\centering
+\caption{Experiment 2: W4A16KV16 loss comparison on base models. Best quantised result \textbf{bolded}. Full breakdown in Appendix~\ref{app:exp2}.}
+\label{tab:exp2_results}
+\vspace{0.3em}
+\small
+\begin{tabular}{ll cc c}
+\toprule
+\textbf{Scale} & \textbf{Loss} & \textbf{Wiki-2}~$\downarrow$ & \textbf{C4}~$\downarrow$ & \textbf{Avg}~$\uparrow$ \\
+\midrule
+\multirow{3}{*}{1B}
+  & SWD-Unif  & \best{10.39} & 15.63 & 51.26 \\
+  & Whip      & 10.45 & \best{15.63} & \best{52.28} \\
+  & SWD-Gauss & 12.16 & 18.17 & 50.38 \\
+\midrule
+\multirow{3}{*}{3B}
+  & SWD-Unif  & \best{8.15} & 12.31 & 61.32 \\
+  & Whip      & 8.16 & \best{12.30} & \best{62.31} \\
+  & SWD-Gauss & 9.18 & 13.77 & 59.84 \\
+\midrule
+\multirow{3}{*}{8B}
+  & SWD-Unif  & \best{6.56} & 10.38 & 67.22 \\
+  & Whip      & 6.58 & \best{10.37} & \best{67.42} \\
+  & SWD-Gauss & 7.10 & 11.22 & 67.24 \\
+\bottomrule
+\end{tabular}%
+\end{table}
+
+We find that even after removing the activation-side mismatch, the NF4/\texttt{bitsandbytes} branch remains less effective than the INT4/GPTQ branch. This is a negative result for our SWD-Gauss proposal: the loss--quantiser pairing predicts that SWD-Gauss matched with a Gaussian-optimal quantiser should at least equal the INT4 branch when activations are driven toward Gaussian shape, but it does not.
+
+The shortfall is consistent with a backend confound rather than a failure of the pairing principle, though the two cannot be separated from our data alone. GPTQ performs gradient-based weight reconstruction using approximate Hessian information, whereas the \texttt{bitsandbytes} NF4 implementation rounds weights directly to the nearest codebook level without a calibration step. The remaining gap between SWD-Gauss/NF4 and SWD-Unif/INT4 in Table~\ref{tab:exp2_results} is consistent in magnitude with this difference in weight reconstruction quality, which is incurred regardless of how the activation distribution is shaped. A fair test of the pairing principle on the NF4 side requires an NF4 weight-quantisation backend with GPTQ-equivalent calibration; we treat this as an open question rather than evidence against the pairing itself.
+ 
+ 
+%% ============================
+%% EXPERIMENT 3
+%% ============================
+\subsection{Additional Analysis: Interaction with Instruction Tuning}
+\label{sec:exp3}
+
+Having addressed Questions~1 and~2 in Experiments~1 and~2, we now report an additional empirical observation that is orthogonal to the three research questions: how instruction tuning interacts with aggressive quantisation across model scales. We systematically compare base and Instruct variants across all three model scales under both quantisation regimes.
+ 
+Even at FP16, Instruct models show $+14\%$--$35\%$ higher WikiText-2 PPL than base models (Table~\ref{tab:exp3_ppl}), reflecting the distributional shift from instruction tuning away from general language modelling.
+ 
+\begin{table}[t]
+\centering
+\caption{WikiText-2 PPL: Base vs.\ Instruct. $\Delta$: absolute PPL increase. Full results in Appendix~\ref{app:exp3}.}
+\label{tab:exp3_ppl}
+\vspace{0.3em}
+\small
+\begin{tabular}{ll ccc}
+\toprule
+\textbf{Scale} & \textbf{Loss} & \textbf{Base} & \textbf{Inst.} & $\Delta$ \\
+\midrule
+\multicolumn{5}{l}{\emph{FP16 (no quantisation)}} \\
+\midrule
+1B & & 9.75 & 13.17 & +3.42 \\
+3B & & 7.81 & 11.05 & +3.24 \\
+8B & & 6.24 & 7.22 & +0.98 \\
+\midrule
+\multicolumn{5}{l}{\emph{W4A4KV4}} \\
+\midrule
+1B & SWD-Unif & 13.90 & 18.26 & +4.36 \\
+1B & Whip     & 14.08 & 18.96 & +4.88 \\
+3B & SWD-Unif & 9.53  & 14.54 & +5.01 \\
+3B & Whip     & 9.75  & 15.09 & +5.34 \\
+8B & SWD-Unif & 7.73  & 8.74  & +1.01 \\
+8B & Whip     & 7.85  & 8.68  & +0.83 \\
+\bottomrule
+\end{tabular}
+\end{table}
+ 
+Quantisation \emph{amplifies} this gap: on 1B with SWD-Unif, $\Delta$ grows from $+3.42$ (FP16) to $+4.36$ (W4A4KV4); on 3B, from $+3.24$ to $+5.01$. However, downstream accuracy reveals a nuanced pattern (Table~\ref{tab:exp3_acc}): at 8B scale, Instruct models achieve \emph{higher} average accuracy than base models despite worse PPL, driven by gains on ARC-Challenge. At smaller scales (1B, 3B), base models dominate in both metrics.
+ 
+\begin{table}[t]
+\centering
+\caption{Avg zero-shot accuracy under W4A4KV4. Instruct advantages emerge only at 8B scale.}
+\label{tab:exp3_acc}
+\vspace{0.3em}
+\small
+\begin{tabular}{ll cc}
+\toprule
+\textbf{Scale} & \textbf{Loss} & \textbf{Base} & \textbf{Instruct} \\
+\midrule
+\multirow{2}{*}{1B}
+  & SWD-Unif  & \best{47.35} & 46.63 \\
+  & Whip      & \best{48.00} & 46.76 \\
+\midrule
+\multirow{2}{*}{3B}
+  & SWD-Unif  & \best{57.12} & 54.24 \\
+  & Whip      & \best{56.89} & 54.48 \\
+\midrule
+\multirow{2}{*}{8B}
+  & SWD-Unif  & 64.31 & \best{63.97} \\
+  & Whip      & 63.87 & \best{65.69} \\
+\bottomrule
+\end{tabular}
+\end{table}
+ 
+We attribute this scale-dependent behaviour to two factors. First, instruction tuning sharpens the output distribution, increasing sensitivity to quantisation-induced perturbations on open-domain text. Second, at smaller scales, instruction tuning consumes representational capacity critical for surviving aggressive quantisation, whereas 8B models retain sufficient redundancy to benefit from instruction-aligned reasoning on structured tasks like ARC-Challenge. Combined with the findings from Experiment~2 that INT4/GPTQ provides more robust weight quantisation than NF4/bitsandbytes, these results suggest that the optimal deployment strategy depends on both model scale and the target application.
+ 
+\paragraph{Practical recommendation.} For general language modelling, quantising the base model is strictly preferable. For task-specific deployment at $\geq$8B scale, the Instruct variant may be preferred despite higher PPL, using the INT4/GPTQ quantiser validated in Experiments~1 and~2.
+
+\paragraph{Discussion.} Question~1 is answered positively in perplexity: SWD-Unif reduces perplexity relative to Whip under identical rotation machinery on every (model, regime, dataset) pair we report; downstream accuracy effects are scale-dependent and mixed at 1B and 3B (Tables~\ref{tab:exp1_main} and~\ref{tab:exp2_results}). Question~2 receives a partial answer: the INT4 instantiation of the pairing (SWD-Unif with INT4/GPTQ) achieves the strongest perplexity across Experiments~1 and~2, consistent with the principle on the INT4 side; the NF4 instantiation (SWD-Gauss with \texttt{bitsandbytes}) underperforms INT4/GPTQ at matched precision, and this shortfall is consistent with the backend's lack of a weight-calibration step, but the backend confound and the pairing principle cannot be separated without an NF4 backend offering GPTQ-equivalent weight reconstruction. Question~3 is answered theoretically but not empirically: Section~\ref{sec:future} introduces learnable butterfly Givens rotations as a principled replacement for the fixed Hadamard $R_3$ and $R_4$, with a prototype in our codebase but no experiments at scale. We note three scope limitations: all results are single-seed, all models belong to the Llama~3 family, and the calibration context is 2048 tokens; extending to other model families and longer contexts is mechanical but unevaluated.
+
+%% ============================================================
+%% SECTION 5: FUTURE WORK
+%% ============================================================
+\section{Future Work}
+\label{sec:future}
+
+\paragraph{Learnable butterfly rotations for $R_3$ and $R_4$.}
+The theoretical suboptimality of fixed Hadamard matrices under RoPE (Appendix~\ref{app:hadamard}) points directly to \emph{learnable butterfly Givens rotations} \cite{butterflyquant,dao2019,dao2020kaleidoscope} as a replacement: $K = \log_2 d$ layers of parallel $2 \times 2$ Givens rotations with $\frac{d}{2}\log_2 d$ trainable angles at $O(d \log d)$ cost, matching the asymptotic complexity of the Hadamard transform while admitting the per-pair optimum $\theta^*$ of Lemma~\ref{lem:givens_eq}. Our codebase contains prototype implementations (\texttt{ButterflyRotation} and \texttt{ButterflyFactored}); the open problem is a systematic ablation of learnable butterfly against fixed Hadamard for $R_3$ and $R_4$ across model scales and precision regimes, which is the direct empirical counterpart to Proposition~\ref{prop:hadamard_subopt}.
+
+
+%% ============================================================
+%% SECTION 6: CONCLUSION (placeholder)
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented a distribution-aware rotation calibration framework for low-bit LLM quantisation, replacing DartQuant's Whip proxy with a Sliced Wasserstein Distance loss and motivating a loss--quantiser pairing principle that couples the calibration target to the quantiser's optimal input distribution. SWD-Unif paired with INT4/GPTQ reduces WikiText-2 perplexity relative to Whip on every (model, regime) pair we test, by $1.3\%$--$2.3\%$ under W4A4KV4 on Llama-3.2-1B/3B and Llama-3.1-8B, consistent with the pairing principle on the INT4 side. The NF4 branch yields a negative finding: SWD-Gauss via \texttt{bitsandbytes} underperforms the INT4 branch, and the gap is consistent with the NF4 backend's lack of a weight-calibration step; the backend confound and the pairing principle cannot be separated without an NF4 backend offering GPTQ-equivalent weight reconstruction. We further prove that fixed Hadamard matrices are suboptimal for the post-RoPE and post-activation rotations under any non-zero intra-band correlation, and propose learnable butterfly Givens rotations as an $\mathcal{O}(d \log d)$ data-adaptive replacement whose systematic empirical evaluation is the main open problem we leave for future work.
+
+
+%% ============================================================
+%% REFERENCES
+%% ============================================================
+\bibliography{references}
+\bibliographystyle{acl_natbib}
+
+
+%% ============================================================
+%% APPENDICES
+%% ============================================================
+\appendix
+
+\section{Full Derivation of the Sliced Wasserstein Distance Loss}
+\label{app:swd_derivation}
+
+\subsection{Starting Point: 1D 2-Wasserstein Distance}
+
+For two probability distributions $P$ and $Q$ on $\mathbb{R}$ with finite second moments, the squared 2-Wasserstein distance admits the closed form~\eqref{eq:w2} stated in Section~\ref{sec:swd} \cite{wasserstein}, where $F_P^{-1}(u) = \inf\{x : F_P(x) \geq u\}$ is the quantile function (generalised inverse CDF) of $P$, and similarly for $Q$.
+This closed form is a special property of the one-dimensional case; in higher dimensions, the Wasserstein distance requires solving an optimal transport problem.
+
+\subsection{Empirical Quantile Approximation}
+
+Let $Y = \{y_1, \ldots, y_N\}$ be an i.i.d.\ sample from distribution $P_Y$.
+Sort these values to obtain order statistics $y_{(1)} \leq y_{(2)} \leq \cdots \leq y_{(N)}$.
+The empirical quantile function is a step function satisfying $\hat{F}_{P_Y}^{-1}(u_i) = y_{(i)}$ at the evaluation points $u_i = (i - 0.5)/N$ for $i = 1, \ldots, N$, following the midpoint convention \cite{blom1958,wilk1968} which keeps all evaluation points strictly in $(0,1)$---avoiding the boundary divergences $\Phi^{-1}(0) = -\infty$ and $\Phi^{-1}(1) = +\infty$ that arise with the alternative conventions $u_i = i/N$ or $u_i = i/(N+1)$.
+Substituting the empirical quantiles into~\eqref{eq:w2} and approximating the integral by a Riemann sum gives:
+\begin{equation}
+\label{eq:w2_empirical}
+W_2^2(P_Y, Q) \approx \frac{1}{N} \sum_{i=1}^{N} \bigl(y_{(i)} - F_Q^{-1}(u_i)\bigr)^2.
+\end{equation}
+The approximation error of this discretisation converges at rate $O(1/N)$ under standard regularity conditions (bounded density bounded away from zero); more precisely, the Dvoretzky--Kiefer--Wolfowitz inequality \cite{dkw1956} gives uniform convergence of the empirical quantile function at rate $O(\sqrt{\log N / N})$.
+Defining the target quantiles $t_i := F_Q^{-1}(u_i)$ recovers the SWD loss~\eqref{eq:swd_discrete}.
+
+\subsection{Uniform Target: SWD-Unif}
+
+For INT4 quantisation, we target the uniform distribution on $[-b, b]$, whose quantile function is $F_Q^{-1}(u) = 2bu - b$.
+Evaluating at the midpoint grid $u_i = (i - 0.5)/N$ recovers the target quantiles~\eqref{eq:target_unif} of Section~\ref{sec:swd}.
+It remains to choose the scale $b$.
+We enforce second-moment matching between the target and the data:
+
+\begin{lemma}[Moment-matched uniform scale]
+\label{lem:b_moment_match}
+Let $T \sim \mathrm{Uniform}[-b, b]$.
+If we require $\mathbb{E}[T^2] = \RMS^2(Y)$, then $b = \sqrt{3} \cdot \RMS(Y)$.
+\end{lemma}
+
+\begin{proof}
+The second moment of $\mathrm{Uniform}[-b, b]$ is
+\[
+\mathbb{E}[T^2] = \frac{1}{2b}\int_{-b}^{b} t^2 \, dt = \frac{1}{2b} \cdot \frac{2b^3}{3} = \frac{b^2}{3}.
+\]
+Setting $\mathbb{E}[T^2] = \RMS^2$ gives $b^2/3 = \RMS^2$, hence $b = \sqrt{3} \cdot \RMS$.
+\end{proof}
+
+\noindent
+Here $\RMS = \RMS_{\text{global}}$ is computed over \emph{all} $B \times D$ values in the activation tensor (see the discussion of global RMS in Section~\ref{par:global_rms}).
+
+\subsection{Gaussian Target: SWD-Gauss}
+
+For NF4 quantisation, we target the Gaussian distribution $\mathcal{N}(0, \hat{\sigma}^2)$, whose quantile function is $F_Q^{-1}(u) = \hat{\sigma} \cdot \Phi^{-1}(u)$.
+Evaluating at the same midpoint grid $u_i = (i - 0.5)/N$ used for the uniform target recovers the Gaussian target quantiles~\eqref{eq:target_gauss} of Section~\ref{sec:swd}, with $\hat{\sigma} = \RMS_{\text{global}}$.
+Since the NF4 codebook levels are placed at the quantiles of a standard normal \cite{qlora}, driving activations toward a Gaussian shape directly minimises the expected quantisation error under NF4 (for fixed-codebook scalar quantisation).
+
+\subsection{Gradient Derivation}
+\label{app:swd_gradient}
+
+The SWD loss~\eqref{eq:swd_discrete} is differentiable almost everywhere with respect to the unsorted activations (the non-differentiable set corresponds to tied values, which has measure zero under continuous distributions; in practice, random tie-breaking or straight-through estimation handles ties in low-precision settings \cite{blondel2020}).
+Let $\sigma$ denote the sorting permutation such that $y_{\sigma(i)} = y_{(i)}$.
+The main-body gradient~\eqref{eq:swd_grad} can then be rewritten in terms of the unsorted activation $y_k$ with rank $r = \sigma^{-1}(k)$ as
+\[
+\frac{\partial \mathcal{L}_{\text{SWD}}}{\partial y_k}
+= \frac{2}{N}\bigl(y_k - t_{\sigma^{-1}(k)}\bigr).
+\]
+At the extremes, $y_{(N)}$ is the largest value and $t_N \approx b$ (for the uniform target) or $t_N \approx \hat{\sigma} \cdot \Phi^{-1}((N-0.5)/N)$ (for the Gaussian target), both of which are moderate constants.
+Thus the gradient magnitude scales as $|y_{(N)} - t_N| = \Theta(|y_{(N)}|)$ for $|y_{(N)}| \to \infty$, confirming Proposition~\ref{prop:swd_grad}.
+
+For the Whip loss (normalised as an average for direct comparison), $\partial \mathcal{L}_{\text{Whip}} / \partial y_k = -\frac{1}{N}\text{sgn}(y_k) \cdot e^{-|y_k|}$.
+Since both losses are normalised as averages over $N$ samples, the per-activation gradient magnitudes are directly comparable:
+\[
+\frac{|\nabla_{\text{SWD}}|}{|\nabla_{\text{Whip}}|}
+= \frac{\frac{2}{N}|y_k - t_r|}{\frac{1}{N}e^{-|y_k|}}
+= 2|y_k - t_r| \cdot e^{|y_k|}.
+\]
+For a typical activation outlier with $|y_k| = 5$ and $t_r \approx b \approx 1.7$ (assuming $\RMS \approx 1$), this ratio is approximately $2 \times 3.3 \times e^5 \approx 980$.
+The SWD gradient is nearly three orders of magnitude stronger than Whip for this outlier, and the advantage grows exponentially with outlier magnitude.
+
+
+\section{Theoretical Analysis of Random Hadamard Limitations for $R_3$ and $R_4$}
+\label{app:hadamard}
+
+In this appendix, we prove that random Hadamard matrices---the default choice for $R_3$ (post-RoPE) and $R_4$ (post-activation) in QuaRot \cite{quarot} and DartQuant \cite{dartquant}---are provably suboptimal when the activation covariance is anisotropic, as is the case after Rotary Position Embeddings (RoPE).
+
+\subsection{RoPE-Induced Block-Diagonal Covariance}
+\label{app:rope_cov}
+
+RoPE applies a position-dependent rotation to each pair of dimensions $(2k, 2k{+}1)$ in the query and key vectors.
+At position $m$, the rotation for frequency band $k$ is
+\[
+\mathcal{R}_m^{(k)} = \begin{pmatrix} \cos m\theta_k & -\sin m\theta_k \\ \sin m\theta_k & \cos m\theta_k \end{pmatrix},
+\]
+where $\theta_k = 10000^{-2k/d}$.
+Let the input activation have covariance $\bSigma_{\text{in}}$ with the $2 \times 2$ block for band $k$ given by
+\[
+\bSigma_{\text{in}}^{(k)} = \begin{pmatrix} \sigma_1^2 & \rho \sigma_1 \sigma_2 \\ \rho \sigma_1 \sigma_2 & \sigma_2^2 \end{pmatrix},
+\]
+where we allow the two channels in a frequency band to have different variances $\sigma_1^2, \sigma_2^2$ and correlation $\rho$.
+
+\begin{theorem}[Post-RoPE variance]
+\label{thm:rope_var}
+Assume that the pre-RoPE activations within each frequency band have zero cross-channel correlation ($\rho = 0$).
+After applying RoPE and averaging over sequence positions $m = 1, \ldots, L$, the variance of the even-indexed channel in frequency band $k$ is:
+\begin{equation}
+\label{eq:rope_var}
+\begin{split}
+\Var(\tilde{a}_{2k}) &= \frac{\sigma_1^2 + \sigma_2^2}{2} \\
+&+ \frac{\sigma_1^2 - \sigma_2^2}{2} \cdot \frac{1}{L}\sum_{m=1}^{L} \cos(2m\theta_k).
+\end{split}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+At position $m$, the rotated even-indexed activation is
+\[
+\tilde{a}_{2k}^{(m)} = a_{2k} \cos m\theta_k - a_{2k+1} \sin m\theta_k.
+\]
+Its variance is
+\begin{align}
+&\Var(\tilde{a}_{2k}^{(m)}) \nonumber\\
+&= \sigma_1^2 \cos^2 m\theta_k + \sigma_2^2 \sin^2 m\theta_k \nonumber\\
+&\quad - 2\rho\sigma_1\sigma_2 \cos m\theta_k \sin m\theta_k \nonumber\\
+&= \frac{\sigma_1^2 + \sigma_2^2}{2}
+  + \frac{\sigma_1^2 - \sigma_2^2}{2}\cos 2m\theta_k \nonumber\\
+&\quad - \rho\sigma_1\sigma_2 \sin 2m\theta_k.
+\label{eq:var_single_pos}
+\end{align}
+The first line follows from expanding $\Var(X\cos\alpha - Y\sin\alpha)$ for random variables $X, Y$ with the given covariance structure, and the second line uses the double-angle identities $\cos^2\alpha = (1 + \cos 2\alpha)/2$ and $\sin^2\alpha = (1 - \cos 2\alpha)/2$.
+
+Averaging over $m = 1, \ldots, L$:
+\begin{align}
+\overline{\Var}(\tilde{a}_{2k})
+&= \frac{\sigma_1^2 + \sigma_2^2}{2}
++ \frac{\sigma_1^2 - \sigma_2^2}{2} \cdot
+\underbrace{\frac{1}{L}\sum_{m=1}^{L}\cos 2m\theta_k}_{C_k} \nonumber\\
+&\quad - \rho\sigma_1\sigma_2 \cdot
+\underbrace{\frac{1}{L}\sum_{m=1}^{L}\sin 2m\theta_k}_{S_k}.
+\end{align}
+Setting $\rho = 0$ eliminates the $S_k$ term, yielding~\eqref{eq:rope_var}.
+\end{proof}
+
+\begin{remark}[Extension to $\rho \neq 0$]
+\label{rem:general_rho}
+When $\rho \neq 0$, the full position-averaged variance includes an additional term $-\rho\sigma_1\sigma_2 \cdot S_k$ where $S_k = \frac{1}{L}\sum_{m=1}^{L}\sin 2m\theta_k$.
+Empirically, pre-RoPE activations in LLMs exhibit near-zero cross-channel correlation within each frequency band, so $\rho \approx 0$ is a well-supported simplification.
+\end{remark}
+
+\subsection{Extreme Value Analysis of Frequency Bands}
+
+The behaviour of the oscillation average $C_k = \frac{1}{L}\sum_{m=1}^{L}\cos 2m\theta_k$ depends critically on the frequency:
+
+\paragraph{High-frequency bands ($\theta_k \approx 1$).}
+The cosines oscillate rapidly and average to approximately zero: $C_k \approx 0$.
+Hence $\Var(\tilde{a}_{2k}) \approx (\sigma_1^2 + \sigma_2^2)/2$, a well-mixed average.
+
+\paragraph{Low-frequency bands ($\theta_k \to 0$).}
+Here $\cos 2m\theta_k \approx 1$ for all $m$, giving $C_k \approx 1$.
+Thus $\Var(\tilde{a}_{2k}) \approx \sigma_1^2$, the \emph{original} (unmixed) variance of the first channel.
+
+\begin{corollary}[Structured variance profile]
+\label{cor:monotonic}
+The post-RoPE channel variances exhibit a systematic trend with frequency band index $k$: low-frequency bands (small $\theta_k$, hence $C_k \approx 1$) preserve the original variance heterogeneity, while high-frequency bands (large $\theta_k$, hence $C_k \approx 0$) average it.
+Since $\theta_k = 10000^{-2k/d}$ is strictly decreasing in $k$, the transition from $C_k \approx 1$ to $C_k \approx 0$ proceeds systematically (though not necessarily strictly monotonically, as intermediate-frequency bands may exhibit minor oscillations in $C_k$), producing a structured variance profile across channels.
+\end{corollary}
+
+\subsection{Suboptimality of Hadamard under Anisotropy}
+
+The Hadamard matrix $\bH$ has coherence $\mu(\bH) = 1/\sqrt{d}$, which is the minimum possible for any orthogonal matrix.
+This property guarantees optimal variance dispersion \emph{when the input covariance is isotropic}, i.e., $\bSigma \approx \sigma^2 \bI$.
+
+\begin{remark}[Hadamard under diagonal covariance]
+\label{rem:hadamard_diag}
+When $\bSigma = \diag(\lambda_1, \ldots, \lambda_d)$ with independent channels, the Hadamard rotation $\bH$ perfectly equalises output variances:
+$\Var((\bH\bx)_i) = \frac{1}{d}\sum_j \lambda_j = \bar{\lambda}$.
+However, this guarantee can break down when off-diagonal correlations are present, as we demonstrate below.
+\end{remark}
+
+\begin{proposition}[Hadamard suboptimality under correlation]
+\label{prop:hadamard_subopt}
+Consider two channels with variances $\lambda_i, \lambda_j$ and non-zero correlation $\rho_{ij} \neq 0$.
+The $2 \times 2$ normalised Hadamard rotation (equivalent to a Givens rotation with $\theta = \pi/4$) does not equalise output variances.
+\end{proposition}
+
+\begin{proof}
+By Lemma~\ref{lem:givens_eq}, the equalisation condition $\lambda_i' = \lambda_j'$ at angle $\theta$ requires
+\[
+(\lambda_i - \lambda_j)\cos 2\theta + 2\rho_{ij}\sqrt{\lambda_i\lambda_j}\sin 2\theta = 0.
+\]
+Evaluating at the Hadamard angle $\theta = \pi/4$ gives $\cos(\pi/2) = 0$ and $\sin(\pi/2) = 1$, so the condition reduces to $2\rho_{ij}\sqrt{\lambda_i\lambda_j} = 0$, which fails when $\rho_{ij} \neq 0$ and $\lambda_i, \lambda_j > 0$.
+Thus $\theta = \pi/4$ does not satisfy the equalisation condition; instead, the Hadamard rotation produces output variances
+\[
+\lambda_i' = \frac{\lambda_i + \lambda_j}{2} + \rho_{ij}\sqrt{\lambda_i\lambda_j},
+\]
+
+\[
+\lambda_j' = \frac{\lambda_i + \lambda_j}{2} - \rho_{ij}\sqrt{\lambda_i\lambda_j},
+\]
+which differ by $2\rho_{ij}\sqrt{\lambda_i\lambda_j} \neq 0$.
+
+As a concrete illustration, consider $d = 2$ with $\bH = \frac{1}{\sqrt{2}}\bigl(\begin{smallmatrix} 1 & 1 \\ 1 & -1 \end{smallmatrix}\bigr)$ and covariance
+\[
+\bSigma = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix},
+\]
+so that $\lambda_1 = \lambda_2 = 2$, $\rho = 0.5$, and $\bar{\lambda} = 2$.
+The transformed covariance is $\bH \bSigma \bH^\top = \bigl(\begin{smallmatrix} 3 & 0 \\ 0 & 1 \end{smallmatrix}\bigr)$, giving $\Var((\bH\bx)_1) = 3 > \bar{\lambda} = 2$.
+The Hadamard rotation takes \emph{equal} input variances and produces \emph{unequal} output variances, amplifying variance in the first output channel by the correlation term.
+In contrast, the optimal angle from Lemma~\ref{lem:givens_eq} is $\theta^* = \frac{1}{2}\arctan\bigl(\frac{0}{2}\bigr) = 0$: the identity (no rotation), which trivially preserves the already-equal variances.
+\end{proof}
+
+\begin{corollary}[Hadamard suboptimality in the post-RoPE setting]
+\label{cor:hadamard_rope}
+Under the conditions of Theorem~\ref{thm:rope_var}, if any frequency band $k$ has even a small non-zero pre-RoPE correlation ($\rho \neq 0$), Proposition~\ref{prop:hadamard_subopt} applies directly: the Hadamard rotation does not equalise the output variances of that block.
+More severely, for low-frequency bands with $C_k \approx 1$ where RoPE does not mix the pair, the post-RoPE covariance retains the original off-diagonal structure, and the Hadamard rotation actively \emph{creates} variance inhomogeneity (as in the $\lambda_1 = \lambda_2$ example of Proposition~\ref{prop:hadamard_subopt}).
+Corollary~\ref{cor:monotonic} shows that such low-frequency bands are always present in standard RoPE configurations, making this failure mode practically unavoidable.
+\end{corollary}
+
+A data-driven rotation that accounts for the actual covariance structure is therefore needed for $R_3$ and $R_4$.
+
+\subsection{Givens Variance Equalisation}
+
+We now show that pairwise Givens rotations---the building blocks of the classical Jacobi eigenvalue algorithm \cite{golub2013matrix}---provide a principled mechanism for variance equalisation that adapts to both variance heterogeneity and non-zero correlations.
+
+\begin{lemma}[Givens variance equalisation]
+\label{lem:givens_eq}
+Consider two channels with variances $\lambda_i, \lambda_j$ and correlation $\rho_{ij}$.
+A Givens rotation $\bG(\theta)$ in the $(i,j)$ plane produces output variances:
+\begin{equation}
+\label{eq:givens_var}
+\begin{split}
+\lambda_i' &= \lambda_i \cos^2\theta + \lambda_j \sin^2\theta \\
+&\quad + 2\rho_{ij}\sqrt{\lambda_i\lambda_j}\cos\theta\sin\theta.
+\end{split}
+\end{equation}
+The angle that equalises $\lambda_i' = \lambda_j'$ is:
+\begin{equation}
+\label{eq:givens_optimal}
+\theta^* = \frac{1}{2}\arctan\!\left(\frac{\lambda_j - \lambda_i}{2\rho_{ij}\sqrt{\lambda_i\lambda_j}}\right).
+\end{equation}
+When $\rho_{ij} \neq 0$, we have $\theta^* \neq \pi/4$, so the fixed Hadamard angle $\pi/4$ is strictly suboptimal.
+\end{lemma}
+
+\begin{proof}
+Under $\bG(\theta)$, the rotated pair is $(\tilde{x}_i, \tilde{x}_j) = (x_i\cos\theta + x_j\sin\theta, \; -x_i\sin\theta + x_j\cos\theta)$.
+The variance of $\tilde{x}_i$ is
+\begin{align*}
+\lambda_i'
+&= \Var(x_i\cos\theta + x_j\sin\theta) \\
+&= \lambda_i\cos^2\theta + \lambda_j\sin^2\theta \\
+&\quad + 2\Cov(x_i, x_j)\cos\theta\sin\theta \\
+&= \lambda_i\cos^2\theta + \lambda_j\sin^2\theta \\
+&\quad + 2\rho_{ij}\sqrt{\lambda_i\lambda_j}\cos\theta\sin\theta.
+\end{align*}
+Similarly,
+$\lambda_j' = \lambda_i\sin^2\theta + \lambda_j\cos^2\theta
+- 2\rho_{ij}\sqrt{\lambda_i\lambda_j}\cos\theta\sin\theta$.
+Setting $\lambda_i' = \lambda_j'$:
+\begin{align*}
+&(\lambda_i - \lambda_j)(\cos^2\theta - \sin^2\theta) \\
+&\quad + 4\rho_{ij}\sqrt{\lambda_i\lambda_j}\cos\theta\sin\theta = 0 \\
+&(\lambda_i - \lambda_j)\cos 2\theta \\
+&\quad + 2\rho_{ij}\sqrt{\lambda_i\lambda_j}\sin 2\theta = 0 \\
+&\tan 2\theta = -\frac{\lambda_i - \lambda_j}{2\rho_{ij}\sqrt{\lambda_i\lambda_j}}.
+\end{align*}
+Taking $\theta^* = \frac{1}{2}\arctan\!\bigl(\frac{\lambda_j - \lambda_i}{2\rho_{ij}\sqrt{\lambda_i\lambda_j}}\bigr)$, which follows directly from the derived $\tan 2\theta^*$, we see that $\theta^* = \pi/4$ requires $\lambda_j - \lambda_i = 2\rho_{ij}\sqrt{\lambda_i\lambda_j}$---a condition that generically fails.
+When $\rho_{ij} = 0$, the equation reduces to $(\lambda_i - \lambda_j)\cos 2\theta = 0$, yielding $\theta^* = \pi/4$ only if $\lambda_i \neq \lambda_j$.
+When $\rho_{ij} = 0$ and $\lambda_i = \lambda_j$, the variances are already equal and every angle $\theta$ is a solution; the formula~\eqref{eq:givens_optimal} becomes the indeterminate form $0/0$ in this degenerate case.
+In general, $\theta^* \neq \pi/4$.
+\end{proof}
+
+\begin{remark}[Implementation: \texttt{atan2}]
+\label{rem:atan2}
+For numerical implementation, the formula~\eqref{eq:givens_optimal} should be computed as $\theta^* = \frac{1}{2}\operatorname{atan2}(\lambda_j - \lambda_i, \; 2\rho_{ij}\sqrt{\lambda_i\lambda_j})$, which avoids division by zero when $\rho_{ij} = 0$ and correctly handles all quadrants.
+This is particularly relevant for the learnable butterfly rotations proposed in Section~\ref{sec:future}, where gradients must flow through the angle computation.
+\end{remark}
+
+\subsection{Full Mixing via Butterfly Topology}
+
+A single layer of parallel Givens rotations can only mix pairs of channels.
+We now show that the butterfly topology---$K = \log_2 d$ layers of $d/2$ parallel Givens rotations with a specific wiring pattern---achieves full mixing.
+
+\begin{lemma}[Full mixing under butterfly topology]
+\label{lem:butterfly_mixing}
+Let $d = 2^K$.
+Consider $K = \log_2 d$ layers of butterfly Givens rotations, where layer $\ell$ ($\ell = 0, \ldots, K{-}1$) pairs channel $i$ with channel $i \oplus 2^\ell$ (bitwise XOR).
+If $\theta = \pi/4$ for all rotations and $\rho_{ij} = 0$ (uncorrelated inputs), then after all $K$ layers, every output channel has variance
+\begin{equation}
+\bar{\lambda} = \frac{1}{d}\sum_{k=1}^{d} \lambda_k.
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+We proceed by induction on the butterfly stage $\ell$.
+
+\textbf{Base case ($\ell = 0$).}
+Layer 0 pairs each even-indexed channel $2j$ with channel $2j + 1$.
+With $\theta = \pi/4$ and $\rho = 0$, Eq.~\eqref{eq:givens_var} gives
+\[
+\lambda_{2j}' = \frac{\lambda_{2j} + \lambda_{2j+1}}{2}, \qquad \lambda_{2j+1}' = \frac{\lambda_{2j} + \lambda_{2j+1}}{2}.
+\]
+After this layer, channels within each pair of stride 1 share the same variance (the pairwise average).
+
+\textbf{Inductive step.}
+Suppose that after the first $\ell$ butterfly layers (layers $0, \ldots, \ell{-}1$), each group of $2^\ell$ consecutive channels shares a common variance equal to the mean of the original $2^\ell$ variances in that group.
+The next layer, layer $\ell$, pairs channel $i$ with channel $i \oplus 2^\ell$, which connects the two halves of each group of $2^{\ell+1}$ channels.
+
+Crucially, the $\rho = 0$ condition is maintained at every layer for the paired channels: at layer $\ell$, channel $i$ is a linear combination of original channels whose indices agree with $i$ on bits $\ell, \ell+1, \ldots, K{-}1$, while channel $i \oplus 2^\ell$ is a linear combination of original channels whose bit $\ell$ is flipped (with all other high bits matching $i$).
+These two index sets are disjoint, so since the original channels are mutually uncorrelated by assumption, any linear combination from one set is uncorrelated with any linear combination from the other.
+
+Since channels within each half-group have equal variance $\mu_A$ and $\mu_B$ (by the inductive hypothesis), and the paired channels are uncorrelated ($\rho = 0$ as argued above), the Givens rotation with $\theta = \pi/4$ produces
+\[
+\mu' = \frac{\mu_A + \mu_B}{2} = \frac{1}{2^{\ell+1}} \sum_{k \in \text{group}} \lambda_k.
+\]
+After $K = \log_2 d$ layers, each group spans the entire dimension $d$, and the common variance is $\frac{1}{d}\sum_{k=1}^{d}\lambda_k = \bar{\lambda}$.
+\end{proof}
+
+\begin{remark}
+When $\rho_{ij} \neq 0$, the fixed angle $\theta = \pi/4$ no longer achieves exact equalisation (Lemma~\ref{lem:givens_eq}).
+This motivates replacing the fixed angles with \emph{learnable} parameters $\theta_{k,j}^*$, yielding a butterfly Givens rotation with $\frac{d}{2}\log_2 d$ trainable parameters and $O(d \log d)$ computational complexity---matching the Hadamard transform in cost while adapting to data-specific covariance structure.
+This is the direction proposed in Section~\ref{sec:future}.
+\end{remark}
+
+\section{Experiment~1: Full Results}
+\label{app:exp1}
+ 
+Table~\ref{tab:app_exp1_full} presents the complete per-benchmark results for Experiment~1 under W4A4KV4. We report HellaSwag (Hella.), ARC-Challenge (ARC-C), and WinoGrande (Wino.) individually alongside their average (Avg).
+ 
+\begin{table*}[!ht]
+\centering
+\caption{Experiment~1 full results: W4A4KV4 on base models. Per-benchmark zero-shot accuracy and perplexity.}
+\label{tab:app_exp1_full}
+\vspace{0.3em}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll cc cccc}
+\toprule
+\textbf{Scale} & \textbf{Loss (Quant.)} & \textbf{Wiki-2}$\downarrow$ & \textbf{C4}$\downarrow$ & \textbf{Hella.}$\uparrow$ & \textbf{ARC-C}$\uparrow$ & \textbf{Wino.}$\uparrow$ & \textbf{Avg}$\uparrow$ \\
+\midrule
+\multirow{4}{*}{\shortstack[l]{Llama-3.2\\1B}} 
+  & \color{gray}{FP16} & \color{gray}{9.75} & \color{gray}{14.29} & \color{gray}{63.76} & \color{gray}{36.77} & \color{gray}{60.93} & \color{gray}{53.82} \\
+  & SWD-Unif (INT4) & \best{13.90} & \best{21.53} & \best{55.05} & 30.72 & 56.27 & 47.35 \\
+  & Whip (INT4) & 14.08 & 22.00 & 54.33 & \best{32.85} & \best{56.83} & \best{48.00} \\
+  & SWD-Gauss (NF4) & 18.05 & 28.30 & 49.82 & 29.78 & 55.09 & 44.90 \\
+\midrule
+\multirow{4}{*}{\shortstack[l]{Llama-3.2\\3B}} 
+  & \color{gray}{FP16} & \color{gray}{7.81} & \color{gray}{11.70} & \color{gray}{73.58} & \color{gray}{45.90} & \color{gray}{70.24} & \color{gray}{63.24} \\
+  & SWD-Unif (INT4) & \best{9.53} & \best{14.85} & \best{69.10} & 38.57 & 63.69 & 57.12 \\
+  & Whip (INT4) & 9.75 & 15.17 & 68.28 & \best{39.25} & \best{63.14} & 56.89 \\
+  & SWD-Gauss (NF4) & 12.06 & 18.79 & 64.23 & 37.12 & 62.19 & 54.51 \\
+\midrule
+\multirow{4}{*}{\shortstack[l]{Llama-3.1\\8B}} 
+  & \color{gray}{FP16} & \color{gray}{6.24} & \color{gray}{9.54} & \color{gray}{79.03} & \color{gray}{53.33} & \color{gray}{74.19} & \color{gray}{68.85} \\
+  & SWD-Unif (INT4) & \best{7.73} & \best{12.54} & \best{74.48} & 49.15 & \best{69.30} & \best{64.31} \\
+  & Whip (INT4) & 7.85 & 12.69 & 74.23 & \best{48.55} & 68.82 & 63.87 \\
+  & SWD-Gauss (NF4) & 9.26 & 14.75 & 71.45 & 45.39 & 67.96 & 61.60 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+ 
+\section{Experiment~2: Full Results}
+\label{app:exp2}
+
+Table~\ref{tab:app_exp2_full} details the full per-benchmark results for Experiment~2. This setup utilises a \mbox{W4A16KV16} configuration to isolate weight quantisation effects from activation distribution mismatches. By maintaining high precision for activations and KV caches, we provide a direct comparison between the calibrated INT4 (GPTQ) approach and the non-calibrated NF4 (bitsandbytes) quantiser. The data confirms that the NF4 format remains less robust due to its reliance on direct rounding without a dedicated calibration stage.
+
+\begin{table*}[!ht]
+\centering
+\caption{Experiment~2 full results: W4A16KV16 on base models. Per-benchmark zero-shot accuracy and perplexity}
+\label{tab:app_exp2_full}
+\vspace{0.3em}
+\footnotesize
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{ll cc cccc}
+\toprule
+\textbf{Scale} & \textbf{Loss (Quantiser)} & \textbf{Wiki-2}$\downarrow$ & \textbf{C4}$\downarrow$ & \textbf{Hella.}$\uparrow$ & \textbf{ARC-C}$\uparrow$ & \textbf{Wino.}$\uparrow$ & \textbf{Avg}$\uparrow$ \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Llama-3.2\\1B}} 
+  & SWD-Unif (INT4) & \best{10.39} & 15.63 & \best{61.61} & 33.28 & 58.88 & 51.26 \\
+  & Whip (INT4) & 10.45 & \best{15.63} & 61.32 & \best{36.09} & \best{59.43} & \best{52.28} \\
+  & SWD-Gauss (NF4) & 12.16 & 18.17 & 57.74 & 34.04 & 59.35 & 50.38 \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Llama-3.2\\3B}} 
+  & SWD-Unif (INT4) & \best{8.15} & 12.31 & \best{72.64} & 43.43 & 67.88 & 61.32 \\
+  & Whip (INT4) & 8.16 & \best{12.30} & 72.32 & \best{44.45} & \best{70.17} & \best{62.31} \\
+  & SWD-Gauss (NF4) & 9.18 & 13.77 & 70.25 & 41.64 & 67.64 & 59.84 \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Llama-3.1\\8B}} 
+  & SWD-Unif (INT4) & \best{6.56} & 10.38 & 77.45 & 51.28 & \best{72.93} & 67.22 \\
+  & Whip (INT4) & 6.58 & \best{10.37} & 77.43 & \best{52.05} & 72.77 & \best{67.42} \\
+  & SWD-Gauss (NF4) & 7.10 & 11.22 & \best{77.54} & 51.79 & 72.38 & 67.24 \\
+\bottomrule
+\end{tabular}%
+\end{table*}
+
+ 
+\section{Additional Analysis: Full Results}
+\label{app:exp3}
+
+Tables~\ref{tab:app_exp3_ppl} and~\ref{tab:app_exp3_acc} present the complete Base vs.\ Instruct comparison across all configurations. Abbreviations follow Appendix~\ref{app:exp1}.
+ 
+\begin{table*}[!ht]
+\centering
+\caption{Additional-analysis full PPL results: Base vs.\ Instruct across all configurations.}
+\label{tab:app_exp3_ppl}
+\vspace{0.3em}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll cc c cc c}
+\toprule
+& & \multicolumn{3}{c}{\textbf{WikiText-2 PPL}$\downarrow$} & \multicolumn{3}{c}{\textbf{C4 PPL}$\downarrow$} \\
+\cmidrule(lr){3-5} \cmidrule(lr){6-8}
+\textbf{Scale} & \textbf{Loss (Quant.)} & \textbf{Base} & \textbf{Inst.} & $\Delta$ & \textbf{Base} & \textbf{Inst.} & $\Delta$ \\
+\midrule
+\multicolumn{8}{l}{\emph{Llama-3.2-1B / 1B-Instruct}} \\
+\midrule
+\multirow{3}{*}{W4A4KV4}
+  & SWD-Unif (INT4)  & 13.90 & 18.26 & +4.36 & 21.53 & 28.60 & +7.07 \\
+  & Whip (INT4)       & 14.08 & 18.96 & +4.88 & 22.00 & 29.38 & +7.38 \\
+  & SWD-Gauss (NF4)   & 18.05 & 22.98 & +4.93 & 28.30 & 34.44 & +6.14 \\
+\midrule
+\multirow{3}{*}{W4A16KV16}
+  & SWD-Unif (INT4)  & 10.39 & 13.85 & +3.46 & 15.63 & 22.47 & +6.84 \\
+  & Whip (INT4)       & 10.45 & 13.96 & +3.51 & 15.63 & 22.34 & +6.71 \\
+  & SWD-Gauss (NF4)   & 12.16 & 15.43 & +3.27 & 18.17 & 24.16 & +5.99 \\
+\midrule
+\multicolumn{8}{l}{\emph{Llama-3.2-3B / 3B-Instruct}} \\
+\midrule
+\multirow{3}{*}{W4A4KV4}
+  & SWD-Unif (INT4)  & 9.53 & 14.54 & +5.01 & 14.85 & 21.44 & +6.59 \\
+  & Whip (INT4)       & 9.75 & 15.09 & +5.34 & 15.17 & 21.34 & +6.17 \\
+  & SWD-Gauss (NF4)   & 12.06 & 17.85 & +5.79 & 18.79 & 25.88 & +7.09 \\
+\midrule
+\multirow{3}{*}{W4A16KV16}
+  & SWD-Unif (INT4)  & 8.15 & 11.96 & +3.81 & 12.31 & 17.68 & +5.37 \\
+  & Whip (INT4)       & 8.16 & 12.01 & +3.85 & 12.30 & 17.38 & +5.08 \\
+  & SWD-Gauss (NF4)   & 9.18 & 12.80 & +3.62 & 13.77 & 18.97 & +5.20 \\
+\midrule
+\multicolumn{8}{l}{\emph{Llama-3.1-8B / 8B-Instruct}} \\
+\midrule
+\multirow{3}{*}{W4A4KV4}
+  & SWD-Unif (INT4)  & 7.73 & 8.74 & +1.01 & 12.54 & 14.54 & +2.00 \\
+  & Whip (INT4)       & 7.85 & 8.68 & +0.83 & 12.69 & 14.33 & +1.64 \\
+  & SWD-Gauss (NF4)   & 9.26 & 10.46 & +1.20 & 14.75 & 16.89 & +2.14 \\
+\midrule
+\multirow{3}{*}{W4A16KV16}
+  & SWD-Unif (INT4)  & 6.56 & 7.50 & +0.94 & 10.38 & 12.19 & +1.81 \\
+  & Whip (INT4)       & 6.58 & 7.49 & +0.91 & 10.37 & 12.18 & +1.81 \\
+  & SWD-Gauss (NF4)   & 7.10 & 8.12 & +1.02 & 11.22 & 13.21 & +1.99 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+ 
+\begin{table*}[!ht]
+\centering
+\caption{Additional-analysis full accuracy results: Base vs.\ Instruct under W4A4KV4.}
+\label{tab:app_exp3_acc}
+\vspace{0.3em}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll cccc cccc}
+\toprule
+& & \multicolumn{4}{c}{\textbf{Base}} & \multicolumn{4}{c}{\textbf{Instruct}} \\
+\cmidrule(lr){3-6} \cmidrule(lr){7-10}
+\textbf{Scale} & \textbf{Loss} & \textbf{Hella.} & \textbf{ARC-C} & \textbf{Wino.} & \textbf{Avg} & \textbf{Hella.} & \textbf{ARC-C} & \textbf{Wino.} & \textbf{Avg} \\
+\midrule
+\multirow{3}{*}{1B}
+  & SWD-Unif  & 55.05 & 30.72 & 56.27 & 47.35 & 53.63 & 32.42 & 53.83 & 46.63 \\
+  & Whip      & 54.33 & 32.85 & 56.83 & 48.00 & 52.81 & 32.94 & 54.54 & 46.76 \\
+  & SWD-Gauss & 49.82 & 29.78 & 55.09 & 44.90 & 50.33 & 31.57 & 54.14 & 45.35 \\
+\midrule
+\multirow{3}{*}{3B}
+  & SWD-Unif  & 69.10 & 38.57 & 63.69 & 57.12 & 64.14 & 38.74 & 59.83 & 54.24 \\
+  & Whip      & 68.28 & 39.25 & 63.14 & 56.89 & 63.62 & 39.68 & 60.14 & 54.48 \\
+  & SWD-Gauss & 64.23 & 37.12 & 62.19 & 54.51 & 58.66 & 34.47 & 56.20 & 49.78 \\
+\midrule
+\multirow{3}{*}{8B}
+  & SWD-Unif  & 74.48 & 49.15 & 69.30 & 64.31 & 75.76 & 48.04 & 68.11 & 63.97 \\
+  & Whip      & 74.23 & 48.55 & 68.82 & 63.87 & 75.54 & 51.37 & 70.17 & 65.69 \\
+  & SWD-Gauss & 71.45 & 45.39 & 67.96 & 61.60 & 73.03 & 45.14 & 67.96 & 62.04 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\end{document}

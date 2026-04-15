@@ -4,10 +4,13 @@
 #
 # Runs every tier × method that the paper reports, in order:
 #
-#   1. FP16 baseline             (no quantization, ceiling PPL)
-#   2. NF4-naive  @ W4A16KV16    (bitsandbytes only — no DartQuant rotations)
-#   3. Comparison @ W4A16KV16    (whip / swd_unif / swd_gauss + full rotations)
-#   4. Comparison @ W4A4KV4      (whip / swd_unif / swd_gauss + full rotations)
+#   1. NF4-naive  @ W4A16KV16    (bitsandbytes only — no DartQuant rotations)
+#   2. Comparison @ W4A16KV16    (whip / swd_unif / swd_gauss + full rotations)
+#   3. Comparison @ W4A4KV4      (whip / swd_unif / swd_gauss + full rotations)
+#
+# The unquantized FP16 ceiling is NOT re-run here — it has already been
+# measured and is independent of any quantization tier. Re-add it with
+# `--group baseline` if needed.
 #
 # Note: bitsandbytes NF4 is weight-only by design (QLoRA convention), so the
 # NF4-naive baseline only exists at W4A16KV16. There is no W4A4KV4 NF4-naive.
@@ -53,58 +56,48 @@ echo "============================================================"
 echo "  Project root : ${PROJECT_ROOT}"
 echo "  Runner       : ${RUNNER}"
 echo "  Output root  : ${OUTPUT_ROOT}"
-echo "  Tiers        : 1) FP16  2) NF4-naive(W4A16KV16)"
-echo "                 3) Comparison@W4A16KV16  4) Comparison@W4A4KV4"
+echo "  Tiers        : 1) NF4-naive(W4A16KV16)"
+echo "                 2) Comparison@W4A16KV16  3) Comparison@W4A4KV4"
+echo "  (FP16 ceiling not re-run — already measured separately.)"
 echo "============================================================"
 
 cd "${PROJECT_ROOT}"
 
 # ---------------------------------------------------------------------------
-# Tier 1: FP16 baseline (unquantized ceiling)
+# Tier 1: NF4-naive baseline (bitsandbytes only, no DartQuant rotations)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[1/4] FP16 baseline (no quantization) ..."
-python3 "${RUNNER}" \
-    --group       baseline \
-    --output_root "${OUTPUT_ROOT}/01_fp16_baseline" \
-    "$@"
-
-# ---------------------------------------------------------------------------
-# Tier 2: NF4-naive baseline (bitsandbytes only, no DartQuant rotations)
-# ---------------------------------------------------------------------------
-echo ""
-echo "[2/4] NF4-naive baseline @ W4A16KV16 (no rotations) ..."
+echo "[1/3] NF4-naive baseline @ W4A16KV16 (no rotations) ..."
 python3 "${RUNNER}" \
     --group       nf4_naive \
-    --output_root "${OUTPUT_ROOT}/02_nf4_naive_W4A16KV16" \
+    --output_root "${OUTPUT_ROOT}/01_nf4_naive_W4A16KV16" \
     "$@"
 
 # ---------------------------------------------------------------------------
-# Tier 3: Weight-only quantization comparison (W4A16KV16)
+# Tier 2: Weight-only quantization comparison (W4A16KV16)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/4] Comparison @ W4A16KV16 (whip / swd_unif / swd_gauss + rotations) ..."
+echo "[2/3] Comparison @ W4A16KV16 (whip / swd_unif / swd_gauss + rotations) ..."
 python3 "${RUNNER}" \
     --group       comparison \
     --w4-only \
-    --output_root "${OUTPUT_ROOT}/03_comparison_W4A16KV16" \
+    --output_root "${OUTPUT_ROOT}/02_comparison_W4A16KV16" \
     "$@"
 
 # ---------------------------------------------------------------------------
-# Tier 4: Full quantization comparison (W4A4KV4)
+# Tier 3: Full quantization comparison (W4A4KV4)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/4] Comparison @ W4A4KV4 (whip / swd_unif / swd_gauss + rotations) ..."
+echo "[3/3] Comparison @ W4A4KV4 (whip / swd_unif / swd_gauss + rotations) ..."
 python3 "${RUNNER}" \
     --group       comparison \
-    --output_root "${OUTPUT_ROOT}/04_comparison_W4A4KV4" \
+    --output_root "${OUTPUT_ROOT}/03_comparison_W4A4KV4" \
     "$@"
 
 echo ""
 echo "============================================================"
 echo "  Full sweep complete. Results under:"
-echo "    ${OUTPUT_ROOT}/01_fp16_baseline/"
-echo "    ${OUTPUT_ROOT}/02_nf4_naive_W4A16KV16/"
-echo "    ${OUTPUT_ROOT}/03_comparison_W4A16KV16/"
-echo "    ${OUTPUT_ROOT}/04_comparison_W4A4KV4/"
+echo "    ${OUTPUT_ROOT}/01_nf4_naive_W4A16KV16/"
+echo "    ${OUTPUT_ROOT}/02_comparison_W4A16KV16/"
+echo "    ${OUTPUT_ROOT}/03_comparison_W4A4KV4/"
 echo "============================================================"

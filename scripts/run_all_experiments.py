@@ -286,33 +286,43 @@ def build_baseline_experiments(
 def build_nf4_naive_experiments(
     models: list[str],
     eval_datasets: list[str],
+    tiers: list[str] | tuple[str, ...] = ("W4A16KV16", "W4A4KV4"),
 ) -> list[dict]:
     """Pure NF4 (bitsandbytes) baseline with NO DartQuant rotations.
 
     Isolates the contribution of the orthogonal R1/R2/R3/R4 rotations by
-    quantizing the model with bitsandbytes NF4 only — the standard QLoRA-style
-    setup. Comparing this against `swd_gauss_nf4` (NF4 + full rotations)
-    quantifies how much DartQuant's rotation training actually helps NF4.
+    quantizing the model with bitsandbytes NF4 — the standard QLoRA-style
+    setup — combined with DartQuant's own activation / KV-cache wrappers
+    but without rotation training. Comparing this against `swd_gauss_nf4`
+    (NF4 + full rotations) quantifies how much the rotation training helps.
 
-    NF4 is weight-only (W4A16KV16); bitsandbytes does not quantize activations
-    or KV-cache.
+    Two tiers are supported:
+      * W4A16KV16 — weight-only (true QLoRA baseline).
+      * W4A4KV4   — NF4 weights + INT4 activations/KV with no rotations.
+                     Exposes how badly activation quant collapses without R1-R4.
     """
+    tier_bits = {
+        "W4A16KV16": {"a_bits": 16, "k_bits": 16, "v_bits": 16},
+        "W4A4KV4":   {"a_bits": 4,  "k_bits": 4,  "v_bits": 4},
+    }
     experiments = []
     for model in models:
-        exp = {
-            "name": f"nf4_naive__{_model_short(model)}__W4A16KV16",
-            "group": "nf4_naive",
-            "model": model,
-            "loss": "swd_gauss",        # placeholder; rotations are disabled
-            "quantizer_type": "nf4",
-            "eval_datasets": eval_datasets,
-            "w_bits": 4,
-            "a_bits": 16,
-            "k_bits": 16,
-            "v_bits": 16,
-            "nf4_naive": True,           # flag for build_command
-        }
-        experiments.append(exp)
+        for tier in tiers:
+            if tier not in tier_bits:
+                raise ValueError(f"Unknown nf4_naive tier: {tier}")
+            bits = tier_bits[tier]
+            exp = {
+                "name": f"nf4_naive__{_model_short(model)}__{tier}",
+                "group": "nf4_naive",
+                "model": model,
+                "loss": "swd_gauss",        # placeholder; rotations are disabled
+                "quantizer_type": "nf4",
+                "eval_datasets": eval_datasets,
+                "w_bits": 4,
+                **bits,
+                "nf4_naive": True,           # flag for build_command
+            }
+            experiments.append(exp)
     return experiments
 
 
@@ -356,9 +366,13 @@ def build_command(exp: dict, output_root: str, extra_args: list[str],
         ])
     elif exp.get("nf4_naive"):
         # Pure NF4 (bitsandbytes) with no DartQuant rotations.
-        # W4A16KV16 because bitsandbytes NF4 is weight-only.
+        # W4A16KV16: weight-only (true QLoRA-style).
+        # W4A4KV4:   NF4 weights + INT4 activation/KV wrappers, no rotations.
         cmd.extend([
-            "--w_bits", "4", "--a_bits", "16", "--k_bits", "16", "--v_bits", "16",
+            "--w_bits", str(exp.get("w_bits", 4)),
+            "--a_bits", str(exp.get("a_bits", 16)),
+            "--k_bits", str(exp.get("k_bits", 16)),
+            "--v_bits", str(exp.get("v_bits", 16)),
             "--no_r1",
             "--use_r2", "none",
             "--no_r3", "--no_r4",
@@ -794,6 +808,12 @@ def parse_args():
         help="Skip the pure NF4 / bitsandbytes baseline (no rotations).",
     )
     parser.add_argument(
+        "--nf4-tiers", dest="nf4_tiers", type=str, nargs="+",
+        choices=["W4A16KV16", "W4A4KV4"],
+        default=["W4A16KV16", "W4A4KV4"],
+        help="Which NF4-naive tier(s) to run. Default: both tiers.",
+    )
+    parser.add_argument(
         "--only", dest="only_losses", type=str, nargs="+", default=None,
         metavar="LOSS",
         help="Run only the specified loss(es) in the comparison group. "
@@ -933,7 +953,8 @@ def main():
     elif args.group in ("all", "baseline") and args.no_baseline:
         log.info("Skipping baseline experiments (--no-baseline set).")
     if args.group in ("all", "nf4_naive") and not args.no_nf4_naive:
-        experiments.extend(build_nf4_naive_experiments(models, eval_datasets))
+        experiments.extend(build_nf4_naive_experiments(
+            models, eval_datasets, tiers=args.nf4_tiers))
     elif args.group in ("all", "nf4_naive") and args.no_nf4_naive:
         log.info("Skipping NF4-naive experiments (--no-nf4-naive set).")
     if args.group in ("all", "comparison"):
@@ -1016,7 +1037,7 @@ def main():
     if resumed:
         completed_exps = detect_completed_experiments(output_root,
             build_baseline_experiments(models, eval_datasets) +
-            build_nf4_naive_experiments(models, eval_datasets) +
+            build_nf4_naive_experiments(models, eval_datasets, tiers=args.nf4_tiers) +
             build_comparison_experiments(models, eval_datasets,
                 only_losses=args.only_losses, w4_only=args.w4_only))
         # Re-build the full experiment list for the summary
@@ -1024,7 +1045,8 @@ def main():
         if args.group in ("all", "baseline") and not args.no_baseline:
             all_experiments_full.extend(build_baseline_experiments(models, eval_datasets))
         if args.group in ("all", "nf4_naive") and not args.no_nf4_naive:
-            all_experiments_full.extend(build_nf4_naive_experiments(models, eval_datasets))
+            all_experiments_full.extend(build_nf4_naive_experiments(
+                models, eval_datasets, tiers=args.nf4_tiers))
         if args.group in ("all", "comparison"):
             all_experiments_full.extend(build_comparison_experiments(
                 models, eval_datasets,

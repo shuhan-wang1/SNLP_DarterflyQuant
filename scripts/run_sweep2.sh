@@ -2,10 +2,9 @@
 # =============================================================================
 # run_sweep2.sh  —  Sweep half #2: large Llama-3.1 family (8B)
 #
-# Runs the full 4-tier experimental matrix (FP16 baseline + NF4-naive +
-# comparison @ W4A16KV16 + comparison @ W4A4KV4) on the 8B models. These
-# are the most expensive runs (~8× compute of 1B), so this server should
-# be the one with the most VRAM / longest wall-time budget.
+# Runs the NF4-naive baseline @ W4A4KV4 only (by default) on the 8B models.
+# Comparison and FP16 tiers are skipped — those are already done.
+# Override NF4_TIERS to run additional tiers if ever needed.
 #
 # Default model set (override with MODELS_SWEEP2 env var):
 #   meta-llama/Llama-3.1-8B

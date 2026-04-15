@@ -1,48 +1,49 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_full_sweep.sh  —  Complete experimental matrix for the report
+# run_full_sweep.sh  —  NF4-naive baseline sweep (no comparison tiers)
 #
-# Runs every tier × method that the paper reports, in order:
+# Runs ONLY the pure NF4 / bitsandbytes baseline (no DartQuant rotations).
+# The comparison group (whip / swd_unif / swd_gauss + rotations) and the
+# FP16 ceiling are NOT re-run here — they've already been measured.
 #
-#   1. NF4-naive  @ W4A16KV16    (bitsandbytes only — no DartQuant rotations)
-#   2. Comparison @ W4A16KV16    (whip / swd_unif / swd_gauss + full rotations)
-#   3. Comparison @ W4A4KV4      (whip / swd_unif / swd_gauss + full rotations)
+# Default tier: W4A4KV4 only. The W4A16KV16 tier is already complete for
+# the cached models, so by default we only run the remaining W4A4KV4 cell.
 #
-# The unquantized FP16 ceiling is NOT re-run here — it has already been
-# measured and is independent of any quantization tier. Re-add it with
-# `--group baseline` if needed.
-#
-# Note: bitsandbytes NF4 is weight-only by design (QLoRA convention), so the
-# NF4-naive baseline only exists at W4A16KV16. There is no W4A4KV4 NF4-naive.
-#
-# Each tier writes to its own subdirectory under OUTPUT_ROOT, so a failure
-# in one tier does not invalidate the others, and --resume works per tier.
+# Override the tier selection:
+#   NF4_TIERS="W4A16KV16 W4A4KV4"  bash scripts/run_full_sweep.sh   # both
+#   NF4_TIERS="W4A16KV16"           bash scripts/run_full_sweep.sh   # only wt-only
 #
 # Usage:
-#   bash scripts/run_full_sweep.sh                          # auto-detect models
+#   bash scripts/run_full_sweep.sh                       # all cached models, W4A4KV4
 #   bash scripts/run_full_sweep.sh --models meta-llama/Llama-3.2-1B
 #   bash scripts/run_full_sweep.sh --dry-run
+#   bash scripts/run_full_sweep.sh --resume
 #
-# Extra flags are forwarded to every run_all_experiments.py invocation.
+# Extra flags forwarded to run_all_experiments.py — safe extras:
+#   --models, --resume, --dry-run, --lm_eval, --nsamples, --seqlen
+# Avoid: --group, --nf4-tiers, --output_root (already set here).
 # =============================================================================
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Resolve paths from this script's location so the script works regardless
-# of the caller's CWD.
-# ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUNNER="${SCRIPT_DIR}/run_all_experiments.py"
 
 # ---------------------------------------------------------------------------
-# Output directory (override by exporting OUTPUT_ROOT before invoking)
+# Output directory (override by exporting OUTPUT_ROOT)
 # ---------------------------------------------------------------------------
-OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/experiment_results_full_sweep}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/experiment_results_nf4_naive}"
 
 # ---------------------------------------------------------------------------
-# Dependency check — bitsandbytes is required for NF4
+# Tier selection (override by exporting NF4_TIERS)
+# Default: W4A4KV4 only (W4A16KV16 is already complete)
+# ---------------------------------------------------------------------------
+NF4_TIERS="${NF4_TIERS:-W4A4KV4}"
+read -ra NF4_TIERS_ARR <<< "${NF4_TIERS}"
+
+# ---------------------------------------------------------------------------
+# Dependency check
 # ---------------------------------------------------------------------------
 if ! python3 -c "import bitsandbytes" >/dev/null 2>&1; then
     echo "[ERROR] bitsandbytes is not installed."
@@ -51,53 +52,24 @@ if ! python3 -c "import bitsandbytes" >/dev/null 2>&1; then
 fi
 
 echo "============================================================"
-echo "  DartQuant v2 — FULL experimental sweep"
+echo "  DartQuant v2 — NF4-naive sweep (no comparison)"
 echo "============================================================"
 echo "  Project root : ${PROJECT_ROOT}"
 echo "  Runner       : ${RUNNER}"
 echo "  Output root  : ${OUTPUT_ROOT}"
-echo "  Tiers        : 1) NF4-naive(W4A16KV16)"
-echo "                 2) Comparison@W4A16KV16  3) Comparison@W4A4KV4"
-echo "  (FP16 ceiling not re-run — already measured separately.)"
+echo "  NF4 tiers    : ${NF4_TIERS_ARR[*]}"
+echo "  Comparison   : SKIPPED by default (already measured)"
 echo "============================================================"
 
 cd "${PROJECT_ROOT}"
 
-# ---------------------------------------------------------------------------
-# Tier 1: NF4-naive baseline (bitsandbytes only, no DartQuant rotations)
-# ---------------------------------------------------------------------------
-echo ""
-echo "[1/3] NF4-naive baseline @ W4A16KV16 (no rotations) ..."
 python3 "${RUNNER}" \
     --group       nf4_naive \
-    --output_root "${OUTPUT_ROOT}/01_nf4_naive_W4A16KV16" \
-    "$@"
-
-# ---------------------------------------------------------------------------
-# Tier 2: Weight-only quantization comparison (W4A16KV16)
-# ---------------------------------------------------------------------------
-echo ""
-echo "[2/3] Comparison @ W4A16KV16 (whip / swd_unif / swd_gauss + rotations) ..."
-python3 "${RUNNER}" \
-    --group       comparison \
-    --w4-only \
-    --output_root "${OUTPUT_ROOT}/02_comparison_W4A16KV16" \
-    "$@"
-
-# ---------------------------------------------------------------------------
-# Tier 3: Full quantization comparison (W4A4KV4)
-# ---------------------------------------------------------------------------
-echo ""
-echo "[3/3] Comparison @ W4A4KV4 (whip / swd_unif / swd_gauss + rotations) ..."
-python3 "${RUNNER}" \
-    --group       comparison \
-    --output_root "${OUTPUT_ROOT}/03_comparison_W4A4KV4" \
+    --nf4-tiers   "${NF4_TIERS_ARR[@]}" \
+    --output_root "${OUTPUT_ROOT}" \
     "$@"
 
 echo ""
 echo "============================================================"
-echo "  Full sweep complete. Results under:"
-echo "    ${OUTPUT_ROOT}/01_nf4_naive_W4A16KV16/"
-echo "    ${OUTPUT_ROOT}/02_comparison_W4A16KV16/"
-echo "    ${OUTPUT_ROOT}/03_comparison_W4A4KV4/"
+echo "  Sweep complete. Results under: ${OUTPUT_ROOT}"
 echo "============================================================"

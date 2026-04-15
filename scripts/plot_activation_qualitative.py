@@ -141,24 +141,41 @@ def _pick_layer(num_layers: int, fraction: float) -> int:
 # Figure 1 (main body): per-channel absmax bars at 2 representative layers
 # ---------------------------------------------------------------------------
 def plot_absmax_bars(bundles: dict[str, dict], out_path: Path) -> None:
+    """Main-body motivating figure: sorted per-channel absmax.
+
+    Why this choice:
+      * Plotting the sorted descending per-channel absmax makes the "one
+        huge outlier column" pathology of raw Llama activations visually
+        unmissable (it's the leftmost tall bar), while rotated variants
+        flatten out.
+      * The y-axis on each row is SHARED and spans [0, row_max * 1.05]
+        where row_max is the max absmax over ALL conditions at that layer
+        — NOT a percentile. A percentile throws away exactly the
+        outliers we want to display.
+      * Each row gets its own scale because outlier magnitude differs
+        dramatically between mid- and late-layer (late layers are worse).
+    """
     num_layers = bundles["raw"]["num_layers"]
     layer_mid = _pick_layer(num_layers, 0.5)
     layer_late = _pick_layer(num_layers, 0.95)
-    layers_to_plot = [("Mid-network layer "
-                       + str(layer_mid), layer_mid),
+    layers_to_plot = [("Mid layer " + str(layer_mid), layer_mid),
                       ("Late layer " + str(layer_late), layer_late)]
 
-    fig, axes = plt.subplots(2, 4, figsize=(7.2, 3.3), sharex="col",
-                             sharey="row",
-                             gridspec_kw={"wspace": 0.08, "hspace": 0.35})
+    fig, axes = plt.subplots(
+        2, 4, figsize=(7.2, 3.4), sharex="col", sharey="row",
+        gridspec_kw={"wspace": 0.06, "hspace": 0.32,
+                     "left": 0.09, "right": 0.995,
+                     "bottom": 0.11, "top": 0.91},
+    )
 
     for row, (row_title, li) in enumerate(layers_to_plot):
         row_axes = axes[row]
-        # Global y-limit (shared across the 4 panels in this row) driven by the
-        # raw baseline, so the three rotations are directly comparable to it.
-        raw_absmax = np.max(np.abs(bundles["raw"]["acts"][li]), axis=0)
-        y_cap = float(np.percentile(raw_absmax, 99.5)) * 1.05
-        y_cap = max(y_cap, 1e-3)
+        # Row-wise global y cap = max absmax across all 4 configs at this
+        # layer. Uses the TRUE max so raw outliers stay in frame.
+        row_peak = max(
+            float(np.max(np.abs(bundles[c]["acts"][li]))) for c in CONFIG_ORDER
+        )
+        y_cap = row_peak * 1.05 if row_peak > 0 else 1.0
 
         for col, cfg in enumerate(CONFIG_ORDER):
             ax = row_axes[col]
@@ -181,18 +198,21 @@ def plot_absmax_bars(bundles: dict[str, dict], out_path: Path) -> None:
                 ax.set_title(CONFIG_LABEL[cfg], pad=4)
             if col == 0:
                 ax.set_ylabel(row_title + "\n$\\max_t |x_{t,c}|$", fontsize=8)
-            # Numeric callout: maximum absmax for that condition, to make the
-            # "outlier smashing" quantitative even without reading the body.
-            peak = absmax.max()
+            # Numeric callout: peak absmax for this condition — makes the
+            # comparison quantitative without forcing the reader to eyeball
+            # the bars against the tick marks.
+            peak = float(absmax.max())
             ax.text(
                 0.97, 0.92,
                 f"peak={peak:.1f}",
                 transform=ax.transAxes, ha="right", va="top",
-                fontsize=7, color="#404040",
+                fontsize=7, color="#222222",
             )
 
-    fig.text(0.5, -0.02, "Channel (sorted by $|x|$, descending)",
-             ha="center", va="top", fontsize=9)
+    # Single shared x-axis caption at the bottom centre, so we don't repeat
+    # the same label under every column.
+    fig.supxlabel("Channel index (sorted by per-channel $\\max_t |x_{t,c}|$, descending)",
+                  fontsize=8.5, y=0.01)
     fig.savefig(out_path)
     plt.close(fig)
 
@@ -201,46 +221,56 @@ def plot_absmax_bars(bundles: dict[str, dict], out_path: Path) -> None:
 # Figure 2 (appendix): stacked histograms at one fixed layer
 # ---------------------------------------------------------------------------
 def plot_histograms(bundles: dict[str, dict], out_path: Path) -> None:
+    """Log-scale activation histogram at one fixed layer.
+
+    X-axis is SHARED across all four panels — we set_xlabel only once via
+    fig.supxlabel to avoid repeating the same caption under every column
+    (which overlapped in the original version).
+    """
     num_layers = bundles["raw"]["num_layers"]
     layer = _pick_layer(num_layers, 0.75)
 
-    all_vals = np.concatenate(
-        [bundles[c]["acts"][layer].ravel() for c in CONFIG_ORDER]
+    # Bin edges: span the widest condition so raw's tails are not clipped.
+    span = max(
+        float(np.percentile(np.abs(bundles[c]["acts"][layer].ravel()), 99.95))
+        for c in CONFIG_ORDER
     )
-    # Symmetric range from the raw baseline so rotated conditions are
-    # directly comparable.
-    raw_vals = bundles["raw"]["acts"][layer].ravel()
-    span = float(np.percentile(np.abs(raw_vals), 99.9))
+    span = max(span, 1e-3)
     x_edges = np.linspace(-span * 1.05, span * 1.05, 161)
 
-    fig, axes = plt.subplots(1, 4, figsize=(7.2, 2.0), sharex=True,
-                             sharey=True,
-                             gridspec_kw={"wspace": 0.10})
+    fig, axes = plt.subplots(
+        1, 4, figsize=(7.2, 2.2), sharex=True, sharey=True,
+        gridspec_kw={"wspace": 0.10,
+                     "left": 0.08, "right": 0.995,
+                     "bottom": 0.22, "top": 0.86},
+    )
     for ax, cfg in zip(axes, CONFIG_ORDER):
         v = bundles[cfg]["acts"][layer].ravel()
         ax.hist(
-            v, bins=x_edges, color=CONFIG_COLOR[cfg], alpha=0.85,
+            v, bins=x_edges, color=CONFIG_COLOR[cfg], alpha=0.88,
             edgecolor="none",
         )
         ax.set_yscale("log")
         ax.set_xlim(x_edges[0], x_edges[-1])
         ax.set_title(CONFIG_LABEL[cfg], pad=4)
         ax.grid(axis="y", linestyle=":", alpha=0.35)
-        # Annotate kurtosis — a single scalar that separates heavy-tailed from
-        # Gaussian-like distributions and therefore distinguishes the three
-        # losses directly.
-        m = v.mean()
-        s = v.std() + 1e-12
+        # Kurtosis annotation: one scalar that separates heavy-tailed
+        # (Whip, raw) from Gaussian-like (swd_gauss) and from flat-uniform
+        # (swd_unif) distributions, so the reader has a quantitative anchor
+        # in addition to the visual.
+        m = float(v.mean())
+        s = float(v.std()) + 1e-12
         kurt = float(((v - m) ** 4).mean() / (s ** 4) - 3.0)
         ax.text(
-            0.03, 0.92,
-            f"$\\kappa={kurt:.1f}$",
+            0.03, 0.93,
+            f"$\\kappa_4={kurt:.1f}$",
             transform=ax.transAxes, ha="left", va="top",
-            fontsize=7, color="#404040",
+            fontsize=7, color="#222222",
         )
-    axes[0].set_ylabel("Count (log)", fontsize=8)
-    for ax in axes:
-        ax.set_xlabel("Activation value at layer " + str(layer))
+    axes[0].set_ylabel("Count (log scale)", fontsize=8)
+    # Single shared caption — replaces the 4 overlapping xlabels.
+    fig.supxlabel(f"Activation value at layer {layer}",
+                  fontsize=8.5, y=0.03)
     fig.savefig(out_path)
     plt.close(fig)
 
@@ -249,16 +279,27 @@ def plot_histograms(bundles: dict[str, dict], out_path: Path) -> None:
 # Figure 3 (appendix): absmax / p99.9 curves across all layers
 # ---------------------------------------------------------------------------
 def plot_absmax_curves(bundles: dict[str, dict], out_path: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.4),
-                             gridspec_kw={"wspace": 0.22})
-    titles = [r"Per-layer peak: $\max_{t,c} |x|$",
-              r"Per-layer tail: $P_{99.9}(|x|)$"]
+    """Per-layer peak and tail magnitudes across every transformer layer.
+
+    Two panels share the x-axis semantics (layer index) but plot different
+    aggregators. Legend lives OUTSIDE the axes at the top so the curves
+    themselves are never occluded by the legend box.
+    """
+    fig, axes = plt.subplots(
+        1, 2, figsize=(7.2, 2.6), sharex=True,
+        gridspec_kw={"wspace": 0.22,
+                     "left": 0.09, "right": 0.995,
+                     "bottom": 0.20, "top": 0.80},
+    )
+    panel_titles = [r"Per-layer peak $\max_{t,c} |x|$",
+                    r"Per-layer tail $P_{99.9}(|x|)$"]
     agg_fns = [
         lambda x: float(np.max(np.abs(x))),
         lambda x: float(np.percentile(np.abs(x).ravel(), 99.9)),
     ]
 
-    for ax, title, fn in zip(axes, titles, agg_fns):
+    handles = None
+    for ax, title, fn in zip(axes, panel_titles, agg_fns):
         for cfg in CONFIG_ORDER:
             b = bundles[cfg]
             ys = [fn(b["acts"][i]) for i in b["layers"]]
@@ -266,20 +307,27 @@ def plot_absmax_curves(bundles: dict[str, dict], out_path: Path) -> None:
                 b["layers"], ys,
                 color=CONFIG_COLOR[cfg],
                 label=CONFIG_LABEL[cfg],
-                marker="o", markersize=2.5,
-                linewidth=1.1,
+                marker="o", markersize=2.8,
+                linewidth=1.2,
                 alpha=0.95,
             )
-        ax.set_title(title, pad=4)
-        ax.set_xlabel("Transformer layer index")
+        ax.set_title(title, pad=4, fontsize=8.5)
         ax.grid(True, linestyle=":", alpha=0.35)
         ax.set_yscale("log")
+        if handles is None:
+            handles, _ = ax.get_legend_handles_labels()
 
-    axes[0].set_ylabel(r"Magnitude")
-    axes[0].legend(
-        loc="upper left", bbox_to_anchor=(0.0, 1.02),
-        ncol=2, columnspacing=1.0, handlelength=1.6, borderaxespad=0.0,
-        fontsize=7,
+    axes[0].set_ylabel(r"Activation magnitude")
+    fig.supxlabel("Transformer layer index", fontsize=8.5, y=0.03)
+
+    # One shared legend centred above both panels. bbox_to_anchor uses
+    # figure coordinates so the legend never clips an axis.
+    fig.legend(
+        handles=handles,
+        labels=[CONFIG_LABEL[c] for c in CONFIG_ORDER],
+        loc="upper center", bbox_to_anchor=(0.5, 0.99),
+        ncol=4, columnspacing=1.4, handlelength=1.8,
+        fontsize=7.5, frameon=False,
     )
     fig.savefig(out_path)
     plt.close(fig)
@@ -315,9 +363,13 @@ def plot_variance_heatmap(bundles: dict[str, dict], out_path: Path) -> None:
     vmin = max(float(np.percentile(raw_mat[raw_mat > 0], 0.5))
                if np.any(raw_mat > 0) else 1e-6, 1e-8)
 
-    fig, axes = plt.subplots(1, 4, figsize=(7.2, 2.6), sharey=True,
-                             gridspec_kw={"wspace": 0.08,
-                                          "width_ratios": [1, 1, 1, 1.12]})
+    fig, axes = plt.subplots(
+        1, 4, figsize=(7.2, 2.7), sharey=True,
+        gridspec_kw={"wspace": 0.08,
+                     "width_ratios": [1, 1, 1, 1],
+                     "left": 0.07, "right": 0.885,
+                     "bottom": 0.20, "top": 0.88},
+    )
     im = None
     for ax, cfg in zip(axes, CONFIG_ORDER):
         m = mats[cfg]
@@ -330,12 +382,17 @@ def plot_variance_heatmap(bundles: dict[str, dict], out_path: Path) -> None:
             interpolation="nearest",
         )
         ax.set_title(CONFIG_LABEL[cfg], pad=4)
-        ax.set_xlabel("Channel rank (by variance)")
         ax.set_xticks([0, ffn // 2, ffn - 1])
     axes[0].set_ylabel("Transformer layer")
 
-    # Single right-hand colorbar shared by all panels
-    cbar = fig.colorbar(im, ax=axes[-1], fraction=0.05, pad=0.02)
+    # Single shared x-axis caption (avoids 4 overlapping xlabels).
+    fig.supxlabel("Channel rank (sorted by per-channel variance)",
+                  fontsize=8.5, y=0.03)
+
+    # Single right-hand colorbar outside the last panel, using explicit
+    # axes coordinates so the bar never collides with the neighbouring plot.
+    cax = fig.add_axes([0.90, 0.20, 0.015, 0.68])
+    cbar = fig.colorbar(im, cax=cax)
     cbar.set_label(r"Per-channel variance $\mathrm{Var}(x_{\cdot, c})$",
                    fontsize=8)
     cbar.ax.tick_params(labelsize=7)

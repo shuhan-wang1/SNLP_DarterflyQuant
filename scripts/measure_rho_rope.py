@@ -433,6 +433,66 @@ def write_outputs(result: dict, out_dir: Path, model_name: str) -> None:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _resolve_hub_cache() -> str:
+    """Mirror UnifiedQuantModel: prefer HF_HUB_CACHE, then HF_HOME, else default."""
+    return os.environ.get(
+        "HF_HUB_CACHE",
+        os.environ.get("HF_HOME", "/root/autodl-tmp/huggingface"),
+    )
+
+
+def load_model_and_tokenizer(model_name: str, dtype: torch.dtype,
+                             hf_token: str | None,
+                             cache_dir: str | None):
+    """Load from local cache only, matching dartquant_v2/unified_model.py."""
+    hub_cache = cache_dir or _resolve_hub_cache()
+    log.info("Using HF cache_dir=%s (local_files_only=True)", hub_cache)
+
+    tok_kwargs = {
+        "use_fast": False,
+        "trust_remote_code": True,
+        "local_files_only": True,
+        "cache_dir": hub_cache,
+    }
+    if hf_token:
+        tok_kwargs["token"] = hf_token
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
+
+    # Skip param init for faster loading (same trick as unified_model.py).
+    orig_k = torch.nn.init.kaiming_uniform_
+    orig_u = torch.nn.init.uniform_
+    orig_n = torch.nn.init.normal_
+    torch.nn.init.kaiming_uniform_ = lambda *a, **k: None
+    torch.nn.init.uniform_ = lambda *a, **k: None
+    torch.nn.init.normal_ = lambda *a, **k: None
+    try:
+        model_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "local_files_only": True,
+            "cache_dir": hub_cache,
+        }
+        if hf_token:
+            model_kwargs["token"] = hf_token
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_name, **model_kwargs,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Model '{model_name}' not found in local cache ({hub_cache}). "
+                f"Set HF_HUB_CACHE or HF_HOME to your cache root. Original: {e}"
+            ) from e
+    finally:
+        torch.nn.init.kaiming_uniform_ = orig_k
+        torch.nn.init.uniform_ = orig_u
+        torch.nn.init.normal_ = orig_n
+
+    log.info("Loaded model from local cache: %s", model_name)
+    return model, tokenizer
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True,
@@ -450,6 +510,10 @@ def main():
                    help="If set, hook only the first N layers (smoke test)")
     p.add_argument("--hf_token", type=str, default=None,
                    help="HF token; falls back to HF_TOKEN env var")
+    p.add_argument("--cache_dir", type=str, default=None,
+                   help="Override HF cache root. Falls back to HF_HUB_CACHE, "
+                        "then HF_HOME, then /root/autodl-tmp/huggingface "
+                        "(matches dartquant_v2/unified_model.py).")
     args = p.parse_args()
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16,
@@ -458,13 +522,8 @@ def main():
     device = torch.device(args.device)
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
-    tok_kwargs = {"token": token} if token else {}
-
-    log.info("Loading tokenizer %s", args.model)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, **tok_kwargs)
-    log.info("Loading model %s in %s", args.model, args.dtype)
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, low_cpu_mem_usage=True, **tok_kwargs,
+    model, tokenizer = load_model_and_tokenizer(
+        args.model, dtype, token, args.cache_dir,
     )
     model.to(device)
     model.eval()

@@ -12,6 +12,10 @@ build/
 # Experiment outputs
 dartquant_v2_output/
 experiment_results/
+experiment_results_*/
+
+# Report writing assets (PDFs, references) — kept local, not pushed
+report_writing/
 
 # Logs
 *.log

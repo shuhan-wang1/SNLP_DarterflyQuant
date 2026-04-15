@@ -53,6 +53,12 @@ NSAMPLES="${NSAMPLES:-32}"
 SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
 CONFIGS="${CONFIGS:-raw whip swd_unif swd_gauss}"
+# HOOK selects which sub-module's INPUT to capture. Must be consistent across
+# all four configs for comparison to be meaningful. Default = up_proj so that
+# the captured tensor lives in the hidden dimension (= R1's rotation space)
+# and the rotation's flattening effect is visible. Use down_proj to see R4's
+# territory instead, not R1's.
+HOOK="${HOOK:-up_proj}"
 
 DRY_RUN=0
 FORCE=0
@@ -85,6 +91,7 @@ echo "  model        : ${MODEL}"
 echo "  output root  : ${MODEL_OUT}"
 echo "  fig dir      : ${FIG_DIR}"
 echo "  configs      : ${CONFIGS}"
+echo "  hook         : ${HOOK}"
 echo "  nsamples     : ${NSAMPLES}"
 echo "  seqlen       : ${SEQLEN}"
 echo "  seed         : ${SEED}"
@@ -110,7 +117,11 @@ for CFG in "${CONFIG_LIST[@]}"; do
     esac
 
     OUT_DIR="${MODEL_OUT}/${CFG}"
-    DONE_MARK="${OUT_DIR}/down_proj_inputs.npz"
+    if [[ "${HOOK}" == "down_proj" ]]; then
+        DONE_MARK="${OUT_DIR}/down_proj_inputs.npz"
+    else
+        DONE_MARK="${OUT_DIR}/${HOOK}_inputs.npz"
+    fi
     mkdir -p "${OUT_DIR}"
 
     echo
@@ -129,6 +140,7 @@ for CFG in "${CONFIG_LIST[@]}"; do
         --model    "${MODEL}"
         --config   "${CFG}"
         --out_dir  "${OUT_DIR}"
+        --hook     "${HOOK}"
         --nsamples "${NSAMPLES}"
         --seqlen   "${SEQLEN}"
         --seed     "${SEED}")
@@ -172,9 +184,14 @@ fi
 # ---------------------------------------------------------------------------
 # Verify every config has a capture file before plotting
 # ---------------------------------------------------------------------------
+if [[ "${HOOK}" == "down_proj" ]]; then
+    EXPECTED="down_proj_inputs.npz"
+else
+    EXPECTED="${HOOK}_inputs.npz"
+fi
 for CFG in raw whip swd_unif swd_gauss; do
-    if [[ ! -f "${MODEL_OUT}/${CFG}/down_proj_inputs.npz" ]]; then
-        echo "  [WARN] missing capture for ${CFG}; skipping plot step" >&2
+    if [[ ! -f "${MODEL_OUT}/${CFG}/${EXPECTED}" ]]; then
+        echo "  [WARN] missing ${EXPECTED} for ${CFG}; skipping plot step" >&2
         exit 0
     fi
 done

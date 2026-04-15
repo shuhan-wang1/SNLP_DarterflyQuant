@@ -103,9 +103,11 @@ def _load_one(path: Path) -> dict:
     data = np.load(path, allow_pickle=True)
     layer_idxs = data["_layer_idxs"].astype(int).tolist()
     acts = {i: data[f"layer_{i:03d}"] for i in layer_idxs}
+    hook = str(data["_hook"]) if "_hook" in data.files else "down_proj"
     return {
         "config": str(data["_config"]),
         "model": str(data["_model"]),
+        "hook": hook,
         "hidden_size": int(data["_hidden_size"]),
         "intermediate_size": int(data["_intermediate_size"]),
         "num_layers": int(data["_num_layers"]),
@@ -114,13 +116,36 @@ def _load_one(path: Path) -> dict:
     }
 
 
+def _find_capture(cfg_dir: Path) -> Path:
+    """Locate the per-config capture file.
+
+    Accepts both the new naming convention (``<hook>_inputs.npz``, e.g.
+    ``up_proj_inputs.npz``) and the legacy ``down_proj_inputs.npz`` that
+    older captures produced.
+    """
+    if not cfg_dir.is_dir():
+        raise FileNotFoundError(f"missing config dir: {cfg_dir}")
+    candidates = sorted(cfg_dir.glob("*_inputs.npz"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"no *_inputs.npz in {cfg_dir} — re-run "
+            f"scripts/capture_qualitative_activations.py"
+        )
+    return candidates[0]
+
+
 def load_all(in_dir: Path) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for cfg in CONFIG_ORDER:
-        p = in_dir / cfg / "down_proj_inputs.npz"
-        if not p.exists():
-            raise FileNotFoundError(f"missing capture file: {p}")
+        p = _find_capture(in_dir / cfg)
         out[cfg] = _load_one(p)
+    # Cross-config sanity: all four captures MUST share the same hook.
+    hooks = {cfg: b["hook"] for cfg, b in out.items()}
+    if len(set(hooks.values())) != 1:
+        raise RuntimeError(
+            f"inconsistent hook across configs: {hooks} — "
+            f"re-capture with one consistent --hook."
+        )
     return out
 
 
@@ -258,8 +283,9 @@ def plot_before_after(bundles: dict[str, dict], out_path: Path,
     axes[-1, 1].set_xlabel("Channel rank (sorted by absmax)",
                             fontsize=8.5)
 
+    hook = bundles["raw"]["hook"]
     fig.suptitle(
-        f"Down-proj input: before vs. after rotation   "
+        f"{hook} input: before vs. after rotation   "
         f"(layer {layer} of {num_layers}, model "
         f"{Path(bundles['raw']['model']).name})",
         fontsize=10, y=0.975,

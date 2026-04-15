@@ -110,9 +110,11 @@ def _load_one(path: Path) -> dict:
     data = np.load(path, allow_pickle=True)
     layer_idxs = data["_layer_idxs"].astype(int).tolist()
     acts = {i: data[f"layer_{i:03d}"] for i in layer_idxs}
+    hook = str(data["_hook"]) if "_hook" in data.files else "down_proj"
     return {
         "config": str(data["_config"]),
         "model": str(data["_model"]),
+        "hook": hook,
         "hidden_size": int(data["_hidden_size"]),
         "intermediate_size": int(data["_intermediate_size"]),
         "num_layers": int(data["_num_layers"]),
@@ -121,13 +123,34 @@ def _load_one(path: Path) -> dict:
     }
 
 
+def _find_capture(cfg_dir: Path) -> Path:
+    """Locate the capture file for a config dir.
+
+    Supports both the new ``<hook>_inputs.npz`` naming and the legacy
+    ``down_proj_inputs.npz`` filename.
+    """
+    if not cfg_dir.is_dir():
+        raise FileNotFoundError(f"missing config dir: {cfg_dir}")
+    candidates = sorted(cfg_dir.glob("*_inputs.npz"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"no *_inputs.npz in {cfg_dir} — re-run "
+            f"scripts/capture_qualitative_activations.py"
+        )
+    return candidates[0]
+
+
 def load_all(in_dir: Path) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for cfg in CONFIG_ORDER:
-        p = in_dir / cfg / "down_proj_inputs.npz"
-        if not p.exists():
-            raise FileNotFoundError(f"missing capture file: {p}")
+        p = _find_capture(in_dir / cfg)
         out[cfg] = _load_one(p)
+    hooks = {cfg: b["hook"] for cfg, b in out.items()}
+    if len(set(hooks.values())) != 1:
+        raise RuntimeError(
+            f"inconsistent hook across configs: {hooks} — "
+            f"re-capture with one consistent --hook."
+        )
     return out
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture down_proj input activations under four rotation conditions.
+"""Capture residual-stream input activations under four rotation conditions.
 
 Produces one .npz per (model, config) whose contents are the raw per-layer
 activation tensors needed to draw the qualitative figures comparing
@@ -15,10 +15,16 @@ loss reshapes the activation distribution, which is already fully visible at
 the output of R1. Skipping the rest keeps the script fast, deterministic, and
 trivially comparable across the three losses.
 
-Hook point choice: the INPUT to every layer's ``down_proj`` (the MLP output
-projection). This is the canonical outlier hotspot in Llama — the same location
-QuaRot/SpinQuant use for their motivating figures — and is shared by INT4 and
-NF4 variants, so all four configs expose the same tensor semantics.
+Hook point choice (--hook): defaults to the INPUT of every layer's ``up_proj``
+(MLP input). This is in the HIDDEN dimension (d_model) and so lives in the
+space R1 rotates — making R1's flattening effect visible.
+
+IMPORTANT: do NOT hook ``down_proj`` if you want to see R1's effect. The input
+to ``down_proj`` is in the FFN/intermediate dimension, where R1 has cancelled
+out mathematically (W_up <- W_up @ R1 on input, W_down <- R1^T @ W_down on
+output), so raw and rotated configs give numerically identical tensors at
+that point. Use ``--hook up_proj`` (default) / ``gate_proj`` / ``q_proj`` /
+``k_proj`` / ``v_proj`` / ``o_proj`` to see a rotated hidden-dim tensor.
 
 Data / model loading mirror dartquant_v2/unified_model.py and
 scripts/measure_rho_rope.py exactly: local-only HF cache via HF_HUB_CACHE /
@@ -252,13 +258,37 @@ def train_and_apply_r1(model, umodel: UnifiedQuantModel, calib: torch.Tensor,
 # ---------------------------------------------------------------------------
 # Down-proj input capture
 # ---------------------------------------------------------------------------
-def capture_down_proj_inputs(model, umodel: UnifiedQuantModel,
+_HOOK_ATTR_MAP = {
+    "up_proj":   "mlp_up_proj_attr",
+    "gate_proj": "mlp_gate_proj_attr",
+    "down_proj": "mlp_down_proj_attr",
+    "q_proj":    "q_proj_attr",
+    "k_proj":    "k_proj_attr",
+    "v_proj":    "v_proj_attr",
+    "o_proj":    "o_proj_attr",
+}
+
+
+def _resolve_hook_attr(umodel: UnifiedQuantModel, hook: str) -> str:
+    field = _HOOK_ATTR_MAP[hook]
+    attr = getattr(umodel.arch, field, None)
+    if attr is None:
+        raise ValueError(
+            f"Architecture {type(umodel.arch).__name__} has no '{field}' "
+            f"(hook='{hook}'). Pick a different --hook."
+        )
+    return attr
+
+
+def capture_submodule_inputs(model, umodel: UnifiedQuantModel,
                              calib: torch.Tensor,
-                             rows_per_layer: int) -> dict[int, torch.Tensor]:
-    """Hook every layer's down_proj INPUT, return {layer_idx: (rows, ffn)}."""
+                             rows_per_layer: int,
+                             hook: str) -> dict[int, torch.Tensor]:
+    """Hook every layer's `hook` INPUT, return {layer_idx: (rows, dim)}."""
     layers_prefix = umodel.arch.layers_path
+    hook_attr = _resolve_hook_attr(umodel, hook)
     target_names = [
-        f"{layers_prefix}.{i}.{umodel.arch.mlp_down_proj_attr}"
+        f"{layers_prefix}.{i}.{hook_attr}"
         for i in range(umodel.num_layers)
     ]
     acts = collect_activations(
@@ -298,6 +328,14 @@ def main() -> None:
     p.add_argument("--config", required=True, choices=CONFIG_CHOICES,
                    help="Which rotation condition to capture")
     p.add_argument("--out_dir", required=True, type=Path)
+    p.add_argument("--hook", default="up_proj",
+                   choices=["up_proj", "gate_proj", "q_proj", "k_proj",
+                            "v_proj", "o_proj", "down_proj"],
+                   help="Which sub-module's INPUT to capture (default: up_proj). "
+                        "up_proj / gate_proj / q_proj / k_proj / v_proj are in "
+                        "the hidden dim and expose R1's rotation. "
+                        "down_proj is in the FFN dim where R1 cancels — only "
+                        "useful for showing R4's effect, not R1.")
 
     p.add_argument("--nsamples", type=int, default=32,
                    help="Calibration samples for R1 training and capture")
@@ -380,16 +418,24 @@ def main() -> None:
         model.to(DEV)
         cleanup_memory()
 
-    # ---- 4. Capture down_proj inputs on every layer ----
-    log.info("Capturing down_proj inputs (layers=%d, rows/layer<=%d)...",
-             umodel.num_layers, args.rows_per_layer_capture)
+    # ---- 4. Capture sub-module inputs on every layer ----
+    log.info("Capturing %s inputs (layers=%d, rows/layer<=%d)...",
+             args.hook, umodel.num_layers, args.rows_per_layer_capture)
     capture_calib = calib[:min(args.nsamples, 16)]     # 16 sequences is enough
-    acts = capture_down_proj_inputs(model, umodel, capture_calib,
-                                    args.rows_per_layer_capture)
+    acts = capture_submodule_inputs(model, umodel, capture_calib,
+                                     args.rows_per_layer_capture,
+                                     hook=args.hook)
     acts = compress_per_layer(acts, args.rows_per_layer_save)
 
     # ---- 5. Write out ----
-    out_npz = args.out_dir / "down_proj_inputs.npz"
+    # Output filename reflects the hook so multiple hook points can coexist
+    # in the same artifact directory without overwriting each other.
+    # Legacy alias "down_proj_inputs.npz" preserved when --hook=down_proj so
+    # the existing plot scripts keep working without a rename.
+    if args.hook == "down_proj":
+        out_npz = args.out_dir / "down_proj_inputs.npz"
+    else:
+        out_npz = args.out_dir / f"{args.hook}_inputs.npz"
     np_arrays = {}
     layer_idxs = sorted(acts.keys())
     for i in layer_idxs:
@@ -397,6 +443,7 @@ def main() -> None:
     np_arrays["_layer_idxs"] = np.array(layer_idxs, dtype=np.int32)
     np_arrays["_model"] = np.array(args.model)
     np_arrays["_config"] = np.array(args.config)
+    np_arrays["_hook"] = np.array(args.hook)
     np_arrays["_hidden_size"] = np.int32(umodel.hidden_size)
     np_arrays["_intermediate_size"] = np.int32(umodel.intermediate_size)
     np_arrays["_num_layers"] = np.int32(umodel.num_layers)

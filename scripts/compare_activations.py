@@ -186,16 +186,59 @@ _LABEL = {
     "swd_unif":  r"R1 — SWD-Uniform",
     "swd_gauss": r"R1 — SWD-Gaussian",
 }
+# Muted, publication-grade palette (seaborn "deep" family).  Gray baseline for
+# "raw" keeps visual attention on the three learned rotations; the three method
+# colours are distinct in both hue and luminance so they reproduce cleanly in
+# grayscale print as well.
 _COLOR = {
-    "raw":       "#8c8c8c",
-    "whip":      "#D55E00",
-    "swd_unif":  "#0072B2",
-    "swd_gauss": "#009E73",
+    "raw":       "#545454",   # charcoal — baseline
+    "whip":      "#C44E52",   # muted brick red
+    "swd_unif":  "#4C72B0",   # steel blue
+    "swd_gauss": "#55A868",   # sage green
+}
+
+# rcParams for NeurIPS / ICLR / ICML-ready figures.  Key points:
+#   - serif body text + Computer Modern math (matches LaTeX paper body)
+#   - Type-42 fonts in PDF/PS (required for submission: searchable + embeddable)
+#   - no top/right spines, thin axes, subtle grid — clean modern look
+#   - tight default savefig at 300 dpi for any rasterised elements
+_PUB_RC = {
+    "font.family":        "serif",
+    "font.serif":         ["DejaVu Serif", "Computer Modern Roman",
+                           "Times New Roman", "serif"],
+    "mathtext.fontset":   "cm",
+    "axes.titlesize":     10.5,
+    "axes.labelsize":     9.5,
+    "xtick.labelsize":    8.5,
+    "ytick.labelsize":    8.5,
+    "legend.fontsize":    9.0,
+    "axes.linewidth":     0.8,
+    "axes.edgecolor":     "#444444",
+    "axes.labelcolor":    "#222222",
+    "text.color":         "#222222",
+    "xtick.color":        "#444444",
+    "ytick.color":        "#444444",
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "xtick.direction":    "out",
+    "ytick.direction":    "out",
+    "xtick.major.width":  0.8,
+    "ytick.major.width":  0.8,
+    "xtick.major.size":   3.0,
+    "ytick.major.size":   3.0,
+    "grid.color":         "#B8B8B8",
+    "grid.linewidth":     0.5,
+    "grid.alpha":         0.35,
+    "pdf.fonttype":       42,
+    "ps.fonttype":        42,
+    "savefig.dpi":        300,
 }
 
 
 def plot_comparison(bundles: dict[str, torch.Tensor], out_path: Path,
                      layer_idx: int, model_name: str) -> None:
+    plt.rcParams.update(_PUB_RC)
+
     # Shared x-range from raw tails (avoid clipping outliers in the raw panel)
     raw_v = bundles["raw"].numpy().ravel()
     span = float(np.percentile(np.abs(raw_v), 99.95)) * 1.05
@@ -205,27 +248,34 @@ def plot_comparison(bundles: dict[str, torch.Tensor], out_path: Path,
     fig, axes = plt.subplots(
         2, 4,
         figsize=(13, 5.8),
-        gridspec_kw={"hspace": 0.42, "wspace": 0.28,
-                     "left": 0.07, "right": 0.98,
+        gridspec_kw={"hspace": 0.46, "wspace": 0.26,
+                     "left": 0.065, "right": 0.985,
                      "bottom": 0.10, "top": 0.88},
     )
+
+    annot_bbox = dict(boxstyle="round,pad=0.28", facecolor="white",
+                      alpha=0.88, edgecolor="#CCCCCC", linewidth=0.5)
 
     for col, name in enumerate(_ORDER):
         x = bundles[name].numpy()
         v = x.ravel()
         absmax = np.abs(x).max(axis=0)
         order = np.argsort(-absmax)
+        color = _COLOR[name]
 
         # --- Top: value histogram (log y) ---
         ax = axes[0, col]
-        ax.hist(v, bins=bins, color=_COLOR[name], edgecolor="none")
+        ax.hist(v, bins=bins, color=color, edgecolor="none", alpha=0.9)
         ax.set_yscale("log")
         ax.set_xlim(-span, span)
-        ax.set_title(_LABEL[name], fontsize=11)
+        ax.set_title(_LABEL[name], pad=6)
+        ax.grid(True, which="major", axis="y",
+                linestyle="-", linewidth=0.4, alpha=0.3)
+        ax.set_axisbelow(True)
         kurt = float(((v - v.mean()) ** 4).mean() / (v.std() ** 4 + 1e-12) - 3.0)
-        ax.text(0.04, 0.93,
-                rf"$\kappa_4 = {kurt:.1f}$",
-                transform=ax.transAxes, va="top", fontsize=9)
+        ax.text(0.04, 0.94, rf"$\kappa_4 = {kurt:.1f}$",
+                transform=ax.transAxes, va="top", fontsize=8.5,
+                bbox=annot_bbox)
         if col == 0:
             ax.set_ylabel("Count (log)")
         ax.set_xlabel("Activation value")
@@ -233,21 +283,25 @@ def plot_comparison(bundles: dict[str, torch.Tensor], out_path: Path,
         # --- Bottom: per-channel absmax, sorted desc ---
         ax = axes[1, col]
         ax.bar(np.arange(len(absmax)), absmax[order],
-               width=1.0, color=_COLOR[name], linewidth=0)
+               width=1.0, color=color, linewidth=0, alpha=0.95)
         ax.set_ylim(0, ymax_absmax)
         ax.set_xlim(0, len(absmax))
-        ax.text(0.96, 0.93, f"peak = {absmax.max():.2f}",
-                transform=ax.transAxes, ha="right", va="top", fontsize=9)
+        ax.grid(True, which="major", axis="y",
+                linestyle="-", linewidth=0.4, alpha=0.3)
+        ax.set_axisbelow(True)
+        ax.text(0.96, 0.94, f"peak = {absmax.max():.2f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+                bbox=annot_bbox)
         if col == 0:
             ax.set_ylabel(r"per-channel $\max_t |x|$")
         ax.set_xlabel("Channel (sorted desc.)")
 
     fig.suptitle(
         f"mlp.up_proj input distribution — layer {layer_idx} — {Path(model_name).name}",
-        fontsize=12,
+        fontsize=11.5, y=0.965,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {out_path}")
 
